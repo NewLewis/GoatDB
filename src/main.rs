@@ -1,4 +1,8 @@
-use rustgres::{SkipList, MemTable};
+mod mem_table;
+mod skip_list;
+
+use crate::skip_list::SkipList;
+use crate::mem_table::MemTable;
 
 fn main() {
     println!("Testing SkipList...");
@@ -18,6 +22,11 @@ fn main() {
     // Test iterate
     println!("Iterate (should be ordered):");
     for (k, v) in sl.iter() {
+        println!("  {}: {}", k, v);
+    }
+
+    println!("range Iter test");
+    for (k, v) in sl.range(&2, &4) {
         println!("  {}: {}", k, v);
     }
 
@@ -41,6 +50,11 @@ fn main() {
     // Test iterate
     println!("Iterate MemTable:");
     for (k, v) in memtable.iter() {
+        println!("  {:?}: {:?}", String::from_utf8_lossy(k), String::from_utf8_lossy(v));
+    }
+
+    println!("range_iter test:");
+    for (k, v) in memtable.range_iter(&b"key_003".to_vec(), &b"key_007".to_vec()) {
         println!("  {:?}: {:?}", String::from_utf8_lossy(k), String::from_utf8_lossy(v));
     }
 
