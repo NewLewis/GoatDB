@@ -1,5 +1,9 @@
+use std::env;
+use std::path::PathBuf;
+
 use crate::skip_list::SkipList;
 use crate::wal_manager::WalManager;
+
 
 // ==================== LSM MemTable 封装 ====================
 
@@ -12,16 +16,27 @@ pub struct MemTable {
 
 impl MemTable {
     pub fn new(size_limit: usize) -> Self {
+        // todo 暂时将启动路径也定位wal日志的存放路径
+        let mut exec_path = env::current_exe().unwrap();
+        exec_path.pop();
+        exec_path.push("wal.log");
+
+        println!("{}", exec_path.display());
+
+        let wal_manager = WalManager::new(exec_path)
+            .expect("failed to open wal log file");
         Self {
             skiplist: SkipList::new(),
             size_limit,
-            wal_manager: WalManager::new(),
+            wal_manager
         }
     }
 
     /// 插入键值对
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> bool {
-        self.wal_manager.write(&key, &value);
+        if let Err(e) = self.wal_manager.write(&key, &value) {
+            eprintln!("write wal failed: {}", e);
+        }
         self.skiplist.insert(key, value);
         self.should_flush()
     }
