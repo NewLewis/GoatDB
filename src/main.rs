@@ -1,5 +1,6 @@
 mod mem_table;
 mod skip_list;
+mod wal_manager;
 
 use std::io::{self, Write};
 

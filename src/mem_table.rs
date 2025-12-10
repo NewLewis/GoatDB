@@ -1,4 +1,5 @@
 use crate::skip_list::SkipList;
+use crate::wal_manager::WalManager;
 
 // ==================== LSM MemTable 封装 ====================
 
@@ -6,6 +7,7 @@ use crate::skip_list::SkipList;
 pub struct MemTable {
     skiplist: SkipList<Vec<u8>, Vec<u8>>,
     size_limit: usize,
+    wal_manager: WalManager
 }
 
 impl MemTable {
@@ -13,11 +15,13 @@ impl MemTable {
         Self {
             skiplist: SkipList::new(),
             size_limit,
+            wal_manager: WalManager::new(),
         }
     }
 
     /// 插入键值对
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> bool {
+        self.wal_manager.write(&key, &value);
         self.skiplist.insert(key, value);
         self.should_flush()
     }
