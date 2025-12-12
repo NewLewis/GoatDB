@@ -2,6 +2,8 @@ use std::fs::{ File, OpenOptions };
 use std::io::{ self, BufWriter, Write };
 use std::path::{ Path, PathBuf };
 
+use crc32fast::Hasher;
+
 pub struct WalManager {
     writer: BufWriter<File>,
 }
@@ -18,7 +20,27 @@ impl WalManager {
         })
     }
 
+    /// Writes a key-value pair to the WAL (Write-Ahead Log).
+    /// The WAL format is as follows:
+    /// ```
+    /// +----------------+----------------+----------------+----------------+
+    /// |   Checksum (4 bytes, u32, little-endian)                       |
+    /// +----------------+----------------+----------------+----------------+
+    /// |   Key Length (4 bytes, u32, little-endian)                    |
+    /// +----------------+----------------+----------------+----------------+
+    /// |   Key (N bytes, raw bytes)                                    |
+    /// +----------------+----------------+----------------+----------------+
+    /// |   Value Length (4 bytes, u32, little-endian)                  |
+    /// +----------------+----------------+----------------+----------------+
+    /// |   Value (M bytes, raw bytes)                                  |
+    /// +----------------+----------------+----------------+----------------+
+    /// ```
+    /// After writing, the data is flushed to ensure durability.
     pub fn write(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
+        let checksum = Self::get_checksum(key, value);
+
+        self.writer.write_all(&checksum.to_le_bytes())?;
+
         self.writer.write_all(&(key.len() as u32).to_le_bytes())?;
         self.writer.write_all(key)?;
         
@@ -30,5 +52,16 @@ impl WalManager {
         self.writer.flush()?;
         
         Ok(())
+    }
+
+    fn get_checksum(key: &[u8], value: &[u8]) -> u32 {
+        let mut hasher = Hasher::new();
+
+        hasher.update(&(key.len() as u32).to_le_bytes());
+        hasher.update(key);
+        hasher.update(&(value.len() as u32).to_le_bytes());
+        hasher.update(value);
+
+        return hasher.finalize();
     }
 }
