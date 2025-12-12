@@ -1,8 +1,14 @@
 [package]
-name = "GoatDB"
+name = "goat_db"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 rand = "0.8"
 crc32fast = "1.5"
+tonic = "0.14.2"
+prost = "0.14.1"
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14.2"

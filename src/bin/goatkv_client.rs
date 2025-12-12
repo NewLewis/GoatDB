@@ -1,11 +1,6 @@
-mod goatkv;
-mod mem_table;
-mod skip_list;
-mod wal_manager;
-
 use std::io::{self, Write};
 
-use crate::goatkv::GoatKV;
+use goat_db::goatkv::GoatKV;
 
 fn main() {
     // 1. 初始化 MemTable，比如限制大小为 1MB

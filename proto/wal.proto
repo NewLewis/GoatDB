@@ -1,0 +1,16 @@
+syntax = "proto3";
+package wal;
+
+service WalService {
+  rpc Write (WriteRequest) returns (WriteResponse);
+}
+
+message WriteRequest {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message WriteResponse {
+  bool success = 1;
+  string message = 2;
+}

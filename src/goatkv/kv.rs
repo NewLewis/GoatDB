@@ -1,7 +1,7 @@
 use std::env;
 
-use crate::mem_table::MemTable;
-use crate::wal_manager::WalManager;
+use crate::goatkv::mem_table::MemTable;
+use crate::goatkv::wal_manager::WalManager;
 
 pub struct GoatKV {
     wal_manager: WalManager,
@@ -31,7 +31,9 @@ impl GoatKV {
     }
 
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        self.wal_manager.write(&key, &value);
+        self.wal_manager
+            .write(&key, &value)
+            .expect("Failed to write to WAL");
         self.mem_table.put(key, value);
     }
 }
