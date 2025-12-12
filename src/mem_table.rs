@@ -1,9 +1,4 @@
-use std::env;
-use std::path::PathBuf;
-
 use crate::skip_list::SkipList;
-use crate::wal_manager::WalManager;
-
 
 // ==================== LSM MemTable 封装 ====================
 
@@ -11,32 +6,18 @@ use crate::wal_manager::WalManager;
 pub struct MemTable {
     skiplist: SkipList<Vec<u8>, Vec<u8>>,
     size_limit: usize,
-    wal_manager: WalManager
 }
 
 impl MemTable {
     pub fn new(size_limit: usize) -> Self {
-        // todo 暂时将启动路径也定位wal日志的存放路径
-        let mut exec_path = env::current_exe().unwrap();
-        exec_path.pop();
-        exec_path.push("wal.log");
-
-        println!("{}", exec_path.display());
-
-        let wal_manager = WalManager::new(exec_path)
-            .expect("failed to open wal log file");
         Self {
             skiplist: SkipList::new(),
             size_limit,
-            wal_manager
         }
     }
 
     /// 插入键值对
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> bool {
-        if let Err(e) = self.wal_manager.write(&key, &value) {
-            eprintln!("write wal failed: {}", e);
-        }
         self.skiplist.insert(key, value);
         self.should_flush()
     }
@@ -58,7 +39,11 @@ impl MemTable {
             .map(|(k, v)| (k.as_slice(), v.as_slice()))
     }
 
-    pub fn range_iter<'a>(&'a self, start: &'a Vec<u8>, end: &'a Vec<u8>) -> impl Iterator<Item = (&'a [u8], &'a [u8])> {
+    pub fn range_iter<'a>(
+        &'a self,
+        start: &'a Vec<u8>,
+        end: &'a Vec<u8>,
+    ) -> impl Iterator<Item = (&'a [u8], &'a [u8])> {
         self.skiplist
             .range(start, end)
             .map(|(k, v)| (k.as_slice(), v.as_slice()))
