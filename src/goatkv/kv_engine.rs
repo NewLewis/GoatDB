@@ -1,7 +1,8 @@
 use std::env;
+use std::path::PathBuf;
 
-use crate::goatkv::mem_table::MemTable;
-use crate::goatkv::wal_manager::WalManager;
+use crate::goatkv::mem_table::{self, MemTable};
+use crate::goatkv::wal_manager::{WalIterator, WalManager};
 
 #[derive(Debug)]
 pub struct KvEngine {
@@ -16,13 +17,30 @@ impl KvEngine {
         exec_path.pop();
         exec_path.push("wal.log");
 
-        println!("{}", exec_path.display());
+        let mut mem_table = mem_table::MemTable::new(1024 * 1024); // 初始化为1MB大小
+        let _ = Self::replay(&mut mem_table, &exec_path);
 
         let wal_manager = WalManager::new(exec_path).expect("failed to open wal log file");
         Self {
             wal_manager,
-            mem_table: MemTable::new(1024 * 1024), // 初始化为1MB大小
+            mem_table, // 初始化为1MB大小
         }
+    }
+
+    fn replay(mem_table: &mut MemTable, exec_path: &PathBuf) -> Result<(), std::io::Error> {
+        let wal_iterator = WalIterator::new(exec_path)?;
+        for entry in wal_iterator {
+            match entry {
+                Ok((key, value)) => {
+                    mem_table.put(key, value);
+                    return Ok(());
+                }
+                Err(err) => {
+                    println!("Failed to replay WAL entry: {}, skiped", err);
+                }
+            }
+        }
+        Ok(())
     }
 }
 

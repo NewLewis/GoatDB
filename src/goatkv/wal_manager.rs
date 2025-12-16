@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use crc32fast::Hasher;
@@ -61,5 +61,75 @@ impl WalManager {
         hasher.update(value);
 
         return hasher.finalize();
+    }
+}
+
+pub struct WalIterator {
+    reader: BufReader<File>,
+}
+
+impl WalIterator {
+    pub fn new(path: impl AsRef<Path>) -> io::Result<Self> {
+        let file = File::open(path)?;
+        Ok(Self {
+            reader: BufReader::new(file),
+        })
+    }
+}
+
+impl Iterator for WalIterator {
+    type Item = io::Result<(Vec<u8>, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut checksum_bytes = [0u8; 4];
+        match self.reader.read_exact(&mut checksum_bytes) {
+            Ok(_) => {}
+            Err(e) => {
+                if e.kind() == io::ErrorKind::UnexpectedEof {
+                    return None;
+                } else {
+                    return Some(Err(e));
+                }
+            }
+        }
+        let checksum = u32::from_le_bytes(checksum_bytes);
+
+        let mut key_len_bytes = [0u8; 4];
+        if let Err(e) = self.reader.read_exact(&mut key_len_bytes) {
+            return Some(Err(e));
+        }
+        let key_len = u32::from_le_bytes(key_len_bytes) as usize;
+
+        let mut key = vec![0u8; key_len];
+        if let Err(e) = self.reader.read_exact(&mut key) {
+            return Some(Err(e));
+        }
+
+        let mut value_len_bytes = [0u8; 4];
+        if let Err(e) = self.reader.read_exact(&mut value_len_bytes) {
+            return Some(Err(e));
+        }
+        let value_len = u32::from_le_bytes(value_len_bytes) as usize;
+
+        let mut value = vec![0u8; value_len];
+        if let Err(e) = self.reader.read_exact(&mut value) {
+            return Some(Err(e));
+        }
+
+        // 校验crc
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&key_len.to_le_bytes());
+        hasher.update(&key);
+        hasher.update(&value_len.to_le_bytes());
+        hasher.update(&value);
+        let calculated_checksum = hasher.finalize();
+        if calculated_checksum != checksum {
+            return Some(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CRC mismatch",
+            )));
+        }
+
+        Some(Ok((key, value)))
     }
 }
