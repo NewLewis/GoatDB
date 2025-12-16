@@ -1,4 +1,4 @@
-use goatkv::{goat_kv_service_client::GoatKvServiceClient, WriteRequest};
+use goatkv::{goat_kv_service_client::GoatKvServiceClient, GetRequest, WriteRequest};
 use std::io::{self, Write};
 
 pub mod goatkv {
@@ -39,6 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 match parts[0] {
                     "put" => handle_put(&mut client, &parts).await?,
+                    "get" => handle_get(&mut client, &parts).await?,
                     "exit" | "quit" => {
                         println!("Bye!");
                         break;
@@ -62,7 +63,7 @@ async fn handle_put(
 ) -> Result<(), Box<dyn std::error::Error>> {
     if parts.len() < 3 {
         println!("Usage: put <key> <value>");
-        return Ok(());
+        return Err("parts length must be at least 3".into());
     }
     let key = parts[1].as_bytes().to_vec();
     let value = parts[2].as_bytes().to_vec();
@@ -81,20 +82,27 @@ async fn handle_put(
 }
 
 // 处理 GET 命令
-// fn handle_get(_: &mut GoatKvServiceClient, parts: &[&str]) {
-//     todo!("尚未实现")
-//     // if parts.len() < 2 {
-//     //     println!("Usage: get <key>");
-//     //     return;
-//     // }
-//     // let key = parts[1].as_bytes();
+async fn handle_get(
+    client: &mut GoatKvServiceClient<tonic::transport::Channel>,
+    parts: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if parts.len() < 2 {
+        println!("Usage: get <key>");
+        return Err("parts length must be at least 2".into());
+    }
 
-//     // match .get(key) {
-//     //     Some(value) => {
-//     //         // 这里用上了刚才学的 from_utf8_lossy
-//     //         let val_str = String::from_utf8_lossy(&value);
-//     //         println!("Value: {}", val_str);
-//     //     }
-//     //     None => println!("Key not found"),
-//     // }
-// }
+    let key = parts[1].as_bytes().to_vec();
+
+    let request = tonic::Request::new(GetRequest { key });
+
+    // 如果你的 put 返回 bool (need_flush)
+    let response = client.get(request).await?;
+    let resp_data = response.into_inner();
+
+    println!("Response received:");
+    println!("  Success: {}", resp_data.success);
+    println!("  Message: {}", resp_data.message);
+    println!("  Value: {}", String::from_utf8_lossy(&resp_data.value));
+
+    Ok(())
+}

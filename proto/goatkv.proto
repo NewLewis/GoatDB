@@ -3,6 +3,7 @@ package goatkv;
 
 service GoatKVService {
   rpc Write (WriteRequest) returns (WriteResponse);
+  rpc Get (GetRequest) returns (GetResponse);
 }
 
 message WriteRequest {
@@ -13,4 +14,14 @@ message WriteRequest {
 message WriteResponse {
   bool success = 1;
   string message = 2;
+}
+
+message GetRequest {
+  bytes key = 1;
+}
+
+message GetResponse {
+  bool success = 1;
+  string message = 2;
+  bytes value = 3;
 }

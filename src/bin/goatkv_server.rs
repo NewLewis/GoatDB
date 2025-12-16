@@ -1,8 +1,10 @@
 use std::sync::{Arc, Mutex};
 
 use goat_db::goatkv::kv_engine::KvEngine;
-use goatkv::goat_kv_service_server::{GoatKvService, GoatKvServiceServer};
-use goatkv::{WriteRequest, WriteResponse};
+use goatkv::{
+    goat_kv_service_server::{GoatKvService, GoatKvServiceServer},
+    GetRequest, GetResponse, WriteRequest, WriteResponse,
+};
 use tonic::{transport::Server, Request, Response, Status};
 
 // 引入编译生成的代码
@@ -43,6 +45,36 @@ impl GoatKvService for GoatKVServiceImpl {
         };
 
         Ok(Response::new(reply))
+    }
+
+    async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
+        let req = request.into_inner();
+
+        println!("Received get request - key_len: {}", req.key.len());
+
+        // 验ification
+        if req.key.is_empty() {
+            return Err(Status::invalid_argument("Key cannot be empty"));
+        }
+
+        match self.engine.lock().unwrap().get(&req.key) {
+            Some(value) => {
+                let reply = GetResponse {
+                    success: true,
+                    message: format!("Get successfully - key length: {}", req.key.len()),
+                    value,
+                };
+                Ok(Response::new(reply))
+            }
+            None => {
+                let reply = GetResponse {
+                    success: false,
+                    message: format!("Key not found"),
+                    value: vec![],
+                };
+                Ok(Response::new(reply))
+            }
+        }
     }
 }
 
