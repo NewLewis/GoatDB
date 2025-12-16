@@ -33,7 +33,6 @@ impl KvEngine {
             match entry {
                 Ok((key, value)) => {
                     mem_table.put(key, value);
-                    return Ok(());
                 }
                 Err(err) => {
                     println!("Failed to replay WAL entry: {}, skiped", err);
