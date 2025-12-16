@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crc32fast::Hasher;
 
+#[derive(Debug)]
 pub struct WalManager {
     writer: BufWriter<File>,
 }

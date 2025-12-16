@@ -3,6 +3,7 @@ use crate::goatkv::skip_list::SkipList;
 // ==================== LSM MemTable 封装 ====================
 
 /// LSM-Tree 的 MemTable，使用跳表实现
+#[derive(Debug)]
 pub struct MemTable {
     skiplist: SkipList<Vec<u8>, Vec<u8>>,
     size_limit: usize,

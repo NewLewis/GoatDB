@@ -1,7 +1,7 @@
 syntax = "proto3";
-package wal;
+package goatkv;
 
-service WalService {
+service GoatKVService {
   rpc Write (WriteRequest) returns (WriteResponse);
 }
 

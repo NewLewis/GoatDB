@@ -1,8 +1,10 @@
+use rand::{rngs::SmallRng, Rng, SeedableRng};
 use std::cmp::Ordering;
 use std::ptr::NonNull;
 
 // ==================== Arena 分配器 ====================
 
+#[derive(Debug)]
 pub struct Arena {
     chunks: Vec<Vec<u8>>,
     current: Vec<u8>,
@@ -142,15 +144,14 @@ type NodePtr<K, V> = Option<NonNull<Node<K, V>>>;
 
 // ==================== 跳表实现 ====================
 
+#[derive(Debug)]
 pub struct SkipList<K, V> {
     arena: Arena,
     head: NonNull<Node<K, V>>,
     max_height: usize, // 当前最大高度
     len: usize,
-    rng: ThreadRng,
+    rng: SmallRng,
 }
-
-use rand::{rngs::ThreadRng, Rng};
 
 impl<K, V> SkipList<K, V> {
     pub fn new() -> Self {
@@ -166,7 +167,7 @@ impl<K, V> SkipList<K, V> {
             head,
             max_height: 1,
             len: 0,
-            rng: rand::thread_rng(),
+            rng: SmallRng::from_entropy(),
         }
     }
 
@@ -386,6 +387,10 @@ impl<K: Ord, V> SkipList<K, V> {
     }
 }
 
+// 告诉编辑器：只要K和V是现场安全的，我的skipList就是线程安全的
+unsafe impl<K: Send, V: Send> Send for SkipList<K, V> {}
+unsafe impl<K: Send, V: Send> Sync for SkipList<K, V> {}
+
 // ==================== 迭代器 ====================
 
 pub struct Iter<'a, K, V> {
@@ -492,7 +497,7 @@ mod tests {
         assert_eq!(range, (20..30).collect::<Vec<_>>());
     }
 
-     #[test]
+    #[test]
     fn test_large_scale() {
         let mut sl: SkipList<u64, u64> = SkipList::new();
         let n = 100_000;
