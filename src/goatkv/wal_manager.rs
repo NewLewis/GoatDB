@@ -35,7 +35,7 @@ impl WalManager {
     /// ```
     /// After writing, the data is flushed to ensure durability.
     pub fn write(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
-        let checksum = Self::get_checksum(key, value);
+        let checksum = Self::get_checksum(key, key.len() as u32, value, value.len() as u32);
         println!(
             "key: {}, checksum: {}",
             String::from_utf8_lossy(key),
@@ -57,12 +57,12 @@ impl WalManager {
         Ok(())
     }
 
-    pub fn get_checksum(key: &[u8], value: &[u8]) -> u32 {
+    pub fn get_checksum(key: &[u8], key_len: u32, value: &[u8], value_len: u32) -> u32 {
         let mut hasher = Hasher::new();
 
-        hasher.update(&(key.len() as u32).to_le_bytes());
+        hasher.update(&key_len.to_le_bytes());
         hasher.update(key);
-        hasher.update(&(value.len() as u32).to_le_bytes());
+        hasher.update(&value_len.to_le_bytes());
         hasher.update(value);
 
         return hasher.finalize();
@@ -122,7 +122,7 @@ impl Iterator for WalIterator {
         }
 
         // 校验crc
-        if WalManager::get_checksum(&key, &value) != checksum {
+        if WalManager::get_checksum(&key, key_len as u32, &value, value_len as u32) != checksum {
             return Some(Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "CRC mismatch",
