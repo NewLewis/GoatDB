@@ -1,4 +1,5 @@
 // 声明这个文件夹下的其他文件为子模块
+pub mod immu_mem_table;
 pub mod kv_engine;
 pub mod mem_table;
 pub mod skip_list;

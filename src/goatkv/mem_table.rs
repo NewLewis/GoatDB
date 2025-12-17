@@ -5,37 +5,43 @@ use crate::goatkv::skip_list::SkipList;
 /// LSM-Tree 的 MemTable，使用跳表实现
 #[derive(Debug)]
 pub struct MemTable {
-    skiplist: SkipList<Vec<u8>, Vec<u8>>,
+    skiplist: Option<SkipList<Vec<u8>, Vec<u8>>>,
     size_limit: usize,
 }
 
 impl MemTable {
     pub fn new(size_limit: usize) -> Self {
         Self {
-            skiplist: SkipList::new(),
+            skiplist: Some(SkipList::new()),
             size_limit,
         }
     }
 
     /// 插入键值对
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> bool {
-        self.skiplist.insert(key, value);
+        self.skiplist.as_mut().unwrap().insert(key, value);
         self.should_flush()
     }
 
     /// 获取值
     pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
-        self.skiplist.get(&key.to_vec()).map(|v| v.as_slice())
+        self.skiplist
+            .as_ref()
+            .unwrap()
+            .get(&key.to_vec())
+            .map(|v| v.as_slice())
     }
 
-    /// 是否需要 flush 到 SSTable
+    /// 是否需要 flush 到 immutable memtable
     pub fn should_flush(&self) -> bool {
-        self.skiplist.memory_usage() >= self.size_limit
+        self.skiplist.as_ref().unwrap().memory_usage() >= self.size_limit
     }
 
     /// 遍历所有键值对（用于 flush）
     pub fn iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
         self.skiplist
+            .as_ref()
+            .unwrap()
             .iter()
             .map(|(k, v)| (k.as_slice(), v.as_slice()))
     }
@@ -46,16 +52,22 @@ impl MemTable {
         end: &'a Vec<u8>,
     ) -> impl Iterator<Item = (&'a [u8], &'a [u8])> {
         self.skiplist
+            .as_ref()
+            .unwrap()
             .range(start, end)
             .map(|(k, v)| (k.as_slice(), v.as_slice()))
     }
 
     pub fn len(&self) -> usize {
-        self.skiplist.len()
+        self.skiplist.as_ref().unwrap().len()
     }
 
     pub fn memory_usage(&self) -> usize {
-        self.skiplist.memory_usage()
+        self.skiplist.as_ref().unwrap().memory_usage()
+    }
+
+    pub fn replace_skiplist(&mut self) -> Option<SkipList<Vec<u8>, Vec<u8>>> {
+        self.skiplist.replace(SkipList::new())
     }
 }
 
