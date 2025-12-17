@@ -69,13 +69,13 @@ impl KvEngine {
     }
 
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        // 先写入memtable
-        self.mem_table.put(key.clone(), value.clone());
-
-        // 再写入wal
+        // 先写入wal
         self.wal_manager
             .write(&key, &value)
             .expect("Failed to write to WAL");
+
+        // 再写入memtable
+        self.mem_table.put(key.clone(), value.clone());
 
         // 判断memtable是否已达到容量限制，
         // 达到容量限制则转换成immutable_mem_tables

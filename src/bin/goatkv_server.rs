@@ -37,11 +37,11 @@ impl GoatKvService for GoatKVServiceImpl {
             return Err(Status::invalid_argument("Key cannot be empty"));
         }
 
-        self.engine.lock().unwrap().put(req.key.clone(), req.value);
+        self.engine.lock().unwrap().put(req.key, req.value);
 
         let reply = WriteResponse {
             success: true,
-            message: format!("Written successfully - key length: {}", req.key.len()),
+            message: format!("Written successfully"),
         };
 
         Ok(Response::new(reply))
@@ -52,7 +52,7 @@ impl GoatKvService for GoatKVServiceImpl {
 
         println!("Received get request - key_len: {}", req.key.len());
 
-        // 验ification
+        // 验证输入
         if req.key.is_empty() {
             return Err(Status::invalid_argument("Key cannot be empty"));
         }
