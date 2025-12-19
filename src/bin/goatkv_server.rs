@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use goat_db::goatkv::kv_engine::KvEngine;
 use goatkv::{
     goat_kv_service_server::{GoatKvService, GoatKvServiceServer},
-    GetRequest, GetResponse, WriteRequest, WriteResponse,
+    DeleteRequest, DeleteResponse, GetRequest, GetResponse, UpdateRequest, UpdateResponse,
+    WriteRequest, WriteResponse,
 };
 use tonic::{transport::Server, Request, Response, Status};
 
@@ -75,6 +76,67 @@ impl GoatKvService for GoatKVServiceImpl {
                 Ok(Response::new(reply))
             }
         }
+    }
+
+    async fn update(
+        &self,
+        request: Request<UpdateRequest>,
+    ) -> Result<Response<UpdateResponse>, Status> {
+        let req = request.into_inner();
+
+        println!(
+            "Received update request - key_len: {}, value_len: {}",
+            req.key.len(),
+            req.value.len()
+        );
+
+        // 验证输入
+        if req.key.is_empty() {
+            return Err(Status::invalid_argument("Key cannot be empty"));
+        }
+
+        // 检查 key 是否存在
+        if self.engine.lock().unwrap().get(&req.key).is_none() {
+            let reply = UpdateResponse {
+                success: false,
+                message: format!("Key not found, cannot update"),
+            };
+            return Ok(Response::new(reply));
+        }
+
+        // 更新 key 的值
+        self.engine.lock().unwrap().put(req.key, req.value);
+
+        let reply = UpdateResponse {
+            success: true,
+            message: format!("Updated successfully"),
+        };
+
+        Ok(Response::new(reply))
+    }
+
+    async fn delete(
+        &self,
+        request: Request<DeleteRequest>,
+    ) -> Result<Response<DeleteResponse>, Status> {
+        let req = request.into_inner();
+
+        println!("Received delete request - key_len: {}", req.key.len());
+
+        // 验证输入
+        if req.key.is_empty() {
+            return Err(Status::invalid_argument("Key cannot be empty"));
+        }
+
+        // 删除 key (即使不存在也会插入删除标记)
+        self.engine.lock().unwrap().delete(req.key);
+
+        let reply = DeleteResponse {
+            success: true,
+            message: format!("Deleted successfully"),
+        };
+
+        Ok(Response::new(reply))
     }
 }
 

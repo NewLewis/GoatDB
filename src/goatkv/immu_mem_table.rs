@@ -1,3 +1,4 @@
+use crate::goatkv::internal_key::InternalKey;
 use crate::goatkv::skip_list::SkipList;
 
 // ==================== LSM MemTable 封装 ====================
@@ -15,12 +16,12 @@ impl ImmutableMemTable {
 
     /// 获取值
     pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
-        self.skiplist.get(&key.to_vec()).map(|v| v.as_slice())
+        self.skiplist.get(key).map(|v| v.as_slice())
     }
 
-    /// 查找键值对
-    pub fn seek(&self, key: &[u8]) -> Option<&[u8]> {
-        self.skiplist.seek(key).map(|(_, v)| v.as_slice())
+    /// 查找键值对，返回 (InternalKey, value) 元组
+    pub fn seek(&self, key: &[u8]) -> Option<(&InternalKey, &[u8])> {
+        self.skiplist.seek(key).map(|(k, v)| (k, v.as_slice()))
     }
 
     // /// 遍历所有键值对（用于 flush）

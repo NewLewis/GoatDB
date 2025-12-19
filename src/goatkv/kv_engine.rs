@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::env;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use crate::goatkv::immu_mem_table::ImmutableMemTable;
 use crate::goatkv::internal_key::{InternalKey, InternalKeyKind};
@@ -37,6 +38,30 @@ impl KvEngine {
         }
     }
 
+    /// 创建一个新的KvEngine，不尝试从WAL恢复
+    /// 主要用于测试
+    pub fn new_for_test() -> Self {
+        let mut exec_path = env::current_exe().unwrap();
+        exec_path.pop();
+
+        // 使用时间戳生成唯一文件名，避免测试间的冲突
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let filename = format!("test_wal_{}.log", timestamp);
+        exec_path.push(filename);
+
+        let mem_table = mem_table::MemTable::new(Self::DEFAULT_MEM_TABLE_SIZE);
+        let wal_manager = WalManager::new(exec_path).expect("failed to open wal log file");
+        Self {
+            wal_manager,
+            mem_table,
+            immutable_mem_tables: VecDeque::new(),
+            sequence_number: SequenceNumber::new(),
+        }
+    }
+
     fn replay(mem_table: &mut MemTable, exec_path: &PathBuf) -> Result<(), std::io::Error> {
         let wal_iterator = WalIterator::new(exec_path)?;
         for entry in wal_iterator {
@@ -55,20 +80,48 @@ impl KvEngine {
 
 impl KvEngine {
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        // 先从memtable中查找
-        let value = self.mem_table.seek(key).map(|value| value.to_vec());
-        if value.is_some() {
-            return value;
-        }
-
-        // 再从immutable_mem_tables中查找
-        for table in &self.immutable_mem_tables {
-            if let Some(value) = table.seek(key) {
-                return Some(value.to_vec());
+        // Helper function to check a single table
+        fn check_table<'a>(
+            table: &'a dyn TableLookup,
+            key: &[u8],
+        ) -> Option<(Option<&'a InternalKey>, Option<&'a [u8]>)> {
+            if let Some((internal_key, value)) = table.seek(key) {
+                // Check if user key matches exactly
+                if internal_key.user_key() == key {
+                    Some((Some(internal_key), Some(value)))
+                } else {
+                    // seek returned a key with user_key > target
+                    Some((None, None))
+                }
+            } else {
+                // No key >= target found
+                None
             }
         }
 
-        // 如果都没有找到，则返回None
+        // First check memtable
+        if let Some((Some(internal_key), Some(value))) = check_table(&self.mem_table, key) {
+            if internal_key.kind() != InternalKeyKind::Delete {
+                return Some(value.to_vec());
+            } else {
+                // Latest version is a delete marker
+                return None;
+            }
+        }
+
+        // Then check immutable memtables in order (newer first)
+        for table in &self.immutable_mem_tables {
+            if let Some((Some(internal_key), Some(value))) = check_table(table, key) {
+                if internal_key.kind() != InternalKeyKind::Delete {
+                    return Some(value.to_vec());
+                } else {
+                    // Latest version is a delete marker
+                    return None;
+                }
+            }
+        }
+
+        // Key not found
         None
     }
 
@@ -118,5 +171,102 @@ impl KvEngine {
         let immutable_mem_table = ImmutableMemTable::new(old_skiplist);
         // 将immutable_mem_table放入immutable_mem_tables中
         self.immutable_mem_tables.push_front(immutable_mem_table);
+    }
+}
+
+// Trait for table lookup (memtable and immutable memtable)
+trait TableLookup {
+    fn seek(&self, key: &[u8]) -> Option<(&InternalKey, &[u8])>;
+}
+
+impl TableLookup for MemTable {
+    fn seek(&self, key: &[u8]) -> Option<(&InternalKey, &[u8])> {
+        self.seek(key)
+    }
+}
+
+impl TableLookup for ImmutableMemTable {
+    fn seek(&self, key: &[u8]) -> Option<(&InternalKey, &[u8])> {
+        self.seek(key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_put_and_get() {
+        let mut engine = KvEngine::new_for_test();
+
+        // Test put and get
+        engine.put(b"key1".to_vec(), b"value1".to_vec());
+        assert_eq!(engine.get(b"key1"), Some(b"value1".to_vec()));
+
+        engine.put(b"key2".to_vec(), b"value2".to_vec());
+        assert_eq!(engine.get(b"key2"), Some(b"value2".to_vec()));
+
+        // Get non-existent key
+        assert_eq!(engine.get(b"nonexistent"), None);
+    }
+
+    #[test]
+    fn test_update_existing_key() {
+        let mut engine = KvEngine::new_for_test();
+
+        // Insert key
+        engine.put(b"key1".to_vec(), b"value1".to_vec());
+        assert_eq!(engine.get(b"key1"), Some(b"value1".to_vec()));
+
+        // Update key
+        engine.put(b"key1".to_vec(), b"newvalue".to_vec());
+        assert_eq!(engine.get(b"key1"), Some(b"newvalue".to_vec()));
+    }
+
+    #[test]
+    fn test_delete_key() {
+        let mut engine = KvEngine::new_for_test();
+
+        // Insert key
+        engine.put(b"key1".to_vec(), b"value1".to_vec());
+        assert_eq!(engine.get(b"key1"), Some(b"value1".to_vec()));
+
+        // Delete key
+        engine.delete(b"key1".to_vec());
+        assert_eq!(engine.get(b"key1"), None);
+
+        // Delete non-existent key (should insert delete marker)
+        engine.delete(b"nonexistent".to_vec());
+        assert_eq!(engine.get(b"nonexistent"), None);
+    }
+
+    #[test]
+    fn test_delete_then_reinsert() {
+        let mut engine = KvEngine::new_for_test();
+
+        // Insert and delete
+        engine.put(b"key1".to_vec(), b"value1".to_vec());
+        engine.delete(b"key1".to_vec());
+        assert_eq!(engine.get(b"key1"), None);
+
+        // Re-insert same key
+        engine.put(b"key1".to_vec(), b"value2".to_vec());
+        assert_eq!(engine.get(b"key1"), Some(b"value2".to_vec()));
+    }
+
+    #[test]
+    fn test_multiple_operations() {
+        let mut engine = KvEngine::new_for_test();
+
+        // Multiple operations
+        engine.put(b"key1".to_vec(), b"value1".to_vec());
+        engine.put(b"key2".to_vec(), b"value2".to_vec());
+        engine.delete(b"key1".to_vec());
+        engine.put(b"key3".to_vec(), b"value3".to_vec());
+        engine.put(b"key2".to_vec(), b"updated_value2".to_vec());
+
+        assert_eq!(engine.get(b"key1"), None);
+        assert_eq!(engine.get(b"key2"), Some(b"updated_value2".to_vec()));
+        assert_eq!(engine.get(b"key3"), Some(b"value3".to_vec()));
     }
 }

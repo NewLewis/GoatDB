@@ -4,6 +4,8 @@ package goatkv;
 service GoatKVService {
   rpc Write (WriteRequest) returns (WriteResponse);
   rpc Get (GetRequest) returns (GetResponse);
+  rpc Update (UpdateRequest) returns (UpdateResponse);
+  rpc Delete (DeleteRequest) returns (DeleteResponse);
 }
 
 message WriteRequest {
@@ -24,4 +26,23 @@ message GetResponse {
   bool success = 1;
   string message = 2;
   bytes value = 3;
+}
+
+message UpdateRequest {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message UpdateResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message DeleteRequest {
+  bytes key = 1;
+}
+
+message DeleteResponse {
+  bool success = 1;
+  string message = 2;
 }

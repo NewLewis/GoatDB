@@ -1,4 +1,7 @@
-use goatkv::{goat_kv_service_client::GoatKvServiceClient, GetRequest, WriteRequest};
+use goatkv::{
+    goat_kv_service_client::GoatKvServiceClient, DeleteRequest, GetRequest, UpdateRequest,
+    WriteRequest,
+};
 use std::io::{self, Write};
 
 pub mod goatkv {
@@ -11,6 +14,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Commands:");
     println!("  put <key> <value>   - Insert a key-value pair");
     println!("  get <key>           - Get a value by key");
+    println!("  update <key> <value> - Update an existing key's value");
+    println!("  delete <key>        - Delete a key-value pair");
     println!("  exit                - Quit");
 
     // 初始化client
@@ -40,6 +45,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match parts[0] {
                     "put" => handle_put(&mut client, &parts).await?,
                     "get" => handle_get(&mut client, &parts).await?,
+                    "update" => handle_update(&mut client, &parts).await?,
+                    "delete" => handle_delete(&mut client, &parts).await?,
                     "exit" | "quit" => {
                         println!("Bye!");
                         break;
@@ -70,7 +77,6 @@ async fn handle_put(
 
     let request = tonic::Request::new(WriteRequest { key, value });
 
-    // 如果你的 put 返回 bool (need_flush)
     let response = client.write(request).await?;
     let resp_data = response.into_inner();
 
@@ -95,7 +101,6 @@ async fn handle_get(
 
     let request = tonic::Request::new(GetRequest { key });
 
-    // 如果你的 put 返回 bool (need_flush)
     let response = client.get(request).await?;
     let resp_data = response.into_inner();
 
@@ -103,6 +108,54 @@ async fn handle_get(
     println!("  Success: {}", resp_data.success);
     println!("  Message: {}", resp_data.message);
     println!("  Value: {}", String::from_utf8_lossy(&resp_data.value));
+
+    Ok(())
+}
+
+// 处理 UPDATE 命令
+async fn handle_update(
+    client: &mut GoatKvServiceClient<tonic::transport::Channel>,
+    parts: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if parts.len() < 3 {
+        println!("Usage: update <key> <value>");
+        return Err("parts length must be at least 3".into());
+    }
+    let key = parts[1].as_bytes().to_vec();
+    let value = parts[2].as_bytes().to_vec();
+
+    let request = tonic::Request::new(UpdateRequest { key, value });
+
+    let response = client.update(request).await?;
+    let resp_data = response.into_inner();
+
+    println!("Response received:");
+    println!("  Success: {}", resp_data.success);
+    println!("  Message: {}", resp_data.message);
+
+    Ok(())
+}
+
+// 处理 DELETE 命令
+async fn handle_delete(
+    client: &mut GoatKvServiceClient<tonic::transport::Channel>,
+    parts: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if parts.len() < 2 {
+        println!("Usage: delete <key>");
+        return Err("parts length must be at least 2".into());
+    }
+
+    let key = parts[1].as_bytes().to_vec();
+
+    let request = tonic::Request::new(DeleteRequest { key });
+
+    let response = client.delete(request).await?;
+    let resp_data = response.into_inner();
+
+    println!("Response received:");
+    println!("  Success: {}", resp_data.success);
+    println!("  Message: {}", resp_data.message);
 
     Ok(())
 }

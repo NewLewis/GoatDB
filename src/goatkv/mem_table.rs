@@ -33,13 +33,13 @@ impl MemTable {
             .map(|v| v.as_slice())
     }
 
-    /// 查找键值对
-    pub fn seek(&self, key: &[u8]) -> Option<&[u8]> {
+    /// 查找键值对，返回 (InternalKey, value) 元组
+    pub fn seek(&self, key: &[u8]) -> Option<(&InternalKey, &[u8])> {
         self.skiplist
             .as_ref()
             .unwrap()
             .seek(key)
-            .map(|(_, v)| v.as_slice())
+            .map(|(k, v)| (k, v.as_slice()))
     }
 
     /// 是否需要 flush 到 immutable memtable
