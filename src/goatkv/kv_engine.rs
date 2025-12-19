@@ -3,12 +3,15 @@ use std::env;
 use std::path::PathBuf;
 
 use crate::goatkv::immu_mem_table::ImmutableMemTable;
+use crate::goatkv::internal_key::{InternalKey, InternalKeyKind};
 use crate::goatkv::mem_table::{self, MemTable};
+use crate::goatkv::sequence_number::SequenceNumber;
 use crate::goatkv::wal_manager::{WalIterator, WalManager};
 
 #[derive(Debug)]
 pub struct KvEngine {
     wal_manager: WalManager,
+    sequence_number: SequenceNumber,
     mem_table: MemTable,
     immutable_mem_tables: VecDeque<ImmutableMemTable>,
 }
@@ -30,6 +33,7 @@ impl KvEngine {
             wal_manager,
             mem_table,
             immutable_mem_tables: VecDeque::new(),
+            sequence_number: SequenceNumber::new(),
         }
     }
 
@@ -52,14 +56,14 @@ impl KvEngine {
 impl KvEngine {
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         // 先从memtable中查找
-        let value = self.mem_table.get(key).map(|value| value.to_vec());
+        let value = self.mem_table.seek(key).map(|value| value.to_vec());
         if value.is_some() {
             return value;
         }
 
         // 再从immutable_mem_tables中查找
         for table in &self.immutable_mem_tables {
-            if let Some(value) = table.get(key) {
+            if let Some(value) = table.seek(key) {
                 return Some(value.to_vec());
             }
         }
@@ -69,13 +73,36 @@ impl KvEngine {
     }
 
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
+        // 构造InternalKey
+        let internal_key = InternalKey::new(key, self.sequence_number.next(), InternalKeyKind::Put);
+
         // 先写入wal
         self.wal_manager
-            .write(&key, &value)
+            .write(&internal_key, &value)
             .expect("Failed to write to WAL");
 
         // 再写入memtable
-        self.mem_table.put(key.clone(), value.clone());
+        self.mem_table.put(internal_key, value.clone());
+
+        // 判断memtable是否已达到容量限制，
+        // 达到容量限制则转换成immutable_mem_tables
+        if self.mem_table.should_flush() {
+            self.flush();
+        }
+    }
+
+    pub fn delete(&mut self, key: Vec<u8>) {
+        // 先构造InternalKey
+        let internal_key =
+            InternalKey::new(key, self.sequence_number.next(), InternalKeyKind::Delete);
+
+        // 先写入wal
+        self.wal_manager
+            .write(&internal_key, &[] as &[u8])
+            .expect("Failed to write to WAL");
+
+        // 再写入memtable
+        self.mem_table.put(internal_key, vec![]);
 
         // 判断memtable是否已达到容量限制，
         // 达到容量限制则转换成immutable_mem_tables

@@ -1,3 +1,4 @@
+use crate::goatkv::internal_key::InternalKey;
 use crate::goatkv::skip_list::SkipList;
 
 // ==================== LSM MemTable 封装 ====================
@@ -5,7 +6,7 @@ use crate::goatkv::skip_list::SkipList;
 /// LSM-Tree 的 MemTable，使用跳表实现
 #[derive(Debug)]
 pub struct MemTable {
-    skiplist: Option<SkipList<Vec<u8>, Vec<u8>>>,
+    skiplist: Option<SkipList<Vec<u8>>>,
     size_limit: usize,
 }
 
@@ -18,7 +19,7 @@ impl MemTable {
     }
 
     /// 插入键值对
-    pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> bool {
+    pub fn put(&mut self, key: InternalKey, value: Vec<u8>) -> bool {
         self.skiplist.as_mut().unwrap().insert(key, value);
         self.should_flush()
     }
@@ -28,8 +29,17 @@ impl MemTable {
         self.skiplist
             .as_ref()
             .unwrap()
-            .get(&key.to_vec())
+            .get(key)
             .map(|v| v.as_slice())
+    }
+
+    /// 查找键值对
+    pub fn seek(&self, key: &[u8]) -> Option<&[u8]> {
+        self.skiplist
+            .as_ref()
+            .unwrap()
+            .seek(key)
+            .map(|(_, v)| v.as_slice())
     }
 
     /// 是否需要 flush 到 immutable memtable
@@ -37,26 +47,26 @@ impl MemTable {
         self.skiplist.as_ref().unwrap().memory_usage() >= self.size_limit
     }
 
-    /// 遍历所有键值对（用于 flush）
-    pub fn iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
-        self.skiplist
-            .as_ref()
-            .unwrap()
-            .iter()
-            .map(|(k, v)| (k.as_slice(), v.as_slice()))
-    }
+    // /// 遍历所有键值对（用于 flush）
+    // pub fn iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+    //     self.skiplist
+    //         .as_ref()
+    //         .unwrap()
+    //         .iter()
+    //         .map(|(k, v)| (k.as_slice(), v.as_slice()))
+    // }
 
-    pub fn range_iter<'a>(
-        &'a self,
-        start: &'a Vec<u8>,
-        end: &'a Vec<u8>,
-    ) -> impl Iterator<Item = (&'a [u8], &'a [u8])> {
-        self.skiplist
-            .as_ref()
-            .unwrap()
-            .range(start, end)
-            .map(|(k, v)| (k.as_slice(), v.as_slice()))
-    }
+    // pub fn range_iter<'a>(
+    //     &'a self,
+    //     start: &'a Vec<u8>,
+    //     end: &'a Vec<u8>,
+    // ) -> impl Iterator<Item = (&'a [u8], &'a [u8])> {
+    //     self.skiplist
+    //         .as_ref()
+    //         .unwrap()
+    //         .range(start, end)
+    //         .map(|(k, v)| (k.as_slice(), v.as_slice()))
+    // }
 
     pub fn len(&self) -> usize {
         self.skiplist.as_ref().unwrap().len()
@@ -66,13 +76,15 @@ impl MemTable {
         self.skiplist.as_ref().unwrap().memory_usage()
     }
 
-    pub fn replace_skiplist(&mut self) -> Option<SkipList<Vec<u8>, Vec<u8>>> {
+    pub fn replace_skiplist(&mut self) -> Option<SkipList<Vec<u8>>> {
         self.skiplist.replace(SkipList::new())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::goatkv::internal_key::InternalKey;
+
     use super::MemTable;
 
     #[test]
@@ -82,7 +94,7 @@ mod tests {
         for i in 0..1000 {
             let key = format!("key_{:06}", i).into_bytes();
             let value = format!("value_{}", i).into_bytes();
-            memtable.put(key, value);
+            memtable.put(InternalKey::new(key, 0, 1.into()), value);
         }
 
         assert_eq!(memtable.len(), 1000);
