@@ -1,60 +1,95 @@
 use std::collections::VecDeque;
 use std::env;
-use std::path::PathBuf;
-use std::time::SystemTime;
+use std::path::{Path, PathBuf};
 
+use crate::goatkv::db_path_manager::DbPathManager;
 use crate::goatkv::immu_mem_table::ImmutableMemTable;
 use crate::goatkv::internal_key::{InternalKey, InternalKeyKind};
-use crate::goatkv::mem_table::{self, MemTable};
+use crate::goatkv::mem_table::MemTable;
 use crate::goatkv::sequence_number::SequenceNumber;
 use crate::goatkv::wal_manager::{WalIterator, WalManager};
 
+/// LSM-Tree 键值存储引擎
 #[derive(Debug)]
 pub struct KvEngine {
+    /// 路径管理器，统一管理所有数据库文件路径
+    path_manager: DbPathManager,
+    /// WAL 管理器，负责写前日志
     wal_manager: WalManager,
+    /// 序列号生成器
     sequence_number: SequenceNumber,
+    /// 内存表（可写）
     mem_table: MemTable,
+    /// 不可变内存表队列（待刷盘）
     immutable_mem_tables: VecDeque<ImmutableMemTable>,
 }
 
 impl KvEngine {
     const DEFAULT_MEM_TABLE_SIZE: usize = 1024 * 1024; // 默认大小为1MB
 
+    /// 创建新的 KvEngine，使用默认数据目录（当前目录下的 goatdb_data）
     pub fn new() -> Self {
-        // todo 暂时将启动路径定位wal日志的存放路径
-        let mut exec_path = env::current_exe().unwrap();
-        exec_path.pop();
-        exec_path.push("wal.log");
+        let current_dir = env::current_dir().expect("Failed to get current directory");
+        let default_data_dir = current_dir.join("goatdb_data");
 
-        let mut mem_table = mem_table::MemTable::new(Self::DEFAULT_MEM_TABLE_SIZE);
-        let _ = Self::replay(&mut mem_table, &exec_path);
+        Self::new_with_data_dir(default_data_dir)
+            .expect("Failed to create KvEngine with default data directory")
+    }
 
-        let wal_manager = WalManager::new(exec_path).expect("failed to open wal log file");
-        Self {
+    /// 创建新的 KvEngine，使用指定的数据目录
+    ///
+    /// # 参数
+    /// - `data_dir`: 数据目录路径，类似 PostgreSQL 的 pgdata
+    ///
+    /// # 返回
+    /// - `Ok(KvEngine)`: 创建成功
+    /// - `Err(std::io::Error)`: 创建目录或初始化失败
+    pub fn new_with_data_dir<P: AsRef<Path>>(data_dir: P) -> Result<Self, std::io::Error> {
+        // 创建路径管理器
+        let path_manager = DbPathManager::new(data_dir)?;
+
+        // 获取主 WAL 文件路径
+        let wal_path = path_manager.main_wal_path();
+
+        // 创建内存表并尝试从 WAL 恢复
+        let mut mem_table = MemTable::new(Self::DEFAULT_MEM_TABLE_SIZE);
+        let _ = Self::replay(&mut mem_table, &wal_path);
+
+        // 创建 WAL 管理器
+        let wal_manager = WalManager::new(wal_path).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to open WAL file: {}", e),
+            )
+        })?;
+
+        Ok(Self {
+            path_manager,
             wal_manager,
             mem_table,
             immutable_mem_tables: VecDeque::new(),
             sequence_number: SequenceNumber::new(),
-        }
+        })
     }
 
     /// 创建一个新的KvEngine，不尝试从WAL恢复
     /// 主要用于测试
+    #[cfg(test)]
     pub fn new_for_test() -> Self {
-        let mut exec_path = env::current_exe().unwrap();
-        exec_path.pop();
+        // 使用临时目录创建路径管理器
+        let path_manager = DbPathManager::for_test().expect("Failed to create test path manager");
 
-        // 使用时间戳生成唯一文件名，避免测试间的冲突
-        let timestamp = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let filename = format!("test_wal_{}.log", timestamp);
-        exec_path.push(filename);
+        // 获取测试 WAL 文件路径
+        let wal_path = path_manager.main_wal_path();
 
-        let mem_table = mem_table::MemTable::new(Self::DEFAULT_MEM_TABLE_SIZE);
-        let wal_manager = WalManager::new(exec_path).expect("failed to open wal log file");
+        // 创建内存表（不尝试恢复）
+        let mem_table = MemTable::new(Self::DEFAULT_MEM_TABLE_SIZE);
+
+        // 创建 WAL 管理器
+        let wal_manager = WalManager::new(wal_path).expect("Failed to open test WAL file");
+
         Self {
+            path_manager,
             wal_manager,
             mem_table,
             immutable_mem_tables: VecDeque::new(),
@@ -62,6 +97,7 @@ impl KvEngine {
         }
     }
 
+    /// 从 WAL 文件恢复数据到内存表
     fn replay(mem_table: &mut MemTable, exec_path: &PathBuf) -> Result<(), std::io::Error> {
         let wal_iterator = WalIterator::new(exec_path)?;
         for entry in wal_iterator {
@@ -70,7 +106,7 @@ impl KvEngine {
                     mem_table.put(key, value);
                 }
                 Err(err) => {
-                    println!("Failed to replay WAL entry: {}, skiped", err);
+                    println!("Failed to replay WAL entry: {}, skipped", err);
                 }
             }
         }
@@ -79,6 +115,11 @@ impl KvEngine {
 }
 
 impl KvEngine {
+    /// 获取路径管理器引用
+    pub fn path_manager(&self) -> &DbPathManager {
+        &self.path_manager
+    }
+
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         // Helper function to check a single table
         fn check_table<'a>(
@@ -268,5 +309,22 @@ mod tests {
         assert_eq!(engine.get(b"key1"), None);
         assert_eq!(engine.get(b"key2"), Some(b"updated_value2".to_vec()));
         assert_eq!(engine.get(b"key3"), Some(b"value3".to_vec()));
+    }
+
+    #[test]
+    fn test_path_manager_integration() {
+        let engine = KvEngine::new_for_test();
+        let path_manager = engine.path_manager();
+
+        // Verify path manager is properly integrated
+        assert!(path_manager.base_path().exists());
+        assert!(path_manager.data_dir().exists());
+        assert!(path_manager.wal_dir().exists());
+        assert!(path_manager.log_dir().exists());
+        assert!(path_manager.tmp_dir().exists());
+
+        // Verify WAL file is in the correct location
+        let wal_path = path_manager.main_wal_path();
+        assert!(wal_path.parent().unwrap() == path_manager.wal_dir());
     }
 }

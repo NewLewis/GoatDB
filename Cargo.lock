@@ -319,6 +319,7 @@ dependencies = [
  "prost",
  "rand",
  "simple_logger",
+ "tempfile",
  "tokio",
  "tonic",
  "tonic-prost",
