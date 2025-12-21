@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use clap::Parser;
 use goat_db::goatkv::kv_engine::KvEngine;
 use goatkv::{
     goat_kv_service_server::{GoatKvService, GoatKvServiceServer},
@@ -16,6 +17,15 @@ pub mod goatkv {
 #[derive(Debug)]
 pub struct GoatKVServiceImpl {
     engine: Arc<Mutex<KvEngine>>,
+}
+
+impl GoatKVServiceImpl {
+    /// 创建新的服务实例，使用指定的 KvEngine
+    pub fn new(engine: KvEngine) -> Self {
+        Self {
+            engine: Arc::new(Mutex::new(engine)),
+        }
+    }
 }
 
 // 实现 GoatKvService trait
@@ -147,11 +157,40 @@ impl Default for GoatKVServiceImpl {
         }
     }
 }
+#[derive(Parser)]
+#[command(about = "GoatDB gRPC Server")]
+struct Args {
+    #[arg(short, long, default_value = "127.0.0.1:50051")]
+    address: String,
+    #[arg(short, long, help = "Data directory (default: ./goatdb_data)")]
+    data_dir: Option<String>,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "127.0.0.1:50051".parse()?;
-    let service = GoatKVServiceImpl::default();
+    // 解析命令行参数
+    let args = Args::parse();
+
+    let addr = args.address.parse()?;
+
+    // 创建 KvEngine，使用指定的数据目录或默认值
+    let engine = match args.data_dir {
+        Some(dir) => {
+            println!("Using data directory: {}", dir);
+            KvEngine::new_with_data_dir(&dir).map_err(|e| {
+                format!(
+                    "Failed to create KvEngine with data directory '{}': {}",
+                    dir, e
+                )
+            })?
+        }
+        None => {
+            println!("Using default data directory (./goatdb_data)");
+            KvEngine::new()
+        }
+    };
+
+    let service = GoatKVServiceImpl::new(engine);
 
     println!("gRPC Server listening on {}", addr);
     println!("Starting server...");
