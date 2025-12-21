@@ -4,8 +4,10 @@ pub mod immu_mem_table;
 pub mod internal_key;
 pub mod kv_engine;
 pub mod mem_table;
+pub mod options;
 pub mod sequence_number;
 pub mod skip_list;
 pub mod wal_manager;
 
 pub use kv_engine::KvEngine;
+pub use options::KvEngineOptions;

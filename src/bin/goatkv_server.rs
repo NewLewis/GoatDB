@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 use goat_db::goatkv::kv_engine::KvEngine;
+use goat_db::goatkv::KvEngineOptions;
 use goatkv::{
     goat_kv_service_server::{GoatKvService, GoatKvServiceServer},
     DeleteRequest, DeleteResponse, GetRequest, GetResponse, UpdateRequest, UpdateResponse,
@@ -174,21 +175,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = args.address.parse()?;
 
     // 创建 KvEngine，使用指定的数据目录或默认值
-    let engine = match args.data_dir {
-        Some(dir) => {
-            println!("Using data directory: {}", dir);
-            KvEngine::new_with_data_dir(&dir).map_err(|e| {
-                format!(
-                    "Failed to create KvEngine with data directory '{}': {}",
-                    dir, e
-                )
-            })?
-        }
-        None => {
-            println!("Using default data directory (./goatdb_data)");
-            KvEngine::new()
-        }
-    };
+    let mut options = KvEngineOptions::default();
+
+    if let Some(dir) = args.data_dir {
+        println!("Using data directory: {}", dir);
+        options = options.with_data_dir(dir);
+    } else {
+        println!("Using default data directory (./goatdb_data)");
+    }
+
+    let engine = KvEngine::new_with_options(options)
+        .map_err(|e| format!("Failed to create KvEngine: {}", e))?;
 
     let service = GoatKVServiceImpl::new(engine);
 

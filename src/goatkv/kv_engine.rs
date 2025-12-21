@@ -1,11 +1,11 @@
 use std::collections::VecDeque;
-use std::env;
 use std::path::{Path, PathBuf};
 
 use crate::goatkv::db_path_manager::DbPathManager;
 use crate::goatkv::immu_mem_table::ImmutableMemTable;
 use crate::goatkv::internal_key::{InternalKey, InternalKeyKind};
 use crate::goatkv::mem_table::MemTable;
+use crate::goatkv::options::KvEngineOptions;
 use crate::goatkv::sequence_number::SequenceNumber;
 use crate::goatkv::wal_manager::{WalIterator, WalManager};
 
@@ -25,15 +25,10 @@ pub struct KvEngine {
 }
 
 impl KvEngine {
-    const DEFAULT_MEM_TABLE_SIZE: usize = 1024 * 1024; // 默认大小为1MB
-
     /// 创建新的 KvEngine，使用默认数据目录（当前目录下的 goatdb_data）
     pub fn new() -> Self {
-        let current_dir = env::current_dir().expect("Failed to get current directory");
-        let default_data_dir = current_dir.join("goatdb_data");
-
-        Self::new_with_data_dir(default_data_dir)
-            .expect("Failed to create KvEngine with default data directory")
+        let options = KvEngineOptions::default();
+        Self::new_with_options(options).expect("Failed to create KvEngine with default options")
     }
 
     /// 创建新的 KvEngine，使用指定的数据目录
@@ -45,15 +40,32 @@ impl KvEngine {
     /// - `Ok(KvEngine)`: 创建成功
     /// - `Err(std::io::Error)`: 创建目录或初始化失败
     pub fn new_with_data_dir<P: AsRef<Path>>(data_dir: P) -> Result<Self, std::io::Error> {
+        let options = KvEngineOptions::default().with_data_dir(data_dir);
+        Self::new_with_options(options)
+    }
+
+    /// 创建新的 KvEngine，使用指定的配置选项
+    ///
+    /// # 参数
+    /// - `options`: KvEngine 配置选项
+    ///
+    /// # 返回
+    /// - `Ok(KvEngine)`: 创建成功
+    /// - `Err(std::io::Error)`: 创建目录或初始化失败
+    pub fn new_with_options(options: KvEngineOptions) -> Result<Self, std::io::Error> {
         // 创建路径管理器
-        let path_manager = DbPathManager::new(data_dir)?;
+        let path_manager = DbPathManager::new(&options.data_dir)?;
 
         // 获取主 WAL 文件路径
         let wal_path = path_manager.main_wal_path();
 
-        // 创建内存表并尝试从 WAL 恢复
-        let mut mem_table = MemTable::new(Self::DEFAULT_MEM_TABLE_SIZE);
-        let _ = Self::replay(&mut mem_table, &wal_path);
+        // 创建内存表
+        let mut mem_table = MemTable::new(options.mem_table_size);
+
+        // 如果启用 WAL 恢复，则尝试从 WAL 恢复
+        if options.recover_from_wal {
+            let _ = Self::replay(&mut mem_table, &wal_path);
+        }
 
         // 创建 WAL 管理器
         let wal_manager = WalManager::new(wal_path).map_err(|e| {
@@ -76,25 +88,8 @@ impl KvEngine {
     /// 主要用于测试
     #[cfg(test)]
     pub fn new_for_test() -> Self {
-        // 使用临时目录创建路径管理器
-        let path_manager = DbPathManager::for_test().expect("Failed to create test path manager");
-
-        // 获取测试 WAL 文件路径
-        let wal_path = path_manager.main_wal_path();
-
-        // 创建内存表（不尝试恢复）
-        let mem_table = MemTable::new(Self::DEFAULT_MEM_TABLE_SIZE);
-
-        // 创建 WAL 管理器
-        let wal_manager = WalManager::new(wal_path).expect("Failed to open test WAL file");
-
-        Self {
-            path_manager,
-            wal_manager,
-            mem_table,
-            immutable_mem_tables: VecDeque::new(),
-            sequence_number: SequenceNumber::new(),
-        }
+        let options = KvEngineOptions::for_test();
+        Self::new_with_options(options).expect("Failed to create test KvEngine")
     }
 
     /// 从 WAL 文件恢复数据到内存表
