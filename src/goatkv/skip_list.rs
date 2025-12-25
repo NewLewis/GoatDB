@@ -394,6 +394,7 @@ impl<V> SkipList<V> {
 
 // 告诉编辑器：只要K和V是现场安全的，我的skipList就是线程安全的
 unsafe impl<V: Send> Send for SkipList<V> {}
+unsafe impl<V: Sync> Sync for SkipList<V> {}
 
 // ==================== 迭代器 ====================
 

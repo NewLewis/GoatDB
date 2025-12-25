@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use clap::Parser;
 use goat_db::goatkv::kv_engine::KvEngine;
@@ -17,14 +17,14 @@ pub mod goatkv {
 
 #[derive(Debug)]
 pub struct GoatKVServiceImpl {
-    engine: Arc<Mutex<KvEngine>>,
+    engine: Arc<KvEngine>,
 }
 
 impl GoatKVServiceImpl {
     /// 创建新的服务实例，使用指定的 KvEngine
     pub fn new(engine: KvEngine) -> Self {
         Self {
-            engine: Arc::new(Mutex::new(engine)),
+            engine: Arc::new(engine),
         }
     }
 }
@@ -49,7 +49,7 @@ impl GoatKvService for GoatKVServiceImpl {
             return Err(Status::invalid_argument("Key cannot be empty"));
         }
 
-        self.engine.lock().unwrap().put(req.key, req.value);
+        self.engine.put(req.key, req.value);
 
         let reply = WriteResponse {
             success: true,
@@ -69,7 +69,7 @@ impl GoatKvService for GoatKVServiceImpl {
             return Err(Status::invalid_argument("Key cannot be empty"));
         }
 
-        match self.engine.lock().unwrap().get(&req.key) {
+        match self.engine.get(&req.key) {
             Some(value) => {
                 let reply = GetResponse {
                     success: true,
@@ -107,7 +107,7 @@ impl GoatKvService for GoatKVServiceImpl {
         }
 
         // 检查 key 是否存在
-        if self.engine.lock().unwrap().get(&req.key).is_none() {
+        if self.engine.get(&req.key).is_none() {
             let reply = UpdateResponse {
                 success: false,
                 message: format!("Key not found, cannot update"),
@@ -116,7 +116,7 @@ impl GoatKvService for GoatKVServiceImpl {
         }
 
         // 更新 key 的值
-        self.engine.lock().unwrap().put(req.key, req.value);
+        self.engine.put(req.key, req.value);
 
         let reply = UpdateResponse {
             success: true,
@@ -140,7 +140,7 @@ impl GoatKvService for GoatKVServiceImpl {
         }
 
         // 删除 key (即使不存在也会插入删除标记)
-        self.engine.lock().unwrap().delete(req.key);
+        self.engine.delete(req.key);
 
         let reply = DeleteResponse {
             success: true,
@@ -154,7 +154,7 @@ impl GoatKvService for GoatKVServiceImpl {
 impl Default for GoatKVServiceImpl {
     fn default() -> Self {
         Self {
-            engine: Arc::new(Mutex::new(KvEngine::new())),
+            engine: Arc::new(KvEngine::new()),
         }
     }
 }

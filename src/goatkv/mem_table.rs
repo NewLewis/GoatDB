@@ -1,83 +1,134 @@
+use std::sync::{Arc, RwLock};
+
 use crate::goatkv::internal_key::InternalKey;
 use crate::goatkv::skip_list::SkipList;
 
 // ==================== LSM MemTable 封装 ====================
 
-/// LSM-Tree 的 MemTable，使用跳表实现
 #[derive(Debug)]
-pub struct MemTable {
-    skiplist: Option<SkipList<Vec<u8>>>,
+pub struct MemTableInner {
+    skiplist: RwLock<SkipList<Vec<u8>>>,
     size_limit: usize,
 }
 
-impl MemTable {
+impl MemTableInner {
     pub fn new(size_limit: usize) -> Self {
         Self {
-            skiplist: Some(SkipList::new()),
+            skiplist: RwLock::new(SkipList::new()),
             size_limit,
         }
     }
 
     /// 插入键值对
-    pub fn put(&mut self, key: InternalKey, value: Vec<u8>) -> bool {
-        self.skiplist.as_mut().unwrap().insert(key, value);
-        self.should_flush()
+    pub fn put(&self, key: InternalKey, value: Vec<u8>) {
+        self.skiplist.write().unwrap().insert(key, value);
     }
 
     /// 获取值
-    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
-        self.skiplist
-            .as_ref()
-            .unwrap()
-            .get(key)
-            .map(|v| v.as_slice())
+    pub fn get(&self, key: &[u8]) -> Option<(InternalKey, Vec<u8>)> {
+        match self.seek(key) {
+            Some((inter_key, value)) => {
+                if inter_key.user_key() == key {
+                    Some((inter_key, value))
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
     }
 
     /// 查找键值对，返回 (InternalKey, value) 元组
-    pub fn seek(&self, key: &[u8]) -> Option<(&InternalKey, &[u8])> {
+    pub fn seek(&self, key: &[u8]) -> Option<(InternalKey, Vec<u8>)> {
         self.skiplist
-            .as_ref()
+            .read()
             .unwrap()
             .seek(key)
-            .map(|(k, v)| (k, v.as_slice()))
+            .map(|(k, v)| (k.clone(), v.clone()))
     }
 
     /// 是否需要 flush 到 immutable memtable
     pub fn should_flush(&self) -> bool {
-        self.skiplist.as_ref().unwrap().memory_usage() >= self.size_limit
+        self.skiplist.read().unwrap().memory_usage() >= self.size_limit
     }
 
-    // /// 遍历所有键值对（用于 flush）
-    // pub fn iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
-    //     self.skiplist
-    //         .as_ref()
-    //         .unwrap()
-    //         .iter()
-    //         .map(|(k, v)| (k.as_slice(), v.as_slice()))
-    // }
-
-    // pub fn range_iter<'a>(
-    //     &'a self,
-    //     start: &'a Vec<u8>,
-    //     end: &'a Vec<u8>,
-    // ) -> impl Iterator<Item = (&'a [u8], &'a [u8])> {
-    //     self.skiplist
-    //         .as_ref()
-    //         .unwrap()
-    //         .range(start, end)
-    //         .map(|(k, v)| (k.as_slice(), v.as_slice()))
-    // }
-
     pub fn len(&self) -> usize {
-        self.skiplist.as_ref().unwrap().len()
+        self.skiplist.read().unwrap().len()
     }
 
     pub fn memory_usage(&self) -> usize {
-        self.skiplist.as_ref().unwrap().memory_usage()
+        self.skiplist.read().unwrap().memory_usage()
+    }
+}
+
+/// LSM-Tree 的 MemTable，使用跳表实现
+#[derive(Debug)]
+pub struct MemTable {
+    inner: Arc<MemTableInner>,
+}
+
+impl MemTable {
+    pub fn new(size: usize) -> Self {
+        Self {
+            inner: Arc::new(MemTableInner::new(size)),
+        }
     }
 
-    pub fn replace_skiplist(&mut self) -> Option<SkipList<Vec<u8>>> {
-        self.skiplist.replace(SkipList::new())
+    /// 插入键值对
+    pub fn put(&self, key: InternalKey, value: Vec<u8>) {
+        self.inner.put(key, value);
+    }
+
+    /// 获取值
+    pub fn get(&self, key: &[u8]) -> Option<(InternalKey, Vec<u8>)> {
+        self.inner.get(key)
+    }
+
+    /// 查找键值对，返回 (InternalKey, value) 元组
+    pub fn seek(&self, key: &[u8]) -> Option<(InternalKey, Vec<u8>)> {
+        self.inner.seek(key)
+    }
+
+    /// 是否需要 flush 到 immutable memtable
+    pub fn should_flush(&self) -> bool {
+        self.inner.should_flush()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn memory_usage(&self) -> usize {
+        self.inner.memory_usage()
+    }
+
+    pub fn inner(&self) -> Arc<MemTableInner> {
+        self.inner.clone()
+    }
+}
+
+#[derive(Debug)]
+pub struct ImmutableMemTable {
+    inner: Arc<MemTableInner>,
+}
+
+impl ImmutableMemTable {
+    pub fn new(inner: Arc<MemTableInner>) -> Self {
+        Self { inner }
+    }
+
+    /// 获取值
+    pub fn get(&self, key: &[u8]) -> Option<(InternalKey, Vec<u8>)> {
+        self.inner.get(key)
+    }
+
+    /// 查找键值对，返回 (InternalKey, value) 元组
+    pub fn seek(&self, key: &[u8]) -> Option<(InternalKey, Vec<u8>)> {
+        self.inner.seek(key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
     }
 }
 
@@ -89,7 +140,7 @@ mod tests {
 
     #[test]
     fn test_memtable() {
-        let mut memtable = MemTable::new(1024 * 1024); // 1MB
+        let memtable = MemTable::new(1024 * 1024); // 1MB
 
         for i in 0..1000 {
             let key = format!("key_{:06}", i).into_bytes();
@@ -99,7 +150,9 @@ mod tests {
 
         assert_eq!(memtable.len(), 1000);
 
-        let val = memtable.get(b"key_000500");
-        assert_eq!(val, Some(b"value_500".as_slice()));
+        let result = memtable.get(b"key_000500");
+        assert_eq!(result.is_some(), true);
+        let (_, val) = result.unwrap();
+        assert_eq!(val, b"value_500".to_vec());
     }
 }

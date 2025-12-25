@@ -26,7 +26,6 @@ use std::path::{Path, PathBuf};
 /// ```
 /// use goat_db::goatkv::KvEngineOptions;
 ///
-/// let test_options = KvEngineOptions::for_test();
 /// ```
 #[derive(Debug, Clone)]
 pub struct KvEngineOptions {
