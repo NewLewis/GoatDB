@@ -88,7 +88,7 @@ impl KvEngine {
         for entry in wal_iterator {
             match entry {
                 Ok((key, value)) => {
-                    mem_table.put(key, value);
+                    mem_table.put(key, value.into());
                 }
                 Err(err) => {
                     println!("Failed to replay WAL entry: {}, skipped", err);
@@ -149,7 +149,7 @@ impl KvEngine {
 
         // 再写入memtable
         let guard = self.lsm_state.read().unwrap();
-        guard.mem_table.put(internal_key, value.clone());
+        guard.mem_table.put(internal_key, value.into());
 
         // 判断memtable是否已达到容量限制，
         // 达到容量限制则转换成immutable_mem_tables
@@ -172,7 +172,7 @@ impl KvEngine {
 
         // 再写入memtable
         let guard = self.lsm_state.read().unwrap();
-        guard.mem_table.put(internal_key, vec![]);
+        guard.mem_table.put(internal_key, vec![].into());
 
         // 判断memtable是否已达到容量限制，
         // 达到容量限制则转换成immutable_mem_tables

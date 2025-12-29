@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
 
+use bytes::Bytes;
+
 /// InternalKey encoding format:
 /// - Total size: 8 bytes (64 bits)
 /// - Sequence number: 7 bytes (56 bits), stored in the most significant bits
@@ -54,7 +56,7 @@ impl std::fmt::Display for InternalKeyKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InternalKey {
-    user_key: Vec<u8>,
+    user_key: Bytes,
     encoded_sequence_number: u64,
 }
 
@@ -81,7 +83,7 @@ impl InternalKey {
         let encoded_sequence_number = (sequence_number << KIND_BITS) | (kind_byte as u64);
 
         Self {
-            user_key,
+            user_key: user_key.into(),
             encoded_sequence_number,
         }
     }
@@ -93,7 +95,7 @@ impl InternalKey {
     /// - `encoded_sequence_number`: Raw encoded value (sequence_number << 8 | kind)
     pub fn from_encoded(user_key: Vec<u8>, encoded_sequence_number: u64) -> Self {
         Self {
-            user_key,
+            user_key: user_key.into(),
             encoded_sequence_number,
         }
     }

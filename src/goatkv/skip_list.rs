@@ -1,4 +1,5 @@
 use crate::goatkv::internal_key::InternalKey;
+use bytes::Bytes;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use std::cmp::Ordering;
 use std::ptr::NonNull;
@@ -105,56 +106,56 @@ impl Default for Arena {
 const MAX_HEIGHT: usize = 32;
 
 #[repr(C)]
-struct Node<V> {
+struct Node {
     key: InternalKey,
-    value: V,
+    value: Bytes,
     height: usize,
     // tower 紧跟在结构体后面，通过 get_tower 访问
 }
 
-impl<V> Node<V> {
+impl Node {
     /// 获取 tower 数组（存储各层的下一个节点指针）
     #[inline]
-    fn tower(&self) -> &[NodePtr<V>] {
+    fn tower(&self) -> &[NodePtr] {
         unsafe {
-            let tower_ptr = (self as *const Self).add(1) as *const NodePtr<V>;
+            let tower_ptr = (self as *const Self).add(1) as *const NodePtr;
             std::slice::from_raw_parts(tower_ptr, self.height)
         }
     }
 
     #[inline]
-    fn tower_mut(&mut self) -> &mut [NodePtr<V>] {
+    fn tower_mut(&mut self) -> &mut [NodePtr] {
         unsafe {
-            let tower_ptr = (self as *mut Self).add(1) as *mut NodePtr<V>;
+            let tower_ptr = (self as *mut Self).add(1) as *mut NodePtr;
             std::slice::from_raw_parts_mut(tower_ptr, self.height)
         }
     }
 
     #[inline]
-    fn next(&self, level: usize) -> NodePtr<V> {
+    fn next(&self, level: usize) -> NodePtr {
         self.tower()[level]
     }
 
     #[inline]
-    fn set_next(&mut self, level: usize, node: NodePtr<V>) {
+    fn set_next(&mut self, level: usize, node: NodePtr) {
         self.tower_mut()[level] = node;
     }
 }
 
-type NodePtr<V> = Option<NonNull<Node<V>>>;
+type NodePtr = Option<NonNull<Node>>;
 
 // ==================== 跳表实现 ====================
 
 #[derive(Debug)]
-pub struct SkipList<V> {
+pub struct SkipList {
     arena: Arena,
-    head: NonNull<Node<V>>,
+    head: NonNull<Node>,
     max_height: usize, // 当前最大高度
     len: usize,
     rng: SmallRng,
 }
 
-impl<V> SkipList<V> {
+impl SkipList {
     pub fn new() -> Self {
         Self::with_arena(Arena::new())
     }
@@ -174,17 +175,17 @@ impl<V> SkipList<V> {
 
     fn alloc_node(
         arena: &mut Arena,
-        entry: Option<(InternalKey, V)>,
+        entry: Option<(InternalKey, Bytes)>,
         height: usize,
-    ) -> NonNull<Node<V>> {
+    ) -> NonNull<Node> {
         // 计算需要的内存：Node 结构体 + tower 数组
-        let node_size = std::mem::size_of::<Node<V>>();
-        let tower_size = std::mem::size_of::<NodePtr<V>>() * height;
+        let node_size = std::mem::size_of::<Node>();
+        let tower_size = std::mem::size_of::<NodePtr>() * height;
         let total_size = node_size + tower_size;
-        let align = std::mem::align_of::<Node<V>>();
+        let align = std::mem::align_of::<Node>();
 
         let layout = std::alloc::Layout::from_size_align(total_size, align).unwrap();
-        let ptr = arena.alloc_bytes(layout) as *mut Node<V>;
+        let ptr = arena.alloc_bytes(layout) as *mut Node;
 
         unsafe {
             // Initialize node with MaybeUninit to handle head node case
@@ -204,7 +205,7 @@ impl<V> SkipList<V> {
             }
 
             // 初始化 tower 为全 None
-            let tower_ptr = ptr.add(1) as *mut NodePtr<V>;
+            let tower_ptr = ptr.add(1) as *mut NodePtr;
             for i in 0..height {
                 std::ptr::write(tower_ptr.add(i), None);
             }
@@ -223,10 +224,10 @@ impl<V> SkipList<V> {
     }
 }
 
-impl<V> SkipList<V> {
+impl SkipList {
     /// 插入键值对，如果 key 已存在则更新 value 并返回旧值
-    pub fn insert(&mut self, key: InternalKey, value: V) -> Option<&V> {
-        let mut prev = [None::<NonNull<Node<V>>>; MAX_HEIGHT];
+    pub fn insert(&mut self, key: InternalKey, value: Bytes) -> Option<&Bytes> {
+        let mut prev = [None::<NonNull<Node>>; MAX_HEIGHT];
         let mut current = self.head;
 
         // 从最高层开始查找
@@ -282,7 +283,7 @@ impl<V> SkipList<V> {
     }
 
     /// 查找 key
-    pub fn get(&self, key: &[u8]) -> Option<&V> {
+    pub fn get(&self, key: &[u8]) -> Option<&Bytes> {
         let mut current = self.head;
 
         for i in (0..self.max_height).rev() {
@@ -305,7 +306,7 @@ impl<V> SkipList<V> {
     }
 
     /// 查找大于等于 key 的最小元素
-    pub fn seek(&self, key: &[u8]) -> Option<(&InternalKey, &V)> {
+    pub fn seek(&self, key: &[u8]) -> Option<(&InternalKey, &Bytes)> {
         let mut current = self.head;
 
         for i in (0..self.max_height).rev() {
@@ -352,7 +353,7 @@ impl<V> SkipList<V> {
     }
 
     /// 返回迭代器
-    pub fn iter(&self) -> Iter<'_, V> {
+    pub fn iter(&self) -> Iter<'_> {
         let first = unsafe { self.head.as_ref().next(0) };
         Iter {
             current: first,
@@ -360,76 +361,76 @@ impl<V> SkipList<V> {
         }
     }
 
-    // /// 范围迭代器
-    // pub fn range<'a>(&'a self, start: &'a K, end: &'a K) -> RangeIter<'a, K, V> {
-    //     let mut current = self.head;
+    /// 范围迭代器
+    pub fn range<'a>(&'a self, start: &'a InternalKey, end: &'a InternalKey) -> RangeIter<'a> {
+        let mut current = self.head;
 
-    //     // 找到 >= start 的第一个节点
-    //     for i in (0..self.max_height).rev() {
-    //         loop {
-    //             let next = unsafe { current.as_ref().next(i) };
-    //             match next {
-    //                 Some(next_ptr) => {
-    //                     let next_node = unsafe { next_ptr.as_ref() };
-    //                     if next_node.key.cmp(start) == Ordering::Less {
-    //                         current = next_ptr;
-    //                     } else {
-    //                         break;
-    //                     }
-    //                 }
-    //                 None => break,
-    //             }
-    //         }
-    //     }
+        // 找到 >= start 的第一个节点
+        for i in (0..self.max_height).rev() {
+            loop {
+                let next = unsafe { current.as_ref().next(i) };
+                match next {
+                    Some(next_ptr) => {
+                        let next_node = unsafe { next_ptr.as_ref() };
+                        if next_node.key.cmp(start) == Ordering::Less {
+                            current = next_ptr;
+                        } else {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
 
-    //     let start_node = unsafe { current.as_ref().next(0) };
+        let start_node = unsafe { current.as_ref().next(0) };
 
-    //     RangeIter {
-    //         current: start_node,
-    //         end,
-    //         _marker: std::marker::PhantomData,
-    //     }
-    // }
+        RangeIter {
+            current: start_node,
+            end,
+            _marker: std::marker::PhantomData,
+        }
+    }
 }
 
 // 告诉编辑器：只要K和V是现场安全的，我的skipList就是线程安全的
-unsafe impl<V: Send> Send for SkipList<V> {}
-unsafe impl<V: Sync> Sync for SkipList<V> {}
+unsafe impl Send for SkipList {}
+unsafe impl Sync for SkipList {}
 
 // ==================== 迭代器 ====================
 
-pub struct Iter<'a, V> {
-    current: NodePtr<V>,
-    _marker: std::marker::PhantomData<&'a V>,
+pub struct Iter<'a> {
+    current: NodePtr,
+    _marker: std::marker::PhantomData<&'a Bytes>,
 }
 
-impl<'a, V> Iterator for Iter<'a, V> {
-    type Item = (&'a InternalKey, &'a V);
+impl<'a> Iterator for Iter<'a> {
+    type Item = (InternalKey, Bytes);
 
     fn next(&mut self) -> Option<Self::Item> {
         self.current.map(|ptr| {
             let node = unsafe { ptr.as_ref() };
             self.current = node.next(0);
-            (&node.key, &node.value)
+            (node.key.clone(), node.value.clone())
         })
     }
 }
 
-pub struct RangeIter<'a, V> {
-    current: NodePtr<V>,
+pub struct RangeIter<'a> {
+    current: NodePtr,
     end: &'a InternalKey,
-    _marker: std::marker::PhantomData<&'a (InternalKey, V)>,
+    _marker: std::marker::PhantomData<&'a (InternalKey, Bytes)>,
 }
 
-impl<'a, V> Iterator for RangeIter<'a, V> {
-    type Item = (&'a InternalKey, &'a V);
+impl<'a> Iterator for RangeIter<'a> {
+    type Item = (InternalKey, Bytes);
 
     fn next(&mut self) -> Option<Self::Item> {
         self.current.and_then(|ptr| {
             let node = unsafe { ptr.as_ref() };
             if node.key.cmp(self.end) == Ordering::Less {
                 self.current = node.next(0);
-                Some((&node.key, &node.value))
+                Some((node.key.clone(), node.value.clone()))
             } else {
                 None
             }
@@ -437,96 +438,139 @@ impl<'a, V> Iterator for RangeIter<'a, V> {
     }
 }
 
-impl<V> Default for SkipList<V> {
+impl Default for SkipList {
     fn default() -> Self {
         Self::new()
     }
 }
 
-// // ==================== 测试 ====================
+// ==================== 测试 ====================
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::goatkv::internal_key::InternalKeyKind;
 
-//     #[test]
-//     fn test_basic_operations() {
-//         let mut sl: SkipList<i32, String> = SkipList::new();
+    fn make_key(key: &[u8], seq: u64) -> InternalKey {
+        InternalKey::new(key.to_vec(), seq, InternalKeyKind::Put)
+    }
 
-//         // 插入
-//         sl.insert(3, "three".to_string());
-//         sl.insert(1, "one".to_string());
-//         sl.insert(4, "four".to_string());
-//         sl.insert(1, "ONE".to_string()); // 重复 key
-//         sl.insert(5, "five".to_string());
-//         sl.insert(9, "nine".to_string());
-//         sl.insert(2, "two".to_string());
+    #[test]
+    fn test_basic_operations() {
+        let mut sl: SkipList = SkipList::new();
 
-//         // 查找
-//         assert_eq!(sl.get(&1), Some(&"one".to_string()));
-//         assert_eq!(sl.get(&5), Some(&"five".to_string()));
-//         assert_eq!(sl.get(&100), None);
+        // 插入
+        sl.insert(make_key(b"3", 1), Bytes::from("three"));
+        sl.insert(make_key(b"1", 1), Bytes::from("one"));
+        sl.insert(make_key(b"4", 1), Bytes::from("four"));
+        sl.insert(make_key(b"5", 1), Bytes::from("five"));
+        sl.insert(make_key(b"9", 1), Bytes::from("nine"));
+        sl.insert(make_key(b"2", 1), Bytes::from("two"));
 
-//         // 遍历（有序）
-//         let keys: Vec<_> = sl.iter().map(|(k, _)| *k).collect();
-//         assert_eq!(keys, vec![1, 2, 3, 4, 5, 9]);
-//     }
+        // 查找
+        assert_eq!(sl.get(b"1"), Some(&Bytes::from("one")));
+        assert_eq!(sl.get(b"5"), Some(&Bytes::from("five")));
+        assert_eq!(sl.get(b"100"), None);
 
-//     #[test]
-//     fn test_seek() {
-//         let mut sl: SkipList<i32, i32> = SkipList::new();
+        // 遍历（有序）
+        let keys: Vec<_> = sl.iter().map(|(k, _)| k.user_key().to_vec()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                b"1".to_vec(),
+                b"2".to_vec(),
+                b"3".to_vec(),
+                b"4".to_vec(),
+                b"5".to_vec(),
+                b"9".to_vec()
+            ]
+        );
+    }
 
-//         for i in (0..100).step_by(10) {
-//             sl.insert(i, i * 10);
-//         }
+    #[test]
+    fn test_seek() {
+        let mut sl: SkipList = SkipList::new();
 
-//         // seek 到存在的 key
-//         assert_eq!(sl.seek(&50), Some((&50, &500)));
+        // 使用固定宽度的数字格式以避免字典序问题
+        for i in (0..100).step_by(10) {
+            let key_str = format!("{:02}", i);
+            sl.insert(
+                make_key(key_str.as_bytes(), i as u64),
+                Bytes::from((i * 10).to_string()),
+            );
+        }
 
-//         // seek 到不存在的 key，返回下一个
-//         assert_eq!(sl.seek(&55), Some((&60, &600)));
+        // seek 到存在的 key
+        let result = sl.seek(b"50");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0.user_key(), b"50".as_ref());
 
-//         // seek 超过最大值
-//         assert_eq!(sl.seek(&1000), None);
-//     }
+        // seek 到不存在的 key，返回下一个
+        let result = sl.seek(b"55");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0.user_key(), b"60".as_ref());
 
-//     #[test]
-//     fn test_range() {
-//         let mut sl: SkipList<i32, i32> = SkipList::new();
+        // seek 超过最大值
+        assert_eq!(sl.seek(b"99"), None);
+    }
 
-//         for i in 0..100 {
-//             sl.insert(i, i * 10);
-//         }
+    #[test]
+    fn test_range() {
+        let mut sl: SkipList = SkipList::new();
 
-//         let range: Vec<_> = sl.range(&20, &30).map(|(k, _)| *k).collect();
-//         assert_eq!(range, (20..30).collect::<Vec<_>>());
-//     }
+        // 使用固定宽度的数字格式以避免字典序问题
+        for i in 0..100 {
+            let key_str = format!("{:02}", i);
+            sl.insert(
+                make_key(key_str.as_bytes(), i as u64),
+                Bytes::from((i * 10).to_string()),
+            );
+        }
 
-//     #[test]
-//     fn test_large_scale() {
-//         let mut sl: SkipList<u64, u64> = SkipList::new();
-//         let n = 100_000;
+        let start = make_key(b"20", 20);
+        let end = make_key(b"30", 30);
 
-//         // 插入
-//         for i in 0..n {
-//             sl.insert(i, i * 2);
-//         }
-//         assert_eq!(sl.len(), n as usize);
+        let range: Vec<_> = sl
+            .range(&start, &end)
+            .map(|(k, _)| k.user_key().to_vec())
+            .collect();
 
-//         // 查找
-//         for i in 0..n {
-//             assert_eq!(sl.get(&i), Some(&(i * 2)));
-//         }
+        assert_eq!(range.len(), 10);
+        for i in 0..10 {
+            assert_eq!(range[i], format!("{:02}", 20 + i).as_bytes());
+        }
+    }
 
-//         // 验证有序性
-//         let mut prev = None;
-//         for (k, _) in sl.iter() {
-//             if let Some(p) = prev {
-//                 assert!(k > p);
-//             }
-//             prev = Some(k);
-//         }
+    #[test]
+    fn test_large_scale() {
+        let mut sl: SkipList = SkipList::new();
+        let n = 100_000;
 
-//         println!("Memory usage: {} bytes", sl.memory_usage());
-//     }
-// }
+        // 插入
+        for i in 0..n {
+            let key_str = format!("key_{:010}", i);
+            sl.insert(
+                make_key(key_str.as_bytes(), 1),
+                Bytes::from(format!("value_{}", i)),
+            );
+        }
+        assert_eq!(sl.len(), n);
+
+        // 查找
+        for i in 0..n {
+            let key_str = format!("key_{:010}", i);
+            assert!(sl.get(key_str.as_bytes()).is_some());
+        }
+
+        // 验证有序性
+        let mut prev_key: Option<Vec<u8>> = None;
+        for (k, _) in sl.iter() {
+            if let Some(ref prev) = prev_key {
+                assert!(k.user_key() > prev.as_slice());
+            }
+            prev_key = Some(k.user_key().to_vec());
+        }
+
+        println!("Memory usage: {} bytes", sl.memory_usage());
+    }
+}

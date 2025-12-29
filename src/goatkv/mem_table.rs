@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use std::sync::{Arc, RwLock};
 
 use crate::goatkv::internal_key::InternalKey;
@@ -7,7 +8,7 @@ use crate::goatkv::skip_list::SkipList;
 
 #[derive(Debug)]
 pub struct MemTableInner {
-    skiplist: RwLock<SkipList<Vec<u8>>>,
+    skiplist: RwLock<SkipList>,
     size_limit: usize,
 }
 
@@ -20,8 +21,8 @@ impl MemTableInner {
     }
 
     /// 插入键值对
-    pub fn put(&self, key: InternalKey, value: Vec<u8>) {
-        self.skiplist.write().unwrap().insert(key, value);
+    pub fn put(&self, key: InternalKey, value: Bytes) {
+        self.skiplist.write().unwrap().insert(key, value.into());
     }
 
     /// 获取值
@@ -44,7 +45,7 @@ impl MemTableInner {
             .read()
             .unwrap()
             .seek(key)
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| (k.clone(), v.clone().into()))
     }
 
     /// 是否需要 flush 到 immutable memtable
@@ -75,7 +76,7 @@ impl MemTable {
     }
 
     /// 插入键值对
-    pub fn put(&self, key: InternalKey, value: Vec<u8>) {
+    pub fn put(&self, key: InternalKey, value: Bytes) {
         self.inner.put(key, value);
     }
 
@@ -145,7 +146,7 @@ mod tests {
         for i in 0..1000 {
             let key = format!("key_{:06}", i).into_bytes();
             let value = format!("value_{}", i).into_bytes();
-            memtable.put(InternalKey::new(key, 0, 1.into()), value);
+            memtable.put(InternalKey::new(key, 0, 1.into()), value.into());
         }
 
         assert_eq!(memtable.len(), 1000);

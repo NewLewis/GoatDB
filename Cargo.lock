@@ -392,6 +392,7 @@ dependencies = [
 name = "goat_db"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "crc32fast",
  "env_logger",
