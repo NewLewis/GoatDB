@@ -243,7 +243,15 @@ impl KvEngine {
         db_path_manager: Arc<DbPathManager>,
     ) {
         while let Ok(task) = rx.recv() {
-            let filename = format!("{}/{:6}.sst", db_path_manager.data_dir().display(), task.id);
+            let filename = if task.id < 1000000 {
+                format!(
+                    "{}/{:06}.sst",
+                    db_path_manager.data_dir().display(),
+                    task.id
+                )
+            } else {
+                format!("{}/{}.sst", db_path_manager.data_dir().display(), task.id)
+            };
 
             let file = match OpenOptions::new().create(true).write(true).open(&filename) {
                 Ok(f) => f,
