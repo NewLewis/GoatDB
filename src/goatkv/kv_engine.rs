@@ -175,12 +175,15 @@ impl KvEngine {
             .expect("Failed to write to WAL");
 
         // 再写入memtable
-        let guard = self.lsm_state.read().unwrap();
-        guard.mem_table.put(internal_key, value.into());
+        let needs_flush = {
+            let guard = self.lsm_state.read().unwrap();
+            guard.mem_table.put(internal_key, value.into());
+            guard.mem_table.should_flush()
+        };
 
         // 判断memtable是否已达到容量限制，
         // 达到容量限制则转换成immutable_mem_tables
-        if guard.mem_table.should_flush() {
+        if needs_flush {
             self.flush();
         }
     }
@@ -198,36 +201,39 @@ impl KvEngine {
             .expect("Failed to write to WAL");
 
         // 再写入memtable
-        let guard = self.lsm_state.read().unwrap();
-        guard.mem_table.put(internal_key, vec![].into());
+        let needs_flush = {
+            let guard = self.lsm_state.read().unwrap();
+            guard.mem_table.put(internal_key, vec![].into());
+            guard.mem_table.should_flush()
+        };
 
         // 判断memtable是否已达到容量限制，
         // 达到容量限制则转换成immutable_mem_tables
-        if guard.mem_table.should_flush() {
+        if needs_flush {
             self.flush();
         }
     }
 
     pub fn flush(&self) {
-        // 1. 克隆当前的 memtable（不需要持有锁）
         let mem_table = {
-            let state = self.lsm_state.read().unwrap();
-            state.mem_table.clone()
-        };
-
-        // 2. 创建 immutable_mem_table
-        let immutable_mem_table = ImmutableMemTable::new(mem_table.inner());
-
-        // 3. 将 immutable_mem_table 放入队列并创建新的 memtable
-        {
             let mut state = self.lsm_state.write().unwrap();
+
+            // 克隆当前的 memtable
+            let mem_table = state.mem_table.clone();
+
+            // 创建 immutable_mem_table
+            let immutable_mem_table = ImmutableMemTable::new(mem_table.inner());
+
+            // 将 immutable_mem_table 放入队列并创建新的 memtable
             state
                 .immutable_mem_tables
                 .push_front(Arc::new(immutable_mem_table));
             state.mem_table = Arc::new(MemTable::new(self.options.mem_table_size));
-        }
 
-        // 4. 发送 flush 任务到后台线程
+            mem_table
+        };
+
+        // 发送 flush 任务到后台线程
         let task_id = self.flush_task_id.fetch_add(1, Ordering::SeqCst);
         if let Err(e) = self.sender.send(FlushTask {
             id: task_id,
