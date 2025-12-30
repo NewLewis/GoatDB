@@ -4,14 +4,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 
-use crate::goatkv::db_path_manager::DbPathManager;
-use crate::goatkv::internal_key::{InternalKey, InternalKeyKind};
-use crate::goatkv::lsm_state::LSMState;
-use crate::goatkv::mem_table::{ImmutableMemTable, MemTable};
-use crate::goatkv::options::KvEngineOptions;
-use crate::goatkv::sequence_number::SequenceNumber;
-use crate::goatkv::sstable_builder::SSTableBuilder;
-use crate::goatkv::wal_manager::{WalIterator, WalManager};
+use crate::goatkv::core::lsm_state::LSMState;
+use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
+use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
+use crate::goatkv::storage::sstable_builder::SSTableBuilder;
+use crate::goatkv::storage::wal_manager::{WalIterator, WalManager};
+use crate::goatkv::utils::db_path_manager::DbPathManager;
+use crate::goatkv::utils::options::KvEngineOptions;
+use crate::goatkv::utils::sequence_number::SequenceNumber;
 
 #[derive(Debug)]
 struct FlushTask {

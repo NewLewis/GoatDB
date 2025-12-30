@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crc32fast::Hasher;
 
-use crate::goatkv::internal_key::InternalKey;
+use crate::goatkv::encoding::internal_key::InternalKey;
 
 /// Write-Ahead Log (WAL) 管理器
 ///

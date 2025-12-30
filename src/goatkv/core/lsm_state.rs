@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::goatkv::mem_table::{ImmutableMemTable, MemTable};
-use crate::goatkv::options::KvEngineOptions;
+use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
+use crate::goatkv::utils::options::KvEngineOptions;
 
 #[derive(Debug)]
 pub struct LSMState {

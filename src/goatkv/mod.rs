@@ -1,17 +1,9 @@
-// 声明这个文件夹下的其他文件为子模块
-pub mod block_builder;
-pub mod bloom_builder;
-pub mod db_path_manager;
-pub mod internal_key;
-pub mod kv_engine;
-pub mod lsm_state;
-pub mod mem_table;
-pub mod options;
-pub mod sequence_number;
-pub mod skip_list;
-pub mod sstable_builder;
-pub mod varint;
-pub mod wal_manager;
+// 声明子模块
+pub mod core;
+pub mod encoding;
+pub mod storage;
+pub mod utils;
 
-pub use kv_engine::KvEngine;
-pub use options::KvEngineOptions;
+// 重新导出公共接口
+pub use core::KvEngine;
+pub use utils::KvEngineOptions;

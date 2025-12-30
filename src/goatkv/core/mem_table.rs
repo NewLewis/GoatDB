@@ -2,8 +2,8 @@ use bytes::Bytes;
 use ouroboros::self_referencing;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
-use crate::goatkv::internal_key::InternalKey;
-use crate::goatkv::skip_list::{Iter, SkipList};
+use crate::goatkv::core::skip_list::{Iter, SkipList};
+use crate::goatkv::encoding::internal_key::InternalKey;
 
 // ==================== LSM MemTable 封装 ====================
 
@@ -166,7 +166,7 @@ impl ImmutableMemTable {
 
 #[cfg(test)]
 mod tests {
-    use crate::goatkv::internal_key::InternalKey;
+    use crate::goatkv::encoding::internal_key::InternalKey;
 
     use super::MemTable;
 

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use goat_db::goatkv::kv_engine::KvEngine;
-use goat_db::goatkv::KvEngineOptions;
+use goat_db::goatkv::core::kv_engine::KvEngine;
+use goat_db::goatkv::utils::KvEngineOptions;
 use goatkv::{
     goat_kv_service_server::{GoatKvService, GoatKvServiceServer},
     DeleteRequest, DeleteResponse, FlushRequest, FlushResponse, GetRequest, GetResponse,

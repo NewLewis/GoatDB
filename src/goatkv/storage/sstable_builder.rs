@@ -1,9 +1,9 @@
 use std::fs::File;
 use std::io::{self, Write};
 
-use crate::goatkv::block_builder::BlockBuilder;
-use crate::goatkv::bloom_builder::BloomBuilder;
-use crate::goatkv::varint;
+use crate::goatkv::encoding::varint;
+use crate::goatkv::storage::block_builder::BlockBuilder;
+use crate::goatkv::storage::bloom_builder::BloomBuilder;
 
 const MAGIC_NUMBER: u64 = 0x706A725F676F6174;
 

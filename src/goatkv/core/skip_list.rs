@@ -1,4 +1,4 @@
-use crate::goatkv::internal_key::InternalKey;
+use crate::goatkv::encoding::internal_key::InternalKey;
 use bytes::Bytes;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use std::cmp::Ordering;
@@ -449,7 +449,7 @@ impl Default for SkipList {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::goatkv::internal_key::InternalKeyKind;
+    use crate::goatkv::encoding::internal_key::InternalKeyKind;
 
     fn make_key(key: &[u8], seq: u64) -> InternalKey {
         InternalKey::new(key.to_vec(), seq, InternalKeyKind::Put)

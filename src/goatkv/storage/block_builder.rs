@@ -1,4 +1,4 @@
-use crate::goatkv::varint;
+use crate::goatkv::encoding::varint;
 
 const MAX_BLOCK_SIZE: usize = 4 * 1024; // 4KB
 
