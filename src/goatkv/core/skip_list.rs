@@ -1,8 +1,17 @@
-use crate::goatkv::encoding::internal_key::InternalKey;
 use bytes::Bytes;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use std::cmp::Ordering;
+use std::marker::PhantomData;
 use std::ptr::NonNull;
+
+// ==================== 用户键 trait ====================
+
+/// 定义用户键比较操作的 trait
+/// 泛型跳表需要这个 trait 来比较键
+pub trait UserKey: Ord + Clone {
+    /// 获取用户键的字节表示
+    fn user_key(&self) -> &[u8];
+}
 
 // ==================== Arena 分配器 ====================
 
@@ -106,56 +115,69 @@ impl Default for Arena {
 const MAX_HEIGHT: usize = 32;
 
 #[repr(C)]
-struct Node {
-    key: InternalKey,
+struct Node<K>
+where
+    K: UserKey,
+{
+    key: K,
     value: Bytes,
     height: usize,
     // tower 紧跟在结构体后面，通过 get_tower 访问
 }
 
-impl Node {
+impl<K> Node<K>
+where
+    K: UserKey,
+{
     /// 获取 tower 数组（存储各层的下一个节点指针）
     #[inline]
-    fn tower(&self) -> &[NodePtr] {
+    fn tower(&self) -> &[NodePtr<K>] {
         unsafe {
-            let tower_ptr = (self as *const Self).add(1) as *const NodePtr;
+            let tower_ptr = (self as *const Self).add(1) as *const NodePtr<K>;
             std::slice::from_raw_parts(tower_ptr, self.height)
         }
     }
 
     #[inline]
-    fn tower_mut(&mut self) -> &mut [NodePtr] {
+    fn tower_mut(&mut self) -> &mut [NodePtr<K>] {
         unsafe {
-            let tower_ptr = (self as *mut Self).add(1) as *mut NodePtr;
+            let tower_ptr = (self as *mut Self).add(1) as *mut NodePtr<K>;
             std::slice::from_raw_parts_mut(tower_ptr, self.height)
         }
     }
 
     #[inline]
-    fn next(&self, level: usize) -> NodePtr {
+    fn next(&self, level: usize) -> NodePtr<K> {
         self.tower()[level]
     }
 
     #[inline]
-    fn set_next(&mut self, level: usize, node: NodePtr) {
+    fn set_next(&mut self, level: usize, node: NodePtr<K>) {
         self.tower_mut()[level] = node;
     }
 }
 
-type NodePtr = Option<NonNull<Node>>;
+type NodePtr<K> = Option<NonNull<Node<K>>>;
 
 // ==================== 跳表实现 ====================
 
 #[derive(Debug)]
-pub struct SkipList {
+pub struct SkipList<K>
+where
+    K: UserKey,
+{
     arena: Arena,
-    head: NonNull<Node>,
+    head: NonNull<Node<K>>,
     max_height: usize, // 当前最大高度
     len: usize,
     rng: SmallRng,
+    _phantom: PhantomData<K>,
 }
 
-impl SkipList {
+impl<K> SkipList<K>
+where
+    K: UserKey,
+{
     pub fn new() -> Self {
         Self::with_arena(Arena::new())
     }
@@ -170,22 +192,19 @@ impl SkipList {
             max_height: 1,
             len: 0,
             rng: SmallRng::from_entropy(),
+            _phantom: PhantomData,
         }
     }
 
-    fn alloc_node(
-        arena: &mut Arena,
-        entry: Option<(InternalKey, Bytes)>,
-        height: usize,
-    ) -> NonNull<Node> {
+    fn alloc_node(arena: &mut Arena, entry: Option<(K, Bytes)>, height: usize) -> NonNull<Node<K>> {
         // 计算需要的内存：Node 结构体 + tower 数组
-        let node_size = std::mem::size_of::<Node>();
-        let tower_size = std::mem::size_of::<NodePtr>() * height;
+        let node_size = std::mem::size_of::<Node<K>>();
+        let tower_size = std::mem::size_of::<NodePtr<K>>() * height;
         let total_size = node_size + tower_size;
-        let align = std::mem::align_of::<Node>();
+        let align = std::mem::align_of::<Node<K>>();
 
         let layout = std::alloc::Layout::from_size_align(total_size, align).unwrap();
-        let ptr = arena.alloc_bytes(layout) as *mut Node;
+        let ptr = arena.alloc_bytes(layout) as *mut Node<K>;
 
         unsafe {
             // Initialize node with MaybeUninit to handle head node case
@@ -205,7 +224,7 @@ impl SkipList {
             }
 
             // 初始化 tower 为全 None
-            let tower_ptr = ptr.add(1) as *mut NodePtr;
+            let tower_ptr = ptr.add(1) as *mut NodePtr<K>;
             for i in 0..height {
                 std::ptr::write(tower_ptr.add(i), None);
             }
@@ -224,10 +243,13 @@ impl SkipList {
     }
 }
 
-impl SkipList {
+impl<K> SkipList<K>
+where
+    K: UserKey,
+{
     /// 插入键值对，如果 key 已存在则更新 value 并返回旧值
-    pub fn insert(&mut self, key: InternalKey, value: Bytes) -> Option<&Bytes> {
-        let mut prev = [None::<NonNull<Node>>; MAX_HEIGHT];
+    pub fn insert(&mut self, key: K, value: Bytes) -> Option<&Bytes> {
+        let mut prev = [None::<NonNull<Node<K>>>; MAX_HEIGHT];
         let mut current = self.head;
 
         // 从最高层开始查找
@@ -306,7 +328,7 @@ impl SkipList {
     }
 
     /// 查找大于等于 key 的最小元素
-    pub fn seek(&self, key: &[u8]) -> Option<(&InternalKey, &Bytes)> {
+    pub fn seek(&self, key: &[u8]) -> Option<(&K, &Bytes)> {
         let mut current = self.head;
 
         for i in (0..self.max_height).rev() {
@@ -353,16 +375,16 @@ impl SkipList {
     }
 
     /// 返回迭代器
-    pub fn iter(&self) -> Iter<'_> {
+    pub fn iter(&self) -> Iter<'_, K> {
         let first = unsafe { self.head.as_ref().next(0) };
         Iter {
             current: first,
-            _marker: std::marker::PhantomData,
+            _marker: PhantomData,
         }
     }
 
     /// 范围迭代器
-    pub fn range<'a>(&'a self, start: &'a InternalKey, end: &'a InternalKey) -> RangeIter<'a> {
+    pub fn range<'a>(&'a self, start: &'a K, end: &'a K) -> RangeIter<'a, K> {
         let mut current = self.head;
 
         // 找到 >= start 的第一个节点
@@ -388,46 +410,60 @@ impl SkipList {
         RangeIter {
             current: start_node,
             end,
-            _marker: std::marker::PhantomData,
+            _marker: PhantomData,
         }
     }
 }
 
-// 告诉编辑器：只要K和V是现场安全的，我的skipList就是线程安全的
-unsafe impl Send for SkipList {}
-unsafe impl Sync for SkipList {}
+// 告诉编辑器：只要K是现场安全的，我的skipList就是线程安全的
+unsafe impl<K> Send for SkipList<K> where K: UserKey + Send {}
+unsafe impl<K> Sync for SkipList<K> where K: UserKey + Sync {}
 
 // ==================== 迭代器 ====================
 
-pub struct Iter<'a> {
-    current: NodePtr,
-    _marker: std::marker::PhantomData<&'a Bytes>,
+pub struct Iter<'a, K>
+where
+    K: UserKey,
+{
+    current: NodePtr<K>,
+    _marker: PhantomData<&'a K>,
 }
 
-impl<'a> Iterator for Iter<'a> {
-    type Item = (InternalKey, Bytes);
+impl<'a, K> Iterator for Iter<'a, K>
+where
+    K: UserKey,
+{
+    type Item = (K, Bytes);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.current.map(|ptr| {
-            let node = unsafe { ptr.as_ref() };
+        self.current.map(|ptr| unsafe {
+            let node = ptr.as_ref();
             self.current = node.next(0);
+            // 需要克隆key和value
+            // 这里假设K实现了Clone
             (node.key.clone(), node.value.clone())
         })
     }
 }
 
-pub struct RangeIter<'a> {
-    current: NodePtr,
-    end: &'a InternalKey,
-    _marker: std::marker::PhantomData<&'a (InternalKey, Bytes)>,
+pub struct RangeIter<'a, K>
+where
+    K: UserKey,
+{
+    current: NodePtr<K>,
+    end: &'a K,
+    _marker: PhantomData<&'a K>,
 }
 
-impl<'a> Iterator for RangeIter<'a> {
-    type Item = (InternalKey, Bytes);
+impl<'a, K> Iterator for RangeIter<'a, K>
+where
+    K: UserKey,
+{
+    type Item = (K, Bytes);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.current.and_then(|ptr| {
-            let node = unsafe { ptr.as_ref() };
+        self.current.and_then(|ptr| unsafe {
+            let node = ptr.as_ref();
             if node.key.cmp(self.end) == Ordering::Less {
                 self.current = node.next(0);
                 Some((node.key.clone(), node.value.clone()))
@@ -438,7 +474,10 @@ impl<'a> Iterator for RangeIter<'a> {
     }
 }
 
-impl Default for SkipList {
+impl<K> Default for SkipList<K>
+where
+    K: UserKey,
+{
     fn default() -> Self {
         Self::new()
     }
@@ -449,7 +488,7 @@ impl Default for SkipList {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::goatkv::encoding::internal_key::InternalKeyKind;
+    use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
 
     fn make_key(key: &[u8], seq: u64) -> InternalKey {
         InternalKey::new(key.to_vec(), seq, InternalKeyKind::Put)
@@ -457,7 +496,7 @@ mod tests {
 
     #[test]
     fn test_basic_operations() {
-        let mut sl: SkipList = SkipList::new();
+        let mut sl: SkipList<InternalKey> = SkipList::new();
 
         // 插入
         sl.insert(make_key(b"3", 1), Bytes::from("three"));
@@ -489,7 +528,7 @@ mod tests {
 
     #[test]
     fn test_seek() {
-        let mut sl: SkipList = SkipList::new();
+        let mut sl: SkipList<InternalKey> = SkipList::new();
 
         // 使用固定宽度的数字格式以避免字典序问题
         for i in (0..100).step_by(10) {
@@ -516,7 +555,7 @@ mod tests {
 
     #[test]
     fn test_range() {
-        let mut sl: SkipList = SkipList::new();
+        let mut sl: SkipList<InternalKey> = SkipList::new();
 
         // 使用固定宽度的数字格式以避免字典序问题
         for i in 0..100 {
@@ -543,7 +582,7 @@ mod tests {
 
     #[test]
     fn test_large_scale() {
-        let mut sl: SkipList = SkipList::new();
+        let mut sl: SkipList<InternalKey> = SkipList::new();
         let n = 100_000;
 
         // 插入

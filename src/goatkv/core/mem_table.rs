@@ -9,7 +9,7 @@ use crate::goatkv::encoding::internal_key::InternalKey;
 
 #[derive(Debug)]
 pub struct MemTableInner {
-    skiplist: RwLock<SkipList>,
+    skiplist: RwLock<SkipList<InternalKey>>,
     size_limit: usize,
 }
 
@@ -75,10 +75,10 @@ impl MemTableInner {
 
 #[self_referencing]
 struct MemTableIter<'a> {
-    guard: RwLockReadGuard<'a, SkipList>,
+    guard: RwLockReadGuard<'a, SkipList<InternalKey>>,
     #[borrows(guard)]
     #[covariant]
-    iter: Iter<'this>,
+    iter: Iter<'this, InternalKey>,
 }
 
 impl<'a> Iterator for MemTableIter<'a> {

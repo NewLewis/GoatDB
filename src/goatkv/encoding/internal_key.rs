@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 
+use crate::goatkv::core::skip_list::UserKey;
 use bytes::Bytes;
 
 /// InternalKey encoding format:
@@ -148,6 +149,12 @@ impl Ord for InternalKey {
             }
             ordering => ordering,
         }
+    }
+}
+
+impl UserKey for InternalKey {
+    fn user_key(&self) -> &[u8] {
+        self.user_key()
     }
 }
 
