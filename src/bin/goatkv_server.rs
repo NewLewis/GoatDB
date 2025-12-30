@@ -5,8 +5,8 @@ use goat_db::goatkv::kv_engine::KvEngine;
 use goat_db::goatkv::KvEngineOptions;
 use goatkv::{
     goat_kv_service_server::{GoatKvService, GoatKvServiceServer},
-    DeleteRequest, DeleteResponse, GetRequest, GetResponse, UpdateRequest, UpdateResponse,
-    WriteRequest, WriteResponse,
+    DeleteRequest, DeleteResponse, FlushRequest, FlushResponse, GetRequest, GetResponse,
+    UpdateRequest, UpdateResponse, WriteRequest, WriteResponse,
 };
 use tonic::{transport::Server, Request, Response, Status};
 
@@ -145,6 +145,23 @@ impl GoatKvService for GoatKVServiceImpl {
         let reply = DeleteResponse {
             success: true,
             message: format!("Deleted successfully"),
+        };
+
+        Ok(Response::new(reply))
+    }
+
+    async fn flush(
+        &self,
+        _request: Request<FlushRequest>,
+    ) -> Result<Response<FlushResponse>, Status> {
+        println!("Received flush request");
+
+        // 调用 engine 的 flush 方法
+        self.engine.flush();
+
+        let reply = FlushResponse {
+            success: true,
+            message: format!("Flush triggered successfully"),
         };
 
         Ok(Response::new(reply))

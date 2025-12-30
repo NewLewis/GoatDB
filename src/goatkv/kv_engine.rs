@@ -1,5 +1,8 @@
+use std::fs::OpenOptions;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::thread;
 
 use crate::goatkv::db_path_manager::DbPathManager;
 use crate::goatkv::internal_key::{InternalKey, InternalKeyKind};
@@ -7,7 +10,14 @@ use crate::goatkv::lsm_state::LSMState;
 use crate::goatkv::mem_table::{ImmutableMemTable, MemTable};
 use crate::goatkv::options::KvEngineOptions;
 use crate::goatkv::sequence_number::SequenceNumber;
+use crate::goatkv::sstable_builder::SSTableBuilder;
 use crate::goatkv::wal_manager::{WalIterator, WalManager};
+
+#[derive(Debug)]
+struct FlushTask {
+    _mem_table: Arc<MemTable>,
+    id: usize,
+}
 
 /// LSM-Tree 键值存储引擎
 #[derive(Debug)]
@@ -22,6 +32,12 @@ pub struct KvEngine {
     lsm_state: Arc<RwLock<LSMState>>,
     /// 配置选项
     options: Arc<KvEngineOptions>,
+    /// 发送器，用于发送 FlushTask 到后台线程
+    sender: mpsc::Sender<FlushTask>,
+    /// 后台线程句柄，用于管理后台线程
+    _bg_thread_handle: thread::JoinHandle<()>,
+    /// 当前正在执行的 FlushTask 的 ID
+    flush_task_id: AtomicUsize,
 }
 
 impl KvEngine {
@@ -41,7 +57,7 @@ impl KvEngine {
     /// - `Err(std::io::Error)`: 创建目录或初始化失败
     pub fn new_with_options(options: KvEngineOptions) -> Result<Self, std::io::Error> {
         // 创建路径管理器
-        let path_manager = DbPathManager::new(&options.data_dir)?;
+        let path_manager = Arc::new(DbPathManager::new(&options.data_dir)?);
 
         // 获取主 WAL 文件路径
         let wal_path = path_manager.main_wal_path();
@@ -63,14 +79,25 @@ impl KvEngine {
         })?;
 
         // 创建 LSM 状态管理器
-        let lsm_state = LSMState::new(&options);
+        let lsm_state = Arc::new(RwLock::new(LSMState::new(&options)));
+
+        // 启动后台线程，用于处理 FlushTask
+        let cloned_lsm_state = lsm_state.clone();
+        let cloned_db_path = path_manager.clone();
+        let (tx, rx) = mpsc::channel::<FlushTask>();
+        let bg_thread_handle = thread::spawn(move || {
+            Self::flush_loop(rx, cloned_lsm_state, cloned_db_path);
+        });
 
         Ok(Self {
-            path_manager: Arc::new(path_manager),
+            path_manager,
             wal_manager: Arc::new(Mutex::new(wal_manager)),
             sequence_number: Arc::new(SequenceNumber::new()),
-            lsm_state: Arc::new(RwLock::new(lsm_state)),
+            lsm_state,
             options: Arc::new(options),
+            sender: tx,
+            _bg_thread_handle: bg_thread_handle,
+            flush_task_id: AtomicUsize::new(0),
         })
     }
 
@@ -154,7 +181,7 @@ impl KvEngine {
         // 判断memtable是否已达到容量限制，
         // 达到容量限制则转换成immutable_mem_tables
         if guard.mem_table.should_flush() {
-            self.flush_into_immutable();
+            self.flush();
         }
     }
 
@@ -167,7 +194,7 @@ impl KvEngine {
         self.wal_manager
             .lock()
             .unwrap()
-            .write(&internal_key, &[] as &[u8])
+            .write(&internal_key, &[][..])
             .expect("Failed to write to WAL");
 
         // 再写入memtable
@@ -177,25 +204,91 @@ impl KvEngine {
         // 判断memtable是否已达到容量限制，
         // 达到容量限制则转换成immutable_mem_tables
         if guard.mem_table.should_flush() {
-            self.flush_into_immutable();
+            self.flush();
         }
     }
 
-    fn flush_into_immutable(&self) {
-        let mut state = self.lsm_state.write().unwrap();
+    pub fn flush(&self) {
+        // 1. 克隆当前的 memtable（不需要持有锁）
+        let mem_table = {
+            let state = self.lsm_state.read().unwrap();
+            state.mem_table.clone()
+        };
 
-        // 1. 拿到当前的memtable
-        let mem_table = state.mem_table.clone();
-
-        // 2. 用旧的跳表初始化一个immutable_mem_table
+        // 2. 创建 immutable_mem_table
         let immutable_mem_table = ImmutableMemTable::new(mem_table.inner());
 
-        // 3. 将immutable_mem_table放入immutable_mem_tables中
-        state
-            .immutable_mem_tables
-            .push_front(Arc::new(immutable_mem_table));
+        // 3. 将 immutable_mem_table 放入队列并创建新的 memtable
+        {
+            let mut state = self.lsm_state.write().unwrap();
+            state
+                .immutable_mem_tables
+                .push_front(Arc::new(immutable_mem_table));
+            state.mem_table = Arc::new(MemTable::new(self.options.mem_table_size));
+        }
 
-        state.mem_table = Arc::new(MemTable::new(self.options.mem_table_size));
+        // 4. 发送 flush 任务到后台线程
+        let task_id = self.flush_task_id.fetch_add(1, Ordering::SeqCst);
+        if let Err(e) = self.sender.send(FlushTask {
+            id: task_id,
+            _mem_table: mem_table,
+        }) {
+            eprintln!("Failed to send flush task: {}", e);
+        }
+    }
+
+    fn flush_loop(
+        rx: mpsc::Receiver<FlushTask>,
+        lsm_state: Arc<RwLock<LSMState>>,
+        db_path_manager: Arc<DbPathManager>,
+    ) {
+        while let Ok(task) = rx.recv() {
+            let filename = format!("{}/{:6}.sst", db_path_manager.data_dir().display(), task.id);
+
+            let file = match OpenOptions::new().create(true).write(true).open(&filename) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("Failed to open SSTable file {}: {}", filename, e);
+                    continue;
+                }
+            };
+
+            let mut sst_builder = SSTableBuilder::new(file);
+
+            // 获取 immutable_memtable 并克隆数据，避免长时间持有锁
+            let entries: Vec<(Vec<u8>, Vec<u8>)> = {
+                let lsm_state_guard = lsm_state.read().unwrap();
+                let imm_table = match lsm_state_guard.immutable_mem_tables.front() {
+                    Some(t) => t,
+                    None => {
+                        eprintln!("No immutable memtable found for task id={}", task.id);
+                        continue;
+                    }
+                };
+
+                imm_table
+                    .iter()
+                    .map(|(key, value)| {
+                        let mut serialized_key = Vec::new();
+                        serialized_key.extend_from_slice(key.user_key());
+                        serialized_key
+                            .extend_from_slice(&key.encoded_sequence_number().to_le_bytes());
+                        (serialized_key, value.to_vec())
+                    })
+                    .collect()
+            };
+
+            // 在不持有锁的情况下写入 SSTable
+            for (key, value) in entries {
+                sst_builder.write(&key, &value);
+            }
+
+            sst_builder.finish();
+
+            // 从 immutable_mem_tables 中移除已刷盘的 memtable
+            let mut lsm_state_guard = lsm_state.write().unwrap();
+            lsm_state_guard.immutable_mem_tables.pop_front();
+        }
     }
 }
 

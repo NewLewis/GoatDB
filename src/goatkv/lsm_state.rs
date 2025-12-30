@@ -10,7 +10,6 @@ pub struct LSMState {
     pub mem_table: Arc<MemTable>,
     /// 不可变内存表队列（待刷盘）
     pub immutable_mem_tables: VecDeque<Arc<ImmutableMemTable>>,
-    // todo SSTable
 }
 
 impl LSMState {

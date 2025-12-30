@@ -1,8 +1,9 @@
 use bytes::Bytes;
-use std::sync::{Arc, RwLock};
+use ouroboros::self_referencing;
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 use crate::goatkv::internal_key::InternalKey;
-use crate::goatkv::skip_list::SkipList;
+use crate::goatkv::skip_list::{Iter, SkipList};
 
 // ==================== LSM MemTable 封装 ====================
 
@@ -48,6 +49,16 @@ impl MemTableInner {
             .map(|(k, v)| (k.clone(), v.clone().into()))
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = (InternalKey, Bytes)> + '_ {
+        let guard = self.skiplist.read().unwrap();
+
+        MemTableIterBuilder {
+            guard: guard,
+            iter_builder: |guard| guard.iter(),
+        }
+        .build()
+    }
+
     /// 是否需要 flush 到 immutable memtable
     pub fn should_flush(&self) -> bool {
         self.skiplist.read().unwrap().memory_usage() >= self.size_limit
@@ -59,6 +70,22 @@ impl MemTableInner {
 
     pub fn memory_usage(&self) -> usize {
         self.skiplist.read().unwrap().memory_usage()
+    }
+}
+
+#[self_referencing]
+struct MemTableIter<'a> {
+    guard: RwLockReadGuard<'a, SkipList>,
+    #[borrows(guard)]
+    #[covariant]
+    iter: Iter<'this>,
+}
+
+impl<'a> Iterator for MemTableIter<'a> {
+    type Item = (InternalKey, Bytes);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.with_iter_mut(|iter| iter.next())
     }
 }
 
@@ -130,6 +157,10 @@ impl ImmutableMemTable {
 
     pub fn len(&self) -> usize {
         self.inner.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (InternalKey, Bytes)> + '_ {
+        self.inner.iter()
     }
 }
 

@@ -103,6 +103,8 @@ enum Commands {
         /// 键
         key: String,
     },
+    /// 手动触发 flush
+    Flush,
 }
 
 /// 交互式 REPL 客户端
@@ -157,6 +159,7 @@ async fn run_interactive(
                             "get" => handle_get(&mut client, &args_refs[1..]).await,
                             "update" => handle_update(&mut client, &args_refs[1..]).await,
                             "delete" => handle_delete(&mut client, &args_refs[1..]).await,
+                            "flush" => handle_flush(&mut client).await,
                             _ => {
                                 println!(
                                     "Unknown command: {}. Type 'help' for available commands.",
@@ -199,6 +202,7 @@ fn print_help() {
     println!("  get <key>           - Get the value of a key");
     println!("  update <key> <value> - Update an existing key's value");
     println!("  delete <key>        - Delete a key-value pair");
+    println!("  flush               - Manually trigger flush");
     println!("  exit, quit, :q      - Exit the client");
     println!("  help, :help         - Show this help message");
     println!("\nExamples:");
@@ -206,6 +210,7 @@ fn print_help() {
     println!("  put \"key with spaces\" \"value with spaces\"");
     println!("  get my_key");
     println!("  delete \"key with spaces\"");
+    println!("  flush");
 }
 
 /// 处理 put 命令
@@ -307,6 +312,23 @@ async fn handle_delete(
     Ok(())
 }
 
+/// 处理 flush 命令
+async fn handle_flush(
+    client: &mut GoatKvServiceClient<Channel>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = tonic::Request::new(goatkv::FlushRequest {});
+    let response = client.flush(request).await?;
+    let resp_data = response.into_inner();
+
+    if resp_data.success {
+        println!("✓ Success: {}", resp_data.message);
+    } else {
+        println!("✗ Failed: {}", resp_data.message);
+    }
+
+    Ok(())
+}
+
 /// 执行单次命令
 async fn execute_command(
     mut client: GoatKvServiceClient<Channel>,
@@ -329,6 +351,7 @@ async fn execute_command(
             let args = vec![key.as_str()];
             handle_delete(&mut client, &args).await
         }
+        Commands::Flush => handle_flush(&mut client).await,
     }
 }
 
