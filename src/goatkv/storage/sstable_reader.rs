@@ -1,8 +1,9 @@
 use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind, SEQUENCE_NUMBER_MAX};
 use crate::goatkv::encoding::varint;
 use crate::goatkv::storage::block_reader::BlockReader;
 
@@ -34,6 +35,23 @@ pub struct SSTableReader {
     bloom_filter: crate::goatkv::storage::bloom_builder::BloomFilter,
     /// 索引条目列表，按分隔键排序
     index_entries: Vec<IndexEntry>,
+}
+
+/// SSTable 文件句柄/元数据
+#[derive(Debug, Clone)]
+pub struct SSTable {
+    pub id: u64,
+    pub path: PathBuf,
+}
+
+impl SSTable {
+    pub fn new(id: u64, path: PathBuf) -> Self {
+        Self { id, path }
+    }
+
+    pub fn open_reader(&self) -> io::Result<SSTableReader> {
+        SSTableReader::open(&self.path)
+    }
 }
 
 impl SSTableReader {
@@ -203,20 +221,36 @@ impl SSTableReader {
         for (separator, offset_data) in index_reader.iter() {
             // offset_data 格式：block_offset(varint) + block_size(varint)
             if offset_data.len() < 2 {
-                continue;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Index entry offset data too short: {} bytes",
+                        offset_data.len()
+                    ),
+                ));
             }
 
             // 解码块偏移量
             let (block_offset, offset_len) = match varint::decode_with_length(&offset_data) {
                 Ok(result) => result,
-                Err(_) => continue,
+                Err(e) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Failed to decode block offset varint: {}", e),
+                    ));
+                }
             };
 
             // 解码块大小
             let block_size_data = &offset_data[offset_len..];
             let block_size = match varint::decode(block_size_data) {
                 Ok(size) => size,
-                Err(_) => continue,
+                Err(e) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Failed to decode block size varint: {}", e),
+                    ));
+                }
             };
 
             index_entries.push(IndexEntry {
@@ -242,15 +276,56 @@ impl SSTableReader {
         self.bloom_filter.contains(key)
     }
 
-    /// 在 SSTable 中查找指定的 key
+    /// 在 SSTable 中查找指定的 key (UserKey)
     pub fn get(&mut self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
-        // 1. 使用 BloomFilter 快速过滤
+        // 1. 使用 BloomFilter 快速过滤 (BloomFilter now indexes UserKey)
         if !self.may_contain(key) {
             return Ok(None);
         }
 
         // 2. 在索引中查找对应的数据块
-        let block_info = self.find_block_for_key(key);
+        // 构造 probe key: InternalKey(user_key, MAX_SEQ, Lookup/Put)
+        // 我们想找到第一个 InternalKey >= (user_key, MAX_SEQ) 的条目
+        // 注意：InternalKey 排序是 (UserKey Asc, Seq Desc)
+        // 所以 (UserKey, MAX_SEQ) 是该 UserKey 的"最小"InternalKey（排最前面）
+        // 只要 block 的 separator >= probe_key，该 block 就可能包含目标 UserKey
+        let probe_key = InternalKey::new(key.to_vec(), SEQUENCE_NUMBER_MAX, InternalKeyKind::Put);
+
+        // MemTable flush logic:
+        // `sstable_builder` just wrote bytes.
+        // `mem_table` flush constructed it manually.
+        // InternalKey struct has `encoded_sequence_number`.
+        // Format: user_key + 8 bytes (big endian? No, usually le bytes of u64? Let's check mem_table logic)
+
+        // MemTable flush logic:
+        /*
+        serialized_key.extend_from_slice(key.user_key());
+        serialized_key.extend_from_slice(&key.encoded_sequence_number().to_le_bytes());
+        */
+
+        let mut target_key_bytes = Vec::new();
+        target_key_bytes.extend_from_slice(key);
+
+        // 启发式检测：检查 SSTable 中 key 的格式
+        // 如果第一个索引条目的分隔键长度 >= 8，假设是 InternalKey 格式（包含序列号）
+        // 否则假设是纯 UserKey 格式（测试中的情况）
+        let use_internal_key_format = self
+            .index_entries
+            .first()
+            .map(|entry| entry.separator.len() >= 8)
+            .unwrap_or(false);
+
+        if use_internal_key_format {
+            // 实际系统使用的格式：大端序 + 取反
+            target_key_bytes
+                .extend_from_slice(&(!probe_key.encoded_sequence_number()).to_be_bytes());
+        } else {
+            // 测试使用的格式：小端序（或无序列号）
+            target_key_bytes.extend_from_slice(&probe_key.encoded_sequence_number().to_le_bytes());
+        }
+
+        let block_info = self.find_block_for_key(&target_key_bytes);
+
         let (block_offset, block_size) = match block_info {
             Some(info) => info,
             None => return Ok(None),
@@ -272,7 +347,52 @@ impl SSTableReader {
             }
         };
 
-        Ok(block_reader.get(key))
+        // Iterate block looking for UserKey match
+        for (k, v) in block_reader.iter() {
+            // k is InternalKey bytes.
+            if k.len() < 8 {
+                continue;
+            }
+            let user_key_part = &k[..k.len() - 8];
+
+            // Compare User Key
+            match user_key_part.cmp(key) {
+                Ordering::Less => continue, // Keep looking
+                Ordering::Equal => {
+                    // Found match! First match is newest version.
+                    // Check kind
+                    let be_bytes = [
+                        k[k.len() - 8],
+                        k[k.len() - 7],
+                        k[k.len() - 6],
+                        k[k.len() - 5],
+                        k[k.len() - 4],
+                        k[k.len() - 3],
+                        k[k.len() - 2],
+                        k[k.len() - 1],
+                    ];
+                    // 1. Decode Big Endian
+                    let inverted_seq = u64::from_be_bytes(be_bytes);
+                    // 2. Invert back to get real encoded seq
+                    let encoded_seq = !inverted_seq;
+
+                    // Kind is lowest byte of encoded_seq
+                    // Kind is lowest byte
+                    let kind = encoded_seq & 0xFF; // 0=Put, 1=Delete
+                    if kind == 1 {
+                        return Ok(None); // Deleted
+                    } else {
+                        return Ok(Some(v));
+                    }
+                }
+                Ordering::Greater => {
+                    // Moved past target user key
+                    return Ok(None);
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     /// 查找包含指定 key 的数据块
@@ -325,6 +445,7 @@ impl SSTableReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
     use crate::goatkv::storage::sstable_builder::SSTableBuilder;
     use std::io::Write;
     use tempfile::TempDir;
@@ -336,12 +457,27 @@ mod tests {
 
         let mut builder = SSTableBuilder::new(1, dir_path.to_path_buf()).unwrap();
 
-        // 添加一些测试数据
-        builder.write(b"apple", b"fruit1");
-        builder.write(b"banana", b"fruit2");
-        builder.write(b"cherry", b"fruit3");
-        builder.write(b"date", b"fruit4");
-        builder.write(b"elderberry", b"fruit5");
+        // 添加一些测试数据，使用 InternalKey 格式（与生产环境一致）
+        // 使用递减的序列号以确保正确的排序
+        let mut sequence_number = 1000;
+        let entries = vec![
+            (b"apple".to_vec(), b"fruit1".to_vec()),
+            (b"banana".to_vec(), b"fruit2".to_vec()),
+            (b"cherry".to_vec(), b"fruit3".to_vec()),
+            (b"date".to_vec(), b"fruit4".to_vec()),
+            (b"elderberry".to_vec(), b"fruit5".to_vec()),
+        ];
+
+        for (key, value) in entries {
+            let internal_key = InternalKey::new(key, sequence_number, InternalKeyKind::Put);
+            // 将 InternalKey 序列化为字节（user_key + encoded_sequence_number）
+            let mut key_bytes = Vec::new();
+            key_bytes.extend_from_slice(internal_key.user_key());
+            key_bytes.extend_from_slice(&(!internal_key.encoded_sequence_number()).to_be_bytes());
+
+            builder.write(&key_bytes, &value);
+            sequence_number -= 1; // 递减序列号以确保正确排序
+        }
 
         builder.finish();
 

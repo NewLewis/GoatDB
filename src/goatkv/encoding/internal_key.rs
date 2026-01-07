@@ -18,7 +18,7 @@ use bytes::Bytes;
 
 const SEQUENCE_NUMBER_BITS: u32 = 56;
 const KIND_BITS: u32 = 8;
-const SEQUENCE_NUMBER_MAX: u64 = (1 << SEQUENCE_NUMBER_BITS) - 1;
+pub const SEQUENCE_NUMBER_MAX: u64 = (1 << SEQUENCE_NUMBER_BITS) - 1;
 const KIND_MASK: u64 = 0xFF;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

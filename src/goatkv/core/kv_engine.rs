@@ -7,7 +7,9 @@ use crate::goatkv::core::lsm_state::LSMState;
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
 use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
 use crate::goatkv::storage::sstable_builder::SSTableBuilder;
+use crate::goatkv::storage::sstable_reader::SSTableReader;
 use crate::goatkv::storage::wal_manager::{WalIterator, WalManager};
+
 use crate::goatkv::utils::db_path_manager::DbPathManager;
 use crate::goatkv::utils::options::KvEngineOptions;
 use crate::goatkv::utils::sequence_number::SequenceNumber;
@@ -156,7 +158,19 @@ impl KvEngine {
             }
         }
 
-        // todo sstable
+        // Then check sstables
+        let sstables = lsm_state.sstables.clone();
+        for sstable in sstables {
+            let mut reader = sstable.lock().unwrap();
+            match reader.get(key) {
+                Ok(Some(value)) => return Some(value),
+                Ok(None) => continue, // Not found in this sstable, check next
+                Err(e) => {
+                    eprintln!("Failed to read from sstable: {}", e);
+                    continue;
+                }
+            }
+        }
 
         // Key not found
         None
@@ -273,8 +287,17 @@ impl KvEngine {
                     .map(|(key, value)| {
                         let mut serialized_key = Vec::new();
                         serialized_key.extend_from_slice(key.user_key());
+                        // 关键修正：使用 Big Endian 并取反 (!seq)
+                        // 原因：
+                        // 1. 我们希望 Sequence Number 越大，Key 越小 (Logical Order: Seq Desc)
+                        // 2. SSTable 字节序排序是 Ascending
+                        // 3. !seq (取反) 后，大 Seq 变成小数值
+                        // 4. Big Endian 保证字节序比较等同于数值比较
+                        // 例如:
+                        // Seq 200 (Encoded) -> !200 -> Small Value -> Small Bytes -> First in SSTable
+                        // Seq 100 (Encoded) -> !100 -> Large Value -> Large Bytes -> Later in SSTable
                         serialized_key
-                            .extend_from_slice(&key.encoded_sequence_number().to_le_bytes());
+                            .extend_from_slice(&(!key.encoded_sequence_number()).to_be_bytes());
                         (serialized_key, value.to_vec())
                     })
                     .collect()
@@ -285,12 +308,35 @@ impl KvEngine {
                 sst_builder.write(&key, &value);
             }
 
-            sst_builder.finish();
+            let sstable = match sst_builder.finish() {
+                Ok(sst) => sst,
+                Err(e) => {
+                    eprintln!("Failed to finish SSTable {}: {}", task.id, e);
+                    continue;
+                }
+            };
 
-            // 从 immutable_mem_tables 中移除已刷盘的 memtable
+            let reader = match sstable.open_reader() {
+                Ok(reader) => reader,
+                Err(e) => {
+                    eprintln!("Failed to open newly created SSTable {:?}: {}", sstable.path, e);
+                    continue;
+                }
+            };
+
+            // 从 immutable_mem_tables 中移除已刷盘的 memtable，并将 SSTableReader 添加到 sstables
+            // 注意：需要获取写锁
             let mut lsm_state_guard = lsm_state.write().unwrap();
+            
+            // 添加到 SSTable 列表头部（最新的在最前面）
+            lsm_state_guard
+                .sstables
+                .insert(0, Arc::new(Mutex::new(reader)));
+            
+            // 移除 old memtable
             lsm_state_guard.immutable_mem_tables.pop_front();
         }
+
     }
 }
 
@@ -388,5 +434,44 @@ mod tests {
         // Verify WAL file is in the correct location
         let wal_path = path_manager.main_wal_path();
         assert!(wal_path.parent().unwrap() == path_manager.wal_dir());
+    }
+
+    #[test]
+    fn test_flush_and_read() {
+        let engine = KvEngine::new_for_test();
+
+        // 1. Write data
+        engine.put(b"persist_key".to_vec(), b"persist_value".to_vec());
+        assert_eq!(engine.get(b"persist_key"), Some(b"persist_value".to_vec()));
+
+        // 2. Trigger flush
+        engine.flush();
+
+        // 3. Wait for flush to complete (poll sstables count)
+        // Since flush is async, we wait until sstables count becomes 1
+        let mut flushed = false;
+        for _ in 0..50 {
+            let state = engine.lsm_state.read().unwrap();
+            if !state.sstables.is_empty() {
+                flushed = true;
+                break;
+            }
+            drop(state); // release lock
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(flushed, "Flush timed out or failed");
+
+        // 4. Verify data is still readable
+        // This should read from SSTable now because memtable was flushed
+        // (technically the key might still be in the NEW memtable if we didn't clear it,
+        // but flush creates a NEW empty memtable. The OLD one became immutable and then flushed.
+        // So the key is definitely NOT in the current memtable.)
+        assert_eq!(engine.get(b"persist_key"), Some(b"persist_value".to_vec()));
+        
+        // 5. Verify it's actually in SSTable (white-box check)
+        let state = engine.lsm_state.read().unwrap();
+        assert_eq!(state.sstables.len(), 1);
+        let sstable = state.sstables[0].lock().unwrap();
+        assert!(sstable.may_contain(b"persist_key"));
     }
 }

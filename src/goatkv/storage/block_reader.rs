@@ -145,8 +145,16 @@ impl<'a> BlockReader<'a> {
                 Ok((shared, entry_key, entry_value)) => {
                     // 重建完整的key
                     let full_key = if prev_key.is_empty() {
+                        // 第一个条目的共享长度应该为0
+                        if shared != 0 {
+                            return None; // 数据损坏，第一个条目的共享长度应该为0
+                        }
                         entry_key.clone()
                     } else {
+                        // 检查共享长度是否有效
+                        if shared as usize > prev_key.len() {
+                            return None; // 数据损坏，共享长度无效
+                        }
                         let mut full_key = Vec::new();
                         full_key.extend_from_slice(&prev_key[..shared as usize]);
                         full_key.extend_from_slice(&entry_key);
@@ -192,8 +200,16 @@ impl<'a> BlockReader<'a> {
 
                     // 重建完整的key
                     let full_key = if prev_key.is_empty() {
+                        // 第一个条目的共享长度应该为0
+                        if shared != 0 {
+                            return None; // 数据损坏，第一个条目的共享长度应该为0
+                        }
                         unshared_key.clone()
                     } else {
+                        // 检查共享长度是否有效
+                        if shared as usize > prev_key.len() {
+                            return None; // 数据损坏，共享长度无效
+                        }
                         let mut full_key = Vec::new();
                         full_key.extend_from_slice(&prev_key[..shared as usize]);
                         full_key.extend_from_slice(&unshared_key);
