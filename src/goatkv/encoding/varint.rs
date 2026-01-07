@@ -80,8 +80,34 @@ pub fn encode(value: u64) -> Vec<u8> {
 /// assert_eq!(varint::decode(&[0xAC, 0x02]), Ok(300));
 /// ```
 pub fn decode(bytes: &[u8]) -> Result<u64, &'static str> {
+    decode_with_length(bytes).map(|(value, _)| value)
+}
+
+/// 将 varint 字节解码为 64 位无符号整数，并返回读取的字节数。
+///
+/// # 参数
+/// * `bytes` - varint 编码的字节切片
+///
+/// # 返回值
+/// * `Ok((u64, usize))` - 成功解码的整数和读取的字节数
+/// * `Err(&'static str)` - 解码错误：
+///   - `"Overflow"`: 编码值超过 64 位
+///   - `"Incomplete"`: 缺少终止字节（所有字节的 MSB 都为 1）
+///
+/// # 示例
+/// ```
+/// use goat_db::goatkv::encoding::varint;
+///
+/// assert_eq!(varint::decode_with_length(&[0x00]), Ok((0, 1)));
+/// assert_eq!(varint::decode_with_length(&[0x01]), Ok((1, 1)));
+/// assert_eq!(varint::decode_with_length(&[0x7F]), Ok((127, 1)));
+/// assert_eq!(varint::decode_with_length(&[0x80, 0x01]), Ok((128, 2)));
+/// assert_eq!(varint::decode_with_length(&[0xAC, 0x02]), Ok((300, 2)));
+/// ```
+pub fn decode_with_length(bytes: &[u8]) -> Result<(u64, usize), &'static str> {
     let mut result = 0u64;
     let mut shift = 0u32;
+    let mut bytes_read = 0;
 
     for &byte in bytes {
         // 检查溢出：varint 最多为 u64 编码 10 字节
@@ -93,10 +119,11 @@ pub fn decode(bytes: &[u8]) -> Result<u64, &'static str> {
         // 将 7 位数据添加到结果的当前移位位置
         result |= ((byte & 0x7F) as u64) << shift;
         shift += 7;
+        bytes_read += 1;
 
         // 如果 MSB=0，这是最后一个字节
         if byte & 0x80 == 0 {
-            return Ok(result);
+            return Ok((result, bytes_read));
         }
     }
 
