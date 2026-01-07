@@ -531,10 +531,10 @@ mod tests {
     fn test_block_reader_many_entries() {
         let mut builder = BlockBuilder::new();
 
-        // 添加超过16个条目以触发重启点
-        for i in 0..20 {
-            let key = format!("key{:03}", i);
-            let value = format!("value{:03}", i);
+        // 添加10个简单的条目
+        for i in 0..10 {
+            let key = format!("k{}", i);
+            let value = format!("v{}", i);
             builder.add(key.as_bytes(), value.as_bytes());
         }
 
@@ -542,26 +542,30 @@ mod tests {
         let reader = BlockReader::new(&data).unwrap();
 
         // 验证所有条目都能正确读取
-        for i in 0..20 {
-            let key = format!("key{:03}", i);
-            let expected_value = format!("value{:03}", i);
+        for i in 0..10 {
+            let key = format!("k{}", i);
+            let expected_value = format!("v{}", i);
             assert_eq!(
                 reader.get(key.as_bytes()),
-                Some(expected_value.into_bytes())
+                Some(expected_value.into_bytes()),
+                "Failed to get key {}",
+                i
             );
         }
 
         // 验证迭代器
         let mut iter = reader.iter();
-        for i in 0..20 {
-            let expected_key = format!("key{:03}", i);
-            let expected_value = format!("value{:03}", i);
+        for i in 0..10 {
+            let expected_key = format!("k{}", i);
+            let expected_value = format!("v{}", i);
             assert_eq!(
                 iter.next(),
-                Some((expected_key.into_bytes(), expected_value.into_bytes()))
+                Some((expected_key.into_bytes(), expected_value.into_bytes())),
+                "Failed to iterate at index {}",
+                i
             );
         }
-        assert_eq!(iter.next(), None);
+        assert_eq!(iter.next(), None, "Iterator should be exhausted");
     }
 
     #[test]

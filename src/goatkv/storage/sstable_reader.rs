@@ -438,4 +438,86 @@ mod tests {
         let reader = SSTableReader::open(&file_path);
         assert!(reader.is_err());
     }
+
+    #[test]
+    fn test_sstable_iter_all_data() {
+        // 创建200条数据并测试完整迭代
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path();
+        let mut builder = SSTableBuilder::new(1, dir_path.to_path_buf()).unwrap();
+
+        let mut test_data = Vec::new();
+        for i in 0..200 {
+            let key = format!("key_{:03}", i);
+            let value = format!("value_{:03}", i);
+            let key_bytes = key.as_bytes().to_vec();
+            let value_bytes = value.as_bytes().to_vec();
+
+            builder.write(&key_bytes, &value_bytes);
+            test_data.push((key_bytes, value_bytes));
+        }
+
+        builder.finish();
+
+        let sst_path = temp_dir.path().join("000001.sst");
+        let mut reader = SSTableReader::open(&sst_path).unwrap();
+
+        // 由于SSTable按key排序，我们先对测试数据排序
+        let mut sorted_data = test_data.clone();
+        sorted_data.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // 检查测试数据本身是否有重复
+        let mut seen_keys = std::collections::HashSet::new();
+        for (key, _) in &test_data {
+            if seen_keys.contains(key) {
+                println!(
+                    "WARNING: Duplicate key in test data: {:?}",
+                    String::from_utf8_lossy(key)
+                );
+            }
+            seen_keys.insert(key.clone());
+        }
+        println!("Unique keys in test data: {}", seen_keys.len());
+
+        // 读取所有block并遍历
+        let mut all_entries = Vec::new();
+
+        // 读取每个block的数据
+        let _file_size = std::fs::metadata(&sst_path).unwrap().len();
+        let mut _current_offset = 0;
+
+        for (block_idx, entry) in reader.index_entries.iter().enumerate() {
+            let block_offset = entry.block_offset;
+            let block_size = entry.block_size;
+
+            reader
+                .file
+                .seek(std::io::SeekFrom::Start(block_offset))
+                .unwrap();
+            let mut block_data = vec![0u8; block_size as usize];
+            reader.file.read_exact(&mut block_data).unwrap();
+
+            let block_reader = BlockReader::new(&block_data).unwrap();
+
+            for (key, value) in block_reader.iter() {
+                all_entries.push((key, value));
+            }
+
+            _current_offset = block_offset + block_size;
+        }
+
+        // 验证所有数据都被读取
+        assert_eq!(
+            all_entries.len(),
+            sorted_data.len(),
+            "Should read all {} entries",
+            sorted_data.len()
+        );
+
+        // 验证数据顺序和内容
+        for (i, (actual, expected)) in all_entries.iter().zip(sorted_data.iter()).enumerate() {
+            assert_eq!(actual.0, expected.0, "Key mismatch at index {}", i);
+            assert_eq!(actual.1, expected.1, "Value mismatch at index {}", i);
+        }
+    }
 }

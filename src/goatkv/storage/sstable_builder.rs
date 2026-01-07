@@ -120,6 +120,9 @@ impl SSTableBuilder {
 
         //写入magic number
         self.writer.write_all(&MAGIC_NUMBER.to_le_bytes()).unwrap();
+
+        // 确保所有数据都被写入文件
+        self.writer.flush().unwrap();
     }
 
     fn compute_separator(last_key: &[u8], key: &[u8]) -> Vec<u8> {

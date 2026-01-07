@@ -52,8 +52,9 @@ impl BlockBuilder {
 
     pub fn finish(&mut self) -> (&[u8], &[u8]) {
         self.buffer.extend_from_slice(&self.restarts.as_slice());
-        self.buffer
-            .extend_from_slice(&self.restarts.len().to_le_bytes());
+        // restarts数组中每个重启点是4字节，所以需要除以4得到重启点数量
+        let restart_count = (self.restarts.len() / 4) as u32;
+        self.buffer.extend_from_slice(&restart_count.to_le_bytes());
 
         (&self.buffer, &self.last_key)
     }
