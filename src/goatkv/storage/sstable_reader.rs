@@ -486,7 +486,7 @@ mod tests {
         let _file_size = std::fs::metadata(&sst_path).unwrap().len();
         let mut _current_offset = 0;
 
-        for (block_idx, entry) in reader.index_entries.iter().enumerate() {
+        for (_block_idx, entry) in reader.index_entries.iter().enumerate() {
             let block_offset = entry.block_offset;
             let block_size = entry.block_size;
 
