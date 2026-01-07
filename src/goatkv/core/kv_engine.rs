@@ -1,4 +1,3 @@
-use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
@@ -249,25 +248,14 @@ impl KvEngine {
         db_path_manager: Arc<DbPathManager>,
     ) {
         while let Ok(task) = rx.recv() {
-            let filename = if task.id < 1000000 {
-                format!(
-                    "{}/{:06}.sst",
-                    db_path_manager.data_dir().display(),
-                    task.id
-                )
-            } else {
-                format!("{}/{}.sst", db_path_manager.data_dir().display(), task.id)
-            };
-
-            let file = match OpenOptions::new().create(true).write(true).open(&filename) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("Failed to open SSTable file {}: {}", filename, e);
-                    continue;
-                }
-            };
-
-            let mut sst_builder = SSTableBuilder::new(file);
+            let mut sst_builder =
+                match SSTableBuilder::new(task.id as u64, db_path_manager.data_dir().into()) {
+                    Ok(builder) => builder,
+                    Err(e) => {
+                        eprintln!("Failed to create SSTableBuilder: {}", e);
+                        continue;
+                    }
+                };
 
             // 获取 immutable_memtable 并克隆数据，避免长时间持有锁
             let entries: Vec<(Vec<u8>, Vec<u8>)> = {

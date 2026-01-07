@@ -1,5 +1,6 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::path::PathBuf;
 
 use crate::goatkv::encoding::varint;
 use crate::goatkv::storage::block_builder::BlockBuilder;
@@ -16,13 +17,28 @@ pub struct SSTableBuilder {
 }
 
 impl SSTableBuilder {
-    pub fn new(file: File) -> Self {
-        Self {
+    pub fn new(id: u64, path: PathBuf) -> io::Result<Self> {
+        let filename = Self::get_file_name(id, path);
+
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&filename)?;
+
+        Ok(Self {
             writer: io::BufWriter::new(file),
             data_block_builder: BlockBuilder::new(),
             index_block_builder: BlockBuilder::new(),
             bloom_builder: BloomBuilder::new(),
             offset: 0,
+        })
+    }
+
+    fn get_file_name(id: u64, path: PathBuf) -> String {
+        if id < 1000000 {
+            format!("{}/{:06}.sst", path.display(), id)
+        } else {
+            format!("{}/{}.sst", path.display(), id)
         }
     }
 
