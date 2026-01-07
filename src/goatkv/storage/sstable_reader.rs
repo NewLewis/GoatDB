@@ -8,8 +8,6 @@ use crate::goatkv::storage::block_reader::BlockReader;
 
 /// SSTable 文件的 Magic Number
 const MAGIC_NUMBER: u64 = 0x706A725F676F6174;
-/// BloomFilter 的固定大小
-const BLOOM_FILTER_SIZE: usize = 1024;
 /// Footer 的固定大小：根据 SSTableBuilder 的写入，footer 固定为 48 字节
 /// 两个varint(最多20字节) + padding + magic(8字节)
 const FOOTER_SIZE: usize = 48;
@@ -153,13 +151,16 @@ impl SSTableReader {
 
         // 5. 读取 BloomFilter
         file.seek(SeekFrom::Start(bloom_offset))?;
-        let mut bloom_bitmap = vec![0u8; BLOOM_FILTER_SIZE];
+        // BloomFilter 的大小是 index_offset - bloom_offset
+        let bloom_filter_size = index_offset - bloom_offset;
+        let mut bloom_bitmap = vec![0u8; bloom_filter_size as usize];
         file.read_exact(&mut bloom_bitmap)?;
         let bloom_filter = crate::goatkv::storage::bloom_builder::BloomFilter::new(bloom_bitmap);
 
         // 6. 读取和解析索引块
         // index_offset 是索引块的开始位置
         // 索引块从 index_offset 开始，到文件末尾减去footer大小结束
+        // 注意：index_offset 已经指向索引块的开始，因为 BloomFilter 已经读取完毕
         let index_block_start = index_offset;
         let footer_start = file_size - FOOTER_SIZE as u64;
 

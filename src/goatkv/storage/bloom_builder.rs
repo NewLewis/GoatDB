@@ -4,15 +4,33 @@ use twox_hash::XxHash64;
 /// BloomFilter 构建器，用于构建 SSTable 的 BloomFilter
 pub struct BloomBuilder {
     bitmap: Vec<u8>,
+    /// BloomFilter 的哈希函数数量
+    k: usize,
 }
 
 impl BloomBuilder {
+    /// 创建一个默认的 BloomBuilder，使用 1024 字节 (8192 位) 的位图
     pub fn new() -> Self {
-        // 初始化 bitmap 为 1024 字节 (8192 位)
-        // 避免在 add 方法中出现除零错误
+        // 默认使用 1024 字节 (8192 位)
+        // 这个大小对于大多数小型 SSTable 是足够的
+        Self::with_capacity(1024)
+    }
+
+    /// 创建一个指定字节大小的 BloomBuilder
+    pub fn with_capacity(bytes: usize) -> Self {
         Self {
-            bitmap: vec![0u8; 1024],
+            bitmap: vec![0u8; bytes],
+            k: 7, // 默认使用 7 个哈希函数
         }
+    }
+
+    /// 根据预期的键数量和期望的误报率创建 BloomBuilder
+    pub fn with_estimated_capacity(expected_items: usize, false_positive_rate: f64) -> Self {
+        // 根据公式计算所需的 bit 数: m = - (n * ln(p)) / (ln(2)^2)
+        let m = (-((expected_items as f64) * false_positive_rate.ln()) / (2.0_f64.ln().powi(2)))
+            .ceil() as usize;
+        let bytes = (m + 7) / 8; // 转换为字节数
+        Self::with_capacity(bytes.max(1)) // 至少 1 字节
     }
 
     pub fn add(&mut self, key: &[u8]) {
@@ -29,10 +47,9 @@ impl BloomBuilder {
         // 这样就不用算第二遍哈希了
         let delta = (h >> 17) | (h << 15);
 
-        let k = 7; // 假设我们要 7 次
         let m = self.bitmap.len() * 8; // 总 bit 数
 
-        for _ in 0..k {
+        for _ in 0..self.k {
             let bit_pos = (h as usize) % m;
             self.bitmap[bit_pos / 8] |= 1 << (bit_pos % 8);
 
@@ -123,6 +140,29 @@ mod tests {
 
         let filter = builder.build();
         assert_eq!(filter.size(), 1024);
+    }
+
+    #[test]
+    fn test_bloom_builder_with_capacity() {
+        let mut builder = BloomBuilder::with_capacity(512);
+        builder.add(b"key1");
+        builder.add(b"key2");
+
+        let filter = builder.build();
+        assert_eq!(filter.size(), 512);
+    }
+
+    #[test]
+    fn test_bloom_builder_with_estimated_capacity() {
+        // 100个键，期望误报率1%
+        let mut builder = BloomBuilder::with_estimated_capacity(100, 0.01);
+        builder.add(b"key1");
+        builder.add(b"key2");
+
+        let filter = builder.build();
+        // 对于100个键，1%误报率，大约需要958位（约120字节）
+        assert!(filter.size() > 50);
+        assert!(filter.size() < 200);
     }
 
     #[test]
