@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 use crate::goatkv::encoding::varint;
@@ -28,9 +28,9 @@ const FOOTER_SIZE: usize = 48;
 /// SSTable（Sorted String Table）是一种有序的、不可变的键值存储格式，
 /// 适用于大规模数据的持久化和高效查询：
 ///
-/// ```
+/// ```text
 /// +------------------+
-/// |  Data Block 0    |  数据块：存储实际key-value对
+/// |  Data Block 0    |  数据块:存储实际key-value对
 /// +------------------+
 /// |  Data Block 1    |  使用前缀压缩和重启点
 /// +------------------+
@@ -38,35 +38,35 @@ const FOOTER_SIZE: usize = 48;
 /// +------------------+
 /// |  Data Block N    |
 /// +------------------+
-/// |  Bloom Filter    |  布隆过滤器：快速过滤不存在的key
+/// |  Bloom Filter    |  布隆过滤器:快速过滤不存在的key
 /// +------------------+
-/// |  Index Block     |  索引块：记录每个数据块的位置和大小
+/// |  Index Block     |  索引块:记录每个数据块的位置和大小
 /// +------------------+
-/// |  Footer          |  文件尾：记录BloomFilter和IndexBlock的偏移量
+/// |  Footer          |  文件尾:记录BloomFilter和IndexBlock的偏移量
 /// +------------------+
 /// ```
 ///
 /// # Footer结构（48字节）
 /// Footer位于文件末尾，用于定位各个组件的位置：
-/// ```
+/// ```text
 /// +------------------+
 /// |  Bloom Offset    |  varint编码的BloomFilter起始偏移量
 /// +------------------+
 /// |  Index Offset    |  varint编码的IndexBlock起始偏移量
 /// +------------------+
-/// |  Padding         |  0字节填充，使Footer总大小为48字节
+/// |  Padding         |  0字节填充,使Footer总大小为48字节
 /// +------------------+
-/// |  Magic Number    |  8字节魔数，标识文件格式
+/// |  Magic Number    |  8字节魔数,标识文件格式
 /// +------------------+
 /// ```
 ///
 /// # 索引块结构
 /// 索引块用于快速定位包含特定key的数据块：
-/// ```
-/// Index Entry格式：
+/// ```text
+/// Index Entry格式:
 /// [separator (varint-encoded key)] -> [block_offset (varint), block_size (varint)]
 ///
-/// separator是一个特殊计算的key，表示该数据块中最大的key
+/// separator是一个特殊计算的key,表示该数据块中最大的key
 /// 或是两个key之间的最小分隔符
 /// ```
 ///
@@ -77,12 +77,16 @@ const FOOTER_SIZE: usize = 48;
 /// 4. 调用finish()完成SSTable构建，写入BloomFilter、IndexBlock和Footer
 ///
 /// # 示例
-/// ```
-/// use std::path::PathBuf;
+/// ```no_run
+/// # use std::path::PathBuf;
+/// # use goat_db::goatkv::storage::sstable_builder::SSTableBuilder;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let mut builder = SSTableBuilder::new(1, PathBuf::from("./data"))?;
 /// builder.write(b"apple", b"fruit");
 /// builder.write(b"banana", b"fruit");
 /// builder.finish();
+/// # Ok(())
+/// # }
 /// ```
 pub struct SSTableBuilder {
     /// 带缓冲的文件写入器
@@ -111,7 +115,6 @@ pub struct SSTableBuilder {
     path: PathBuf,
 }
 
-
 impl SSTableBuilder {
     /// 创建一个新的SSTableBuilder
     ///
@@ -127,10 +130,14 @@ impl SSTableBuilder {
     /// 返回io::Error，如果文件创建失败
     ///
     /// # 示例
-    /// ```
-    /// use std::path::PathBuf;
+    /// ```no_run
+    /// # use std::path::PathBuf;
+    /// # use goat_db::goatkv::storage::sstable_builder::SSTableBuilder;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let builder = SSTableBuilder::new(1, PathBuf::from("./data"))?;
     /// // 创建文件 ./data/000001.sst
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn new(id: u64, path: PathBuf) -> io::Result<Self> {
         let filename = Self::get_file_name(id, path);
@@ -151,7 +158,6 @@ impl SSTableBuilder {
         })
     }
 
-
     /// 生成SSTable文件名
     ///
     /// # 参数
@@ -162,12 +168,9 @@ impl SSTableBuilder {
     /// 返回完整的文件路径字符串
     ///
     /// # 示例
-    /// ```
-    /// let filename = SSTableBuilder::get_file_name(1, PathBuf::from("./data"));
-    /// // 返回 "./data/000001.sst"
-    ///
-    /// let filename = SSTableBuilder::get_file_name(1234567, PathBuf::from("./data"));
-    /// // 返回 "./data/1234567.sst"
+    /// ```text
+    /// get_file_name(1, "./data")      -> "./data/000001.sst"
+    /// get_file_name(1234567, "./data") -> "./data/1234567.sst"
     /// ```
     fn get_file_name(id: u64, path: PathBuf) -> String {
         if id < 1000000 {
@@ -199,11 +202,16 @@ impl SSTableBuilder {
     /// - 乱序添加会导致索引查询失败
     ///
     /// # 示例
-    /// ```
+    /// ```no_run
+    /// # use std::path::PathBuf;
+    /// # use goat_db::goatkv::storage::sstable_builder::SSTableBuilder;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let mut builder = SSTableBuilder::new(1, PathBuf::from("./data"))?;
     /// builder.write(b"apple", b"fruit");
     /// builder.write(b"banana", b"fruit");
     /// builder.write(b"cherry", b"fruit");
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn write(&mut self, key: &[u8], value: &[u8]) {
         // 检查当前数据块是否已满（>= 4KB）
@@ -280,7 +288,7 @@ impl SSTableBuilder {
     /// 5. 刷新缓冲区，确保所有数据写入磁盘
     ///
     /// # 文件最终结构
-    /// ```
+    /// ```text
     /// [Data Block 0][Data Block 1]...[Data Block N]
     /// [Bloom Filter]
     /// [Index Block]
@@ -293,16 +301,18 @@ impl SSTableBuilder {
     /// - 内部会自动flush缓冲区
     ///
     /// # 示例
-    /// ```
+    /// ```no_run
+    /// # use std::path::PathBuf;
+    /// # use goat_db::goatkv::storage::sstable_builder::SSTableBuilder;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let mut builder = SSTableBuilder::new(1, PathBuf::from("./data"))?;
     /// builder.write(b"key1", b"value1");
     /// builder.write(b"key2", b"value2");
     /// builder.finish(); // 完成构建
-    /// ```
-    /// builder.finish().unwrap(); // 完成构建
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn finish(&mut self) -> io::Result<SSTable> {
-
         // 如果有未完成的数据块，先完成它
         if !self.data_block_builder.empty() {
             let (block_content, last_key) = self.data_block_builder.finish();
@@ -363,7 +373,6 @@ impl SSTableBuilder {
         Ok(SSTable::new(self.id, self.path.clone()))
     }
 
-
     /// 计算索引中使用的分隔符（separator）
     ///
     /// # Separator的作用
@@ -379,7 +388,7 @@ impl SSTableBuilder {
     /// 3. 返回last_key的共享部分 + 下一个字节值（如果<0xff）
     ///
     /// # 示例
-    /// ```
+    /// ```text
     /// last_key = b"apple"
     /// key = b"application"
     /// // 比较：a=a, p=p, p=p, l=l, e=i (不同)
@@ -434,6 +443,7 @@ impl SSTableBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Seek};
     use tempfile::TempDir;
 
     /// 测试SSTableBuilder的基本创建和写入功能
@@ -450,7 +460,7 @@ mod tests {
         builder.write(b"cherry", b"fruit");
 
         // 完成构建
-        builder.finish();
+        builder.finish().unwrap();
 
         // 验证文件已创建
         let sst_path = dir_path.join("000001.sst");
@@ -494,7 +504,7 @@ mod tests {
             builder.write(key.as_bytes(), value.as_bytes());
         }
 
-        builder.finish();
+        builder.finish().unwrap();
 
         let sst_path = dir_path.join("000001.sst");
         assert!(sst_path.exists());
@@ -519,7 +529,7 @@ mod tests {
             builder.write(key.as_bytes(), value.as_bytes());
         }
 
-        builder.finish();
+        builder.finish().unwrap();
 
         let sst_path = dir_path.join("000001.sst");
         assert!(sst_path.exists());
@@ -572,7 +582,7 @@ mod tests {
         builder.write(b"", b"empty_key_value");
         builder.write(b"a", b"next_value");
 
-        builder.finish();
+        builder.finish().unwrap();
 
         let sst_path = dir_path.join("000001.sst");
         assert!(sst_path.exists());
@@ -591,7 +601,7 @@ mod tests {
         builder.write(b"key2", b"");
         builder.write(b"key3", b"");
 
-        builder.finish();
+        builder.finish().unwrap();
 
         let sst_path = dir_path.join("000001.sst");
         assert!(sst_path.exists());
@@ -612,7 +622,7 @@ mod tests {
         builder.write(b"key space", b"value4");
         builder.write(b"123number", b"value5");
 
-        builder.finish();
+        builder.finish().unwrap();
 
         let sst_path = dir_path.join("000001.sst");
         assert!(sst_path.exists());
@@ -631,7 +641,7 @@ mod tests {
         builder.write(b"key1", &large_value);
         builder.write(b"key2", &large_value);
 
-        builder.finish();
+        builder.finish().unwrap();
 
         let sst_path = dir_path.join("000001.sst");
         assert!(sst_path.exists());
@@ -656,7 +666,7 @@ mod tests {
             builder.write(key.as_bytes(), value.as_bytes());
         }
 
-        builder.finish();
+        builder.finish().unwrap();
 
         let sst_path = dir_path.join("000001.sst");
 
@@ -717,7 +727,7 @@ mod tests {
                 builder.write(key.as_bytes(), value.as_bytes());
             }
 
-            builder.finish();
+            builder.finish().unwrap();
         }
 
         // 验证所有文件都已创建
@@ -742,7 +752,7 @@ mod tests {
             builder.write(key.as_bytes(), value.as_bytes());
         }
 
-        builder.finish();
+        builder.finish().unwrap();
 
         let sst_path = dir_path.join("000001.sst");
         assert!(sst_path.exists());
@@ -761,7 +771,7 @@ mod tests {
         builder.write(b"b", b"2");
         builder.write(b"c", b"3");
 
-        builder.finish();
+        builder.finish().unwrap();
 
         let sst_path = dir_path.join("000001.sst");
         assert!(sst_path.exists());
@@ -782,7 +792,7 @@ mod tests {
             builder.write(key.as_bytes(), value.as_bytes());
         }
 
-        builder.finish();
+        builder.finish().unwrap();
 
         let sst_path = dir_path.join("000001.sst");
         assert!(sst_path.exists());
@@ -809,7 +819,7 @@ mod tests {
             builder.write(key.as_bytes(), value.as_bytes());
         }
 
-        builder.finish();
+        builder.finish().unwrap();
 
         let sst_path = dir_path.join("000001.sst");
         assert!(sst_path.exists());
@@ -854,7 +864,7 @@ mod tests {
             builder.write(key.as_bytes(), value.as_bytes());
         }
 
-        builder.finish();
+        builder.finish().unwrap();
 
         let sst_path = dir_path.join("000001.sst");
         assert!(sst_path.exists());

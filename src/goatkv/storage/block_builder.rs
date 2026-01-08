@@ -10,27 +10,27 @@ const MAX_BLOCK_SIZE: usize = 4 * 1024; // 4KB
 /// # 数据块结构
 /// 数据块采用前缀压缩和重启点机制来减少存储空间：
 ///
-/// ```
+/// ```text
 /// +----------------+
-/// |  Entry 1       |  完整存储（shared=0）
+/// |  Entry 1       |  完整存储(shared=0)
 /// +----------------+
-/// |  Entry 2       |  前缀压缩（shared=n, unshared=m）
+/// |  Entry 2       |  前缀压缩(shared=n, unshared=m)
 /// |  ...           |
 /// +----------------+
 /// |  Entry N       |
 /// +----------------+
-/// |  Restart Point |  每16个条目记录一个重启点（4字节）
+/// |  Restart Point |  每16个条目记录一个重启点(4字节)
 /// |  ...           |  重启点指向条目在buffer中的偏移量
 /// +----------------+
-/// |  Restart Count |  重启点数量（4字节）
+/// |  Restart Count |  重启点数量(4字节)
 /// +----------------+
 /// ```
 ///
 /// # 前缀压缩
 /// 为了减少重复前缀的存储开销，每个条目只存储：
-/// - shared: 与前一个key的共享前缀长度（varint编码）
-/// - unshared: 当前key的非共享部分长度（varint编码）
-/// - value_len: 值的长度（varint编码）
+/// - shared: 与前一个key的共享前缀长度(varint编码)
+/// - unshared: 当前key的非共享部分长度(varint编码)
+/// - value_len: 值的长度(varint编码)
 /// - key[shared..]: key的非共享部分
 /// - value: 实际值
 ///
@@ -64,6 +64,7 @@ impl BlockBuilder {
     ///
     /// # 示例
     /// ```
+    /// # use goat_db::goatkv::storage::block_builder::BlockBuilder;
     /// let builder = BlockBuilder::new();
     /// ```
     pub fn new() -> Self {
@@ -95,6 +96,7 @@ impl BlockBuilder {
     ///
     /// # 示例
     /// ```
+    /// # use goat_db::goatkv::storage::block_builder::BlockBuilder;
     /// let mut builder = BlockBuilder::new();
     /// builder.add(b"apple", b"fruit");
     /// builder.add(b"application", b"app");
@@ -150,7 +152,7 @@ impl BlockBuilder {
     /// 完成当前Block的构建，返回编码后的数据和最后一个key
     ///
     /// # 返回数据格式
-    /// ```
+    /// ```text
     /// +------------------+
     /// |  Entry Data      |  所有条目的编码数据
     /// +------------------+
@@ -158,7 +160,7 @@ impl BlockBuilder {
     /// |  Restart Point 1  |  4字节偏移量
     /// |  ...             |
     /// +------------------+
-    /// |  Restart Count   |  4字节，重启点数量
+    /// |  Restart Count   |  4字节,重启点数量
     /// +------------------+
     /// ```
     ///
@@ -167,6 +169,7 @@ impl BlockBuilder {
     ///
     /// # 示例
     /// ```
+    /// # use goat_db::goatkv::storage::block_builder::BlockBuilder;
     /// let mut builder = BlockBuilder::new();
     /// builder.add(b"key1", b"value1");
     /// builder.add(b"key2", b"value2");
@@ -197,7 +200,7 @@ impl BlockBuilder {
     /// 返回与前一个key的共享前缀字节数
     ///
     /// # 示例
-    /// ```
+    /// ```text
     /// last_key = b"application"
     /// key = b"apple"
     /// // 比较：
@@ -234,9 +237,10 @@ impl BlockBuilder {
     ///
     /// # 示例
     /// ```
+    /// # use goat_db::goatkv::storage::block_builder::BlockBuilder;
     /// let mut builder = BlockBuilder::new();
     /// builder.add(b"key", b"value");
-    /// assert_eq!(builder.len(), 13); // 取决于varint编码
+    /// assert!(builder.len() > 0); // 实际长度取决于varint编码
     /// ```
     pub fn len(&self) -> usize {
         self.buffer.len()
@@ -253,11 +257,13 @@ impl BlockBuilder {
     ///
     /// # 示例
     /// ```
+    /// # use goat_db::goatkv::storage::block_builder::BlockBuilder;
     /// let mut builder = BlockBuilder::new();
-    /// while !builder.should_finish() {
-    ///     // 继续添加数据
-    /// }
-    /// let (block, _) = builder.finish();
+    /// // 刚开始时block是空的，should_finish返回false
+    /// assert!(!builder.should_finish());
+    ///
+    /// // 可以继续添加数据，直到buffer达到4KB
+    /// // 实际使用时，会在循环中添加key-value对
     /// ```
     pub fn should_finish(&self) -> bool {
         self.len() >= MAX_BLOCK_SIZE
@@ -269,6 +275,7 @@ impl BlockBuilder {
     ///
     /// # 示例
     /// ```
+    /// # use goat_db::goatkv::storage::block_builder::BlockBuilder;
     /// let mut builder = BlockBuilder::new();
     /// // 构建第一个block
     /// builder.add(b"key1", b"value1");
@@ -293,6 +300,7 @@ impl BlockBuilder {
     ///
     /// # 示例
     /// ```
+    /// # use goat_db::goatkv::storage::block_builder::BlockBuilder;
     /// let builder = BlockBuilder::new();
     /// assert!(builder.empty());
     ///

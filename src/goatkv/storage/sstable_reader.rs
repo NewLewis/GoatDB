@@ -479,7 +479,7 @@ mod tests {
             sequence_number -= 1; // 递减序列号以确保正确排序
         }
 
-        builder.finish();
+        builder.finish().unwrap();
 
         temp_dir
     }
@@ -593,7 +593,7 @@ mod tests {
             test_data.push((key_bytes, value_bytes));
         }
 
-        builder.finish();
+        builder.finish().unwrap();
 
         let sst_path = temp_dir.path().join("000001.sst");
         let mut reader = SSTableReader::open(&sst_path).unwrap();

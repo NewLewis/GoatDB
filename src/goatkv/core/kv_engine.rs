@@ -7,7 +7,6 @@ use crate::goatkv::core::lsm_state::LSMState;
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
 use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
 use crate::goatkv::storage::sstable_builder::SSTableBuilder;
-use crate::goatkv::storage::sstable_reader::SSTableReader;
 use crate::goatkv::storage::wal_manager::{WalIterator, WalManager};
 
 use crate::goatkv::utils::db_path_manager::DbPathManager;
@@ -319,7 +318,10 @@ impl KvEngine {
             let reader = match sstable.open_reader() {
                 Ok(reader) => reader,
                 Err(e) => {
-                    eprintln!("Failed to open newly created SSTable {:?}: {}", sstable.path, e);
+                    eprintln!(
+                        "Failed to open newly created SSTable {:?}: {}",
+                        sstable.path, e
+                    );
                     continue;
                 }
             };
@@ -327,16 +329,15 @@ impl KvEngine {
             // 从 immutable_mem_tables 中移除已刷盘的 memtable，并将 SSTableReader 添加到 sstables
             // 注意：需要获取写锁
             let mut lsm_state_guard = lsm_state.write().unwrap();
-            
+
             // 添加到 SSTable 列表头部（最新的在最前面）
             lsm_state_guard
                 .sstables
                 .insert(0, Arc::new(Mutex::new(reader)));
-            
+
             // 移除 old memtable
             lsm_state_guard.immutable_mem_tables.pop_front();
         }
-
     }
 }
 
@@ -467,7 +468,7 @@ mod tests {
         // but flush creates a NEW empty memtable. The OLD one became immutable and then flushed.
         // So the key is definitely NOT in the current memtable.)
         assert_eq!(engine.get(b"persist_key"), Some(b"persist_value".to_vec()));
-        
+
         // 5. Verify it's actually in SSTable (white-box check)
         let state = engine.lsm_state.read().unwrap();
         assert_eq!(state.sstables.len(), 1);
