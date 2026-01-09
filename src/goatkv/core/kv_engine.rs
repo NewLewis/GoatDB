@@ -239,8 +239,6 @@ impl KvEngine {
             eprintln!("Failed to send flush task: {}", e);
         }
     }
-
-
 }
 
 #[cfg(test)]

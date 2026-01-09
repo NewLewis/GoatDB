@@ -1,11 +1,10 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
-use crate::goatkv::utils::options::KvEngineOptions;
-
-use std::sync::Mutex;
 use crate::goatkv::storage::sstable_reader::SSTableReader;
+use crate::goatkv::utils::options::KvEngineOptions;
 
 #[derive(Debug)]
 pub struct LSMState {

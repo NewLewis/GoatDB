@@ -15,7 +15,7 @@ pub struct FlushTask {
 }
 
 /// 后台刷盘 Worker
-/// 
+///
 /// 负责在独立线程中处理 MemTable 到 SSTable 的刷盘任务。
 /// 使用 mpsc channel 接收任务，确保任务按顺序执行。
 #[derive(Debug)]
@@ -33,22 +33,19 @@ impl FlushWorker {
     ///
     /// # 返回
     /// 返回新创建的 FlushWorker 实例
-    pub fn new(
-        lsm_state: Arc<RwLock<LSMState>>,
-        db_path_manager: Arc<DbPathManager>,
-    ) -> Self {
+    pub fn new(lsm_state: Arc<RwLock<LSMState>>, db_path_manager: Arc<DbPathManager>) -> Self {
         let (tx, rx) = mpsc::channel();
-        
+
         let handle = thread::spawn(move || {
             Self::run_loop(rx, lsm_state, db_path_manager);
         });
-        
+
         Self {
             sender: tx,
             _handle: handle,
         }
     }
-    
+
     /// 提交刷盘任务到后台线程
     ///
     /// # 参数
@@ -60,7 +57,7 @@ impl FlushWorker {
     pub fn submit_task(&self, task: FlushTask) -> Result<(), mpsc::SendError<FlushTask>> {
         self.sender.send(task)
     }
-    
+
     /// 后台线程主循环
     ///
     /// 持续从 channel 接收刷盘任务并执行：

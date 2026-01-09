@@ -27,6 +27,28 @@ predicates = "3.1"
 ntest = "0.9"
 rand = "0.8"
 
+# ===========================================================================
+# Integration Tests Configuration
+# ===========================================================================
+#
+# Note: Tests in the tests/ directory are auto-discovered ONLY if they are
+# direct children. Tests in subdirectories (e.g., tests/e2e/) must be
+# explicitly configured here.
+#
+# Organization:
+# - tests/common/     - Shared test utilities and fixtures
+# - tests/e2e/        - End-to-end integration tests
+# - tests/integration/ - Integration tests for specific components
+#
+# Running tests:
+# - cargo test              - Run all tests
+# - cargo test --test <name> - Run specific test target
+# - cargo test e2e          - Run all tests matching "e2e"
+# ===========================================================================
+
+# ========== E2E Tests ==========
+# Full system integration tests
+
 [[test]]
 name = "e2e_basic_crud"
 path = "tests/e2e/basic_crud_test.rs"
@@ -37,11 +59,14 @@ name = "e2e_multi_client"
 path = "tests/e2e/multi_client_test.rs"
 harness = true
 
-[[test]]
-name = "e2e_load"
-path = "tests/e2e/load_test.rs"
-harness = true
-
+# ========== Integration Tests ==========
+# Component-level integration tests
+# Uncomment and add more as needed:
+#
+# [[test]]
+# name = "integration_storage"
+# path = "tests/integration/storage_test.rs"
+# harness = true
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"
