@@ -20,6 +20,28 @@ ouroboros = "0.18.5"
 
 [dev-dependencies]
 tempfile = "3.10"
+# E2E 测试框架
+tokio-test = "0.4"
+assert_cmd = "2.0"
+predicates = "3.1"
+ntest = "0.9"
+rand = "0.8"
+
+[[test]]
+name = "e2e_basic_crud"
+path = "tests/e2e/basic_crud_test.rs"
+harness = true
+
+[[test]]
+name = "e2e_multi_client"
+path = "tests/e2e/multi_client_test.rs"
+harness = true
+
+[[test]]
+name = "e2e_load"
+path = "tests/e2e/load_test.rs"
+harness = true
+
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"
