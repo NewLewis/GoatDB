@@ -1,23 +1,16 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
-use std::thread;
+use std::sync::{Arc, Mutex, RwLock};
 
+use crate::goatkv::core::flush_worker::{FlushTask, FlushWorker};
 use crate::goatkv::core::lsm_state::LSMState;
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
 use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
-use crate::goatkv::storage::sstable_builder::SSTableBuilder;
 use crate::goatkv::storage::wal_manager::{WalIterator, WalManager};
 
 use crate::goatkv::utils::db_path_manager::DbPathManager;
 use crate::goatkv::utils::options::KvEngineOptions;
 use crate::goatkv::utils::sequence_number::SequenceNumber;
-
-#[derive(Debug)]
-struct FlushTask {
-    _mem_table: Arc<MemTable>,
-    id: usize,
-}
 
 /// LSM-Tree 键值存储引擎
 #[derive(Debug)]
@@ -32,10 +25,8 @@ pub struct KvEngine {
     lsm_state: Arc<RwLock<LSMState>>,
     /// 配置选项
     options: Arc<KvEngineOptions>,
-    /// 发送器，用于发送 FlushTask 到后台线程
-    sender: mpsc::Sender<FlushTask>,
-    /// 后台线程句柄，用于管理后台线程
-    _bg_thread_handle: thread::JoinHandle<()>,
+    /// 后台刷盘 Worker
+    flush_worker: FlushWorker,
     /// 当前正在执行的 FlushTask 的 ID
     flush_task_id: AtomicUsize,
 }
@@ -81,13 +72,8 @@ impl KvEngine {
         // 创建 LSM 状态管理器
         let lsm_state = Arc::new(RwLock::new(LSMState::new(&options)));
 
-        // 启动后台线程，用于处理 FlushTask
-        let cloned_lsm_state = lsm_state.clone();
-        let cloned_db_path = path_manager.clone();
-        let (tx, rx) = mpsc::channel::<FlushTask>();
-        let bg_thread_handle = thread::spawn(move || {
-            Self::flush_loop(rx, cloned_lsm_state, cloned_db_path);
-        });
+        // 创建后台刷盘 Worker
+        let flush_worker = FlushWorker::new(lsm_state.clone(), path_manager.clone());
 
         Ok(Self {
             path_manager,
@@ -95,8 +81,7 @@ impl KvEngine {
             sequence_number: Arc::new(SequenceNumber::new()),
             lsm_state,
             options: Arc::new(options),
-            sender: tx,
-            _bg_thread_handle: bg_thread_handle,
+            flush_worker,
             flush_task_id: AtomicUsize::new(0),
         })
     }
@@ -247,98 +232,15 @@ impl KvEngine {
 
         // 发送 flush 任务到后台线程
         let task_id = self.flush_task_id.fetch_add(1, Ordering::SeqCst);
-        if let Err(e) = self.sender.send(FlushTask {
+        if let Err(e) = self.flush_worker.submit_task(FlushTask {
             id: task_id,
-            _mem_table: mem_table,
+            mem_table,
         }) {
             eprintln!("Failed to send flush task: {}", e);
         }
     }
 
-    fn flush_loop(
-        rx: mpsc::Receiver<FlushTask>,
-        lsm_state: Arc<RwLock<LSMState>>,
-        db_path_manager: Arc<DbPathManager>,
-    ) {
-        while let Ok(task) = rx.recv() {
-            let mut sst_builder =
-                match SSTableBuilder::new(task.id as u64, db_path_manager.data_dir().into()) {
-                    Ok(builder) => builder,
-                    Err(e) => {
-                        eprintln!("Failed to create SSTableBuilder: {}", e);
-                        continue;
-                    }
-                };
 
-            // 获取 immutable_memtable 并克隆数据，避免长时间持有锁
-            let entries: Vec<(Vec<u8>, Vec<u8>)> = {
-                let lsm_state_guard = lsm_state.read().unwrap();
-                let imm_table = match lsm_state_guard.immutable_mem_tables.front() {
-                    Some(t) => t,
-                    None => {
-                        eprintln!("No immutable memtable found for task id={}", task.id);
-                        continue;
-                    }
-                };
-
-                imm_table
-                    .iter()
-                    .map(|(key, value)| {
-                        let mut serialized_key = Vec::new();
-                        serialized_key.extend_from_slice(key.user_key());
-                        // 关键修正：使用 Big Endian 并取反 (!seq)
-                        // 原因：
-                        // 1. 我们希望 Sequence Number 越大，Key 越小 (Logical Order: Seq Desc)
-                        // 2. SSTable 字节序排序是 Ascending
-                        // 3. !seq (取反) 后，大 Seq 变成小数值
-                        // 4. Big Endian 保证字节序比较等同于数值比较
-                        // 例如:
-                        // Seq 200 (Encoded) -> !200 -> Small Value -> Small Bytes -> First in SSTable
-                        // Seq 100 (Encoded) -> !100 -> Large Value -> Large Bytes -> Later in SSTable
-                        serialized_key
-                            .extend_from_slice(&(!key.encoded_sequence_number()).to_be_bytes());
-                        (serialized_key, value.to_vec())
-                    })
-                    .collect()
-            };
-
-            // 在不持有锁的情况下写入 SSTable
-            for (key, value) in entries {
-                sst_builder.write(&key, &value);
-            }
-
-            let sstable = match sst_builder.finish() {
-                Ok(sst) => sst,
-                Err(e) => {
-                    eprintln!("Failed to finish SSTable {}: {}", task.id, e);
-                    continue;
-                }
-            };
-
-            let reader = match sstable.open_reader() {
-                Ok(reader) => reader,
-                Err(e) => {
-                    eprintln!(
-                        "Failed to open newly created SSTable {:?}: {}",
-                        sstable.path, e
-                    );
-                    continue;
-                }
-            };
-
-            // 从 immutable_mem_tables 中移除已刷盘的 memtable，并将 SSTableReader 添加到 sstables
-            // 注意：需要获取写锁
-            let mut lsm_state_guard = lsm_state.write().unwrap();
-
-            // 添加到 SSTable 列表头部（最新的在最前面）
-            lsm_state_guard
-                .sstables
-                .insert(0, Arc::new(Mutex::new(reader)));
-
-            // 移除 old memtable
-            lsm_state_guard.immutable_mem_tables.pop_front();
-        }
-    }
 }
 
 #[cfg(test)]
