@@ -184,6 +184,31 @@ struct Args {
     data_dir: Option<String>,
 }
 
+// Graceful shutdown signal handler
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => { println!("\nReceived Ctrl+C, initiating graceful shutdown.") },
+        _ = terminate => { println!("\nReceived SIGTERM, initiating graceful shutdown.") },
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 解析命令行参数
@@ -207,14 +232,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = GoatKVServiceImpl::new(engine);
 
     println!("gRPC Server listening on {}", addr);
-    println!("Starting server...");
+    println!("Press Ctrl+C to shut down.");
 
     Server::builder()
         .add_service(GoatKvServiceServer::new(service))
-        .serve(addr)
+        .serve_with_shutdown(addr, shutdown_signal())
         .await?;
 
-    println!("Server finished");
+    println!("Server shut down gracefully.");
 
     Ok(())
 }
