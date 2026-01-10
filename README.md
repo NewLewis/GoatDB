@@ -1,7 +1,7 @@
 # GoatDB
 
-[![CI](https://github.com/YOUR_USERNAME/GoatDB/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR_USERNAME/GoatDB/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/YOUR_USERNAME/GoatDB/branch/main/graph/badge.svg)](https://codecov.io/gh/YOUR_USERNAME/GoatDB)
+[![CI](https://github.com/NewLewis/GoatDB/actions/workflows/ci.yml/badge.svg)](https://github.com/NewLewis/GoatDB/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/NewLewis/GoatDB/branch/main/graph/badge.svg)](https://codecov.io/gh/NewLewis/GoatDB)
 
 A high-performance Key-Value database built in Rust using LSM-Tree architecture.
 
