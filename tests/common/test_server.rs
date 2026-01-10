@@ -1,6 +1,6 @@
+use std::io::Read;
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
-
 use std::time::Duration;
 
 use rand::Rng;
@@ -16,11 +16,23 @@ pub mod goatkv {
 }
 
 /// 测试服务器选项
-#[derive(Default)]
+#[derive(Debug)]
 pub struct TestServerOptions {
     pub port: Option<u16>,
     pub data_dir: Option<TempDir>,
     pub show_logs: bool,
+    pub capture_stderr: bool,
+}
+
+impl Default for TestServerOptions {
+    fn default() -> Self {
+        Self {
+            port: None,
+            data_dir: None,
+            show_logs: true, // 临时启用日志以便调试
+            capture_stderr: true,
+        }
+    }
 }
 
 /// 测试服务器管理器
@@ -29,6 +41,7 @@ pub struct TestServer {
     pub address: String,
     #[allow(dead_code)]
     pub data_dir: TempDir,
+    stderr_output: Option<Vec<u8>>,
 }
 
 #[allow(dead_code)]
@@ -51,6 +64,7 @@ impl TestServer {
             port: None,
             data_dir: Some(data_dir),
             show_logs: false,
+            capture_stderr: true,
         };
 
         Self::start_with_options(options).await
@@ -77,30 +91,139 @@ impl TestServer {
             data_dir.path().to_str().unwrap().to_string(),
         ];
 
+        // 决定stderr的处理方式
+        let stderr_handle = if opts.capture_stderr {
+            Stdio::piped()
+        } else if opts.show_logs {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        };
+
         // 启动服务器进程
-        let process = Command::new("cargo")
-            .args(&args)
-            .stdout(if opts.show_logs {
-                Stdio::inherit()
-            } else {
-                Stdio::null()
-            })
-            .stderr(if opts.show_logs {
-                Stdio::inherit()
-            } else {
-                Stdio::null()
-            })
-            .spawn()
-            .expect("Failed to start test server");
+        let mut command = Command::new("cargo");
+        command.args(&args);
+
+        if opts.show_logs {
+            command.stdout(Stdio::inherit());
+        } else {
+            command.stdout(Stdio::null());
+        }
+
+        command.stderr(stderr_handle);
+
+        let mut process = command.spawn().expect("Failed to start test server");
+
+        // 如果是管道模式，获取stderr管道
+        let mut stderr_pipe = if opts.capture_stderr {
+            process.stderr.take()
+        } else {
+            None
+        };
 
         // 等待服务器就绪
         let server_url = format!("http://{}", address);
-        wait_for_server(&server_url, Duration::from_secs(10)).await;
+        let mut stderr_output = Vec::new();
+
+        if let Err(e) = Self::wait_for_server_with_process(
+            &server_url,
+            Duration::from_secs(30), // 增加超时到30秒
+            &mut process,
+            stderr_pipe.as_mut(),
+            &mut stderr_output,
+        )
+        .await
+        {
+            // 如果进程已退出，获取退出状态
+            let status = process.try_wait().ok().flatten();
+            let exit_code = status.map(|s| s.code()).flatten();
+
+            // 尝试读取剩余的stderr输出
+            if let Some(mut pipe) = stderr_pipe {
+                let _ = pipe.read_to_end(&mut stderr_output);
+            }
+
+            let stderr_str = String::from_utf8_lossy(&stderr_output);
+
+            panic!(
+                "Server failed to start within timeout: {}\n\
+                 Process exit code: {:?}\n\
+                 Stderr output:\n{}\n\
+                 Server address: {}\n\
+                 Data directory: {}",
+                e,
+                exit_code,
+                stderr_str,
+                address,
+                data_dir.path().display()
+            );
+        }
 
         Self {
             process,
             address: server_url,
             data_dir,
+            stderr_output: Some(stderr_output),
+        }
+    }
+
+    /// 带进程监控的等待函数
+    async fn wait_for_server_with_process(
+        url: &str,
+        timeout: Duration,
+        process: &mut Child,
+        mut stderr_pipe: Option<&mut std::process::ChildStderr>,
+        stderr_output: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        let start = std::time::Instant::now();
+
+        loop {
+            // 首先检查进程是否还活着
+            match process.try_wait() {
+                Ok(Some(status)) => {
+                    // 进程已退出
+                    let exit_code = status.code();
+                    let mut error_msg = format!("Server process exited with code: {:?}", exit_code);
+
+                    // 尝试读取剩余的stderr输出
+                    if let Some(mut pipe) = stderr_pipe.take() {
+                        let _ = pipe.read_to_end(stderr_output);
+                        if !stderr_output.is_empty() {
+                            let stderr_str = String::from_utf8_lossy(stderr_output);
+                            error_msg.push_str(&format!("\nStderr output:\n{}", stderr_str));
+                        }
+                    }
+
+                    return Err(error_msg);
+                }
+                Ok(None) => {
+                    // 进程还在运行，尝试连接
+                    match GoatKvServiceClient::<Channel>::connect(url.to_string()).await {
+                        Ok(_) => return Ok(()),
+                        Err(e) => {
+                            // 定期读取stderr，避免缓冲区填满
+                            if let Some(mut pipe) = stderr_pipe.as_mut() {
+                                let mut buffer = [0; 1024];
+                                while let Ok(n) = pipe.read(&mut buffer) {
+                                    if n == 0 {
+                                        break;
+                                    }
+                                    stderr_output.extend_from_slice(&buffer[..n]);
+                                }
+                            }
+
+                            if start.elapsed() < timeout {
+                                sleep(Duration::from_millis(100)).await;
+                            } else {
+                                return Err(format!("{}", e));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(format!("Failed to check process status: {}", e));
+                }
+            }
         }
     }
 
@@ -115,26 +238,16 @@ impl TestServer {
     pub fn kill(&mut self) {
         let _ = self.process.kill();
     }
+
+    /// 获取服务器进程的标准错误输出
+    pub fn stderr_output(&self) -> Option<&[u8]> {
+        self.stderr_output.as_deref()
+    }
 }
 
 impl Drop for TestServer {
     fn drop(&mut self) {
         let _ = self.process.kill();
-    }
-}
-
-/// 等待服务器启动并可用
-async fn wait_for_server(url: &str, timeout: Duration) {
-    let start = std::time::Instant::now();
-
-    loop {
-        match GoatKvServiceClient::<Channel>::connect(url.to_string()).await {
-            Ok(_) => return,
-            Err(_) if start.elapsed() < timeout => {
-                sleep(Duration::from_millis(100)).await;
-            }
-            Err(e) => panic!("Server failed to start within timeout: {}", e),
-        }
     }
 }
 
