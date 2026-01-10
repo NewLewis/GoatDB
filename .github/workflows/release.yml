@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       upload_url: ${{ steps.create_release.outputs.upload_url }}
-    
+
     steps:
       - name: Create Release
         id: create_release
@@ -46,7 +46,7 @@ jobs:
             target: x86_64-apple-darwin
             artifact_name: goat_db
             asset_name: goat_db-macos-amd64
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -59,14 +59,25 @@ jobs:
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
         with:
-          version: '25.x'
+          version: "25.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Strip binary (Linux/macOS)
-        if: matrix.os != 'windows-latest'
+        if: matrix.os != "windows-latest"
         run: strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
 
       - name: Upload Release Asset
