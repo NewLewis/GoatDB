@@ -18,9 +18,9 @@ fn parse_quoted_args(input: &str) -> Vec<String> {
     let mut in_quote = false;
     let mut quote_char = '\0';
     let mut escape_next = false;
-    let mut chars = input.chars().peekable();
+    let chars = input.chars().peekable();
 
-    while let Some(ch) = chars.next() {
+    for ch in chars {
         if escape_next {
             current_arg.push(ch);
             escape_next = false;

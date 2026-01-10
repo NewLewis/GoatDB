@@ -15,7 +15,6 @@ use bytes::Bytes;
 ///
 /// Sequence number range: 0 to 2^56 - 1 (≈7.2e16)
 /// Kind values: 0 = Put, 1 = Delete
-
 const SEQUENCE_NUMBER_BITS: u32 = 56;
 const KIND_BITS: u32 = 8;
 pub const SEQUENCE_NUMBER_MAX: u64 = (1 << SEQUENCE_NUMBER_BITS) - 1;
@@ -271,6 +270,6 @@ mod tests {
         assert_eq!(key.serialized_size(), 5 + 8);
 
         let empty_key = InternalKey::new(vec![], 456, InternalKeyKind::Delete);
-        assert_eq!(empty_key.serialized_size(), 0 + 8);
+        assert_eq!(empty_key.serialized_size(), 8);
     }
 }

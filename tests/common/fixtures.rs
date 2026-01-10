@@ -1,3 +1,5 @@
+#[allow(dead_code)]
+#[allow(clippy::module_inception)]
 pub mod fixtures {
     /// 生成随机测试数据
     pub fn random_key_value() -> (Vec<u8>, Vec<u8>) {

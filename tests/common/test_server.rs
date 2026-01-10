@@ -16,20 +16,11 @@ pub mod goatkv {
 }
 
 /// 测试服务器选项
+#[derive(Default)]
 pub struct TestServerOptions {
     pub port: Option<u16>,
     pub data_dir: Option<TempDir>,
     pub show_logs: bool,
-}
-
-impl Default for TestServerOptions {
-    fn default() -> Self {
-        Self {
-            port: None,
-            data_dir: None,
-            show_logs: false,
-        }
-    }
 }
 
 /// 测试服务器管理器
@@ -40,6 +31,7 @@ pub struct TestServer {
     pub data_dir: TempDir,
 }
 
+#[allow(dead_code)]
 impl TestServer {
     /// 使用默认选项启动测试服务器
     pub async fn start() -> Self {

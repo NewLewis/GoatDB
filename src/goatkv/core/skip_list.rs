@@ -56,7 +56,7 @@ impl Arena {
         let ptr = self.alloc_bytes(layout) as *mut T;
         unsafe {
             std::ptr::copy_nonoverlapping(src.as_ptr(), ptr, src.len());
-            NonNull::new_unchecked(std::slice::from_raw_parts_mut(ptr, src.len()))
+            NonNull::new_unchecked(std::ptr::slice_from_raw_parts_mut(ptr, src.len()))
         }
     }
 
@@ -281,15 +281,15 @@ where
 
         // 如果新节点高度超过当前最大高度，更新 prev
         if height > self.max_height {
-            for i in self.max_height..height {
-                prev[i] = Some(self.head);
+            for prev_item in prev.iter_mut().take(height).skip(self.max_height) {
+                *prev_item = Some(self.head);
             }
             self.max_height = height;
         }
 
         // 插入新节点到各层
-        for i in 0..height {
-            if let Some(mut prev_node) = prev[i] {
+        for (i, prev_item) in prev.iter().enumerate().take(height) {
+            if let Some(mut prev_node) = prev_item {
                 let prev_next = unsafe { prev_node.as_ref().next(i) };
                 unsafe {
                     // Set new node's next pointer
@@ -575,8 +575,8 @@ mod tests {
             .collect();
 
         assert_eq!(range.len(), 10);
-        for i in 0..10 {
-            assert_eq!(range[i], format!("{:02}", 20 + i).as_bytes());
+        for (i, item) in range.iter().enumerate().take(10) {
+            assert_eq!(item.as_slice(), format!("{:02}", 20 + i).as_bytes());
         }
     }
 
