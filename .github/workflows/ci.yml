@@ -96,7 +96,7 @@ jobs:
         run: cargo build --release
 
       - name: Run slow tests (placeholder)
-        run: echo "Slow/load tests not yet implemented. Add e2e_load_test.rs with #[ignore] tests when ready."
+        run: echo "Slow/load tests not yet implemented. Add e2e_load_test.rs with \#[ignore] tests when ready."
 
   # 代码覆盖率
   coverage:
