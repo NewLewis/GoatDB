@@ -5,6 +5,7 @@ on:
     tags:
       - "v*"
 
+# 1. 关键修复：添加写权限，解决报错问题
 permissions:
   contents: write
 
@@ -12,29 +13,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  create-release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-
-    steps:
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ github.ref }}
-          draft: false
-          prerelease: false
-
-  build-release:
-    name: Build Release
-    needs: create-release
+  build-and-release:
+    name: Build and Release
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false # 如果其中一个平台失败，不要取消其他平台的构建
       matrix:
         include:
           - os: ubuntu-latest
@@ -83,12 +66,24 @@ jobs:
         if: ${{ matrix.os != 'windows-latest' }}
         run: strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
 
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
+      # 2. 新增步骤：在本地重命名文件
+      # softprops 插件上传时会直接使用文件名，所以我们先改成目标名字
+      # 使用 shell: bash 确保在 Windows 上也能用 mv 命令
+      - name: Rename binary for release
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          mv ${{ matrix.artifact_name }} ${{ matrix.asset_name }}
+
+      # 3. 替换步骤：使用 softprops/action-gh-release 发布
+      - name: Create Release and Upload Asset
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: target/${{ matrix.target }}/release/${{ matrix.asset_name }}
+          # 如果你想自动生成 Release Notes，可以取消下面这行的注释
+          # generate_release_notes: true
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
-          asset_name: ${{ matrix.asset_name }}
-          asset_content_type: application/octet-stream
