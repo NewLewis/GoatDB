@@ -112,3 +112,62 @@ impl KvEngineOptions {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_options() {
+        let options = KvEngineOptions::default();
+        assert!(options.data_dir.ends_with("goatdb_data"));
+        assert_eq!(options.mem_table_size, 1024 * 1024);
+        assert!(options.recover_from_wal);
+        assert!(options.wal_sync);
+    }
+
+    #[test]
+    fn test_with_data_dir() {
+        let options = KvEngineOptions::default().with_data_dir("/custom/path");
+        assert_eq!(options.data_dir, PathBuf::from("/custom/path"));
+        assert_eq!(options.mem_table_size, 1024 * 1024);
+        assert!(options.recover_from_wal);
+        assert!(options.wal_sync);
+    }
+
+    #[test]
+    fn test_with_mem_table_size() {
+        let options = KvEngineOptions::default().with_mem_table_size(2048 * 1024);
+        assert_eq!(options.mem_table_size, 2048 * 1024);
+    }
+
+    #[test]
+    fn test_with_recover_from_wal() {
+        let options = KvEngineOptions::default().with_recover_from_wal(false);
+        assert!(!options.recover_from_wal);
+    }
+
+    #[test]
+    fn test_with_wal_sync() {
+        let options = KvEngineOptions::default().with_wal_sync(false);
+        assert!(!options.wal_sync);
+    }
+
+    #[test]
+    fn test_new() {
+        let options = KvEngineOptions::new();
+        assert!(options.data_dir.ends_with("goatdb_data"));
+        assert_eq!(options.mem_table_size, 1024 * 1024);
+        assert!(options.recover_from_wal);
+        assert!(options.wal_sync);
+    }
+
+    #[test]
+    fn test_for_test() {
+        let options = KvEngineOptions::for_test();
+        assert!(options.data_dir.ends_with("goatdb_test"));
+        assert_eq!(options.mem_table_size, 1024 * 1024);
+        assert!(!options.recover_from_wal);
+        assert!(!options.wal_sync);
+    }
+}

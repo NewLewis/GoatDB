@@ -466,4 +466,120 @@ mod tests {
         assert!(base_str.contains("goatdb_test"));
         assert!(base_str.contains("test_"));
     }
+
+    #[test]
+    fn test_directory_size_human() {
+        let temp_dir = tempdir().unwrap();
+        let manager = DbPathManager::new(temp_dir.path()).unwrap();
+
+        // 创建一些文件
+        let file1 = manager.data_dir().join("file1.txt");
+        let file2 = manager.wal_dir().join("file2.txt");
+        fs::write(&file1, "test data 1").unwrap();
+        fs::write(&file2, "test data 2").unwrap();
+
+        let human_size = manager.directory_size_human();
+
+        // 检查返回的字符串格式
+        assert!(!human_size.is_empty());
+        // 应该包含单位（B, KB, MB等）
+        assert!(
+            human_size.ends_with("B")
+                || human_size.ends_with("KB")
+                || human_size.ends_with("MB")
+                || human_size.ends_with("GB")
+                || human_size.ends_with("TB")
+                || human_size.ends_with("PB")
+                || human_size.starts_with("Error:")
+        );
+    }
+
+    #[test]
+    fn test_available_disk_space() {
+        let temp_dir = tempdir().unwrap();
+        let manager = DbPathManager::new(temp_dir.path()).unwrap();
+
+        // available_disk_space 可能返回 None（简化实现）
+        // 我们只需确保调用不会panic
+        let space = manager.available_disk_space();
+        // 可以返回 None 或 Some(u64)
+        match space {
+            Some(bytes) => assert!(bytes >= 0), // 有效的磁盘空间
+            None => (),                         // 可以接受，表示无法获取
+        }
+    }
+
+    #[test]
+    fn test_has_enough_space() {
+        let temp_dir = tempdir().unwrap();
+        let manager = DbPathManager::new(temp_dir.path()).unwrap();
+
+        // 测试小空间请求，应该总是返回 true
+        // 因为如果无法获取磁盘空间信息，has_enough_space 返回 true
+        let has_space = manager.has_enough_space(1024); // 1KB
+        assert!(has_space);
+
+        // 测试大空间请求
+        let has_space_large = manager.has_enough_space(1_000_000_000_000); // 1TB
+                                                                           // 如果 available_disk_space 返回 None，则返回 true
+                                                                           // 如果返回 Some，则取决于实际可用空间
+                                                                           // 无论如何，调用不应panic
+    }
+
+    #[test]
+    fn test_format_bytes() {
+        // 测试私有方法 format_bytes 的逻辑
+        // 通过 directory_size_human 间接测试
+
+        let temp_dir = tempdir().unwrap();
+        let manager = DbPathManager::new(temp_dir.path()).unwrap();
+
+        // 创建一个小文件（小于1KB）
+        let small_file = manager.data_dir().join("small.txt");
+        fs::write(&small_file, "x").unwrap(); // 1字节
+
+        let small_size = manager.directory_size_human();
+        // 应该以 "B" 结尾
+        assert!(small_size.contains("B"));
+
+        // 创建一个大文件（约1MB）
+        let large_file = manager.data_dir().join("large.txt");
+        let data = vec![0u8; 1_000_000]; // 1MB
+        fs::write(&large_file, &data).unwrap();
+
+        let large_size = manager.directory_size_human();
+        // 应该包含 "MB" 或 "KB"
+        assert!(large_size.contains("MB") || large_size.contains("KB"));
+    }
+
+    #[test]
+    fn test_directory_size() {
+        let temp_dir = tempdir().unwrap();
+        let manager = DbPathManager::new(temp_dir.path()).unwrap();
+
+        // 初始目录大小应该很小（只有目录结构）
+        let initial_size = manager.directory_size();
+        assert!(initial_size.is_ok());
+        let initial_bytes = initial_size.unwrap();
+        assert!(initial_bytes >= 0);
+
+        // 添加一个文件
+        let file_path = manager.data_dir().join("test_file.txt");
+        fs::write(&file_path, "Hello, World!").unwrap();
+
+        // 新大小应该更大
+        let new_size = manager.directory_size();
+        assert!(new_size.is_ok());
+        let new_bytes = new_size.unwrap();
+        assert!(new_bytes > initial_bytes);
+
+        // 添加另一个文件到不同目录
+        let wal_file = manager.wal_dir().join("wal_entry.bin");
+        fs::write(&wal_file, vec![0u8; 100]).unwrap();
+
+        let final_size = manager.directory_size();
+        assert!(final_size.is_ok());
+        let final_bytes = final_size.unwrap();
+        assert!(final_bytes > new_bytes);
+    }
 }

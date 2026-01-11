@@ -204,3 +204,168 @@ impl Iterator for WalIterator {
         Some(Ok((key, value)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_wal_manager_new() {
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let wal_manager = WalManager::new(temp_file.path().to_path_buf());
+        assert!(wal_manager.is_ok());
+    }
+
+    #[test]
+    fn test_wal_manager_write_and_checksum() {
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let mut wal_manager =
+            WalManager::new(temp_file.path().to_path_buf()).expect("Failed to create WalManager");
+
+        let key = InternalKey::new(
+            b"test_key".to_vec(),
+            1,
+            crate::goatkv::encoding::internal_key::InternalKeyKind::Put,
+        );
+        let value = b"test_value".to_vec();
+
+        let result = wal_manager.write(&key, &value);
+        assert!(result.is_ok());
+
+        // 验证文件大小非零
+        let metadata = fs::metadata(temp_file.path()).expect("Failed to get metadata");
+        assert!(metadata.len() > 0);
+
+        // 验证校验和计算
+        let checksum = WalManager::get_checksum(
+            &key,
+            key.serialized_size() as u32,
+            &value,
+            value.len() as u32,
+        );
+        // 读取文件验证校验和
+        let file_content = fs::read(temp_file.path()).expect("Failed to read file");
+        let stored_checksum = u32::from_le_bytes(file_content[0..4].try_into().unwrap());
+        assert_eq!(checksum, stored_checksum);
+    }
+
+    #[test]
+    fn test_wal_iterator_empty() {
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let iterator = WalIterator::new(&temp_file.path().to_path_buf());
+        assert!(iterator.is_ok());
+
+        let mut iterator = iterator.unwrap();
+        assert!(iterator.next().is_none());
+    }
+
+    #[test]
+    fn test_wal_write_and_iterate() {
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let path = temp_file.path().to_path_buf();
+
+        // 写入数据
+        {
+            let mut wal_manager =
+                WalManager::new(path.clone()).expect("Failed to create WalManager");
+
+            let key1 = InternalKey::new(
+                b"key1".to_vec(),
+                1,
+                crate::goatkv::encoding::internal_key::InternalKeyKind::Put,
+            );
+            let value1 = b"value1".to_vec();
+            wal_manager
+                .write(&key1, &value1)
+                .expect("Failed to write key1");
+
+            let key2 = InternalKey::new(
+                b"key2".to_vec(),
+                2,
+                crate::goatkv::encoding::internal_key::InternalKeyKind::Delete,
+            );
+            let value2 = b"".to_vec();
+            wal_manager
+                .write(&key2, &value2)
+                .expect("Failed to write key2");
+        }
+
+        // 读取数据
+        let mut iterator = WalIterator::new(&path).expect("Failed to create iterator");
+
+        // 读取第一条记录
+        let entry1 = iterator
+            .next()
+            .expect("Expected first entry")
+            .expect("Failed to read entry");
+        assert_eq!(entry1.0.user_key(), b"key1");
+        assert_eq!(entry1.0.sequence_number(), 1);
+        assert_eq!(entry1.1, b"value1");
+
+        // 读取第二条记录
+        let entry2 = iterator
+            .next()
+            .expect("Expected second entry")
+            .expect("Failed to read entry");
+        assert_eq!(entry2.0.user_key(), b"key2");
+        assert_eq!(entry2.0.sequence_number(), 2);
+        assert_eq!(entry2.1, b"");
+
+        // 应该没有更多记录
+        assert!(iterator.next().is_none());
+    }
+
+    #[test]
+    fn test_wal_checksum_validation() {
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let path = temp_file.path().to_path_buf();
+
+        // 写入有效数据
+        {
+            let mut wal_manager =
+                WalManager::new(path.clone()).expect("Failed to create WalManager");
+
+            let key = InternalKey::new(
+                b"test".to_vec(),
+                1,
+                crate::goatkv::encoding::internal_key::InternalKeyKind::Put,
+            );
+            let value = b"valid".to_vec();
+            wal_manager.write(&key, &value).expect("Failed to write");
+        }
+
+        // 破坏文件内容（修改校验和）
+        {
+            let mut file_content = fs::read(&path).expect("Failed to read file");
+            // 修改第一个字节（校验和的一部分）
+            file_content[0] = file_content[0].wrapping_add(1);
+            fs::write(&path, &file_content).expect("Failed to write corrupted file");
+        }
+
+        // 尝试读取，应该失败
+        let mut iterator = WalIterator::new(&path).expect("Failed to create iterator");
+        let result = iterator.next().expect("Expected entry");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("Checksum mismatch"));
+    }
+
+    #[test]
+    fn test_wal_corrupted_file_handling() {
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let path = temp_file.path().to_path_buf();
+
+        // 写入不完整的数据（只有部分校验和）
+        fs::write(&path, &[0x01, 0x02]).expect("Failed to write corrupted file");
+
+        let iterator = WalIterator::new(&path);
+        assert!(iterator.is_ok());
+
+        let mut iterator = iterator.unwrap();
+        let result = iterator.next();
+        // 对于只有部分校验和的不完整文件，应该返回 None（EOF）
+        assert!(result.is_none());
+    }
+}
