@@ -136,9 +136,10 @@ impl TestServer {
         {
             // 如果进程已退出，获取退出状态
             let status = process.try_wait().ok().flatten();
-            let exit_code = status.map(|s| s.code()).flatten();
+            let exit_code = status.and_then(|s| s.code());
 
             // 尝试读取剩余的stderr输出
+            #[allow(unused_mut)]
             if let Some(mut pipe) = stderr_pipe {
                 let _ = pipe.read_to_end(&mut stderr_output);
             }
@@ -186,6 +187,7 @@ impl TestServer {
                     let mut error_msg = format!("Server process exited with code: {:?}", exit_code);
 
                     // 尝试读取剩余的stderr输出
+                    #[allow(unused_mut)]
                     if let Some(mut pipe) = stderr_pipe.take() {
                         let _ = pipe.read_to_end(stderr_output);
                         if !stderr_output.is_empty() {
@@ -201,17 +203,6 @@ impl TestServer {
                     match GoatKvServiceClient::<Channel>::connect(url.to_string()).await {
                         Ok(_) => return Ok(()),
                         Err(e) => {
-                            // 定期读取stderr，避免缓冲区填满
-                            if let Some(mut pipe) = stderr_pipe.as_mut() {
-                                let mut buffer = [0; 1024];
-                                while let Ok(n) = pipe.read(&mut buffer) {
-                                    if n == 0 {
-                                        break;
-                                    }
-                                    stderr_output.extend_from_slice(&buffer[..n]);
-                                }
-                            }
-
                             if start.elapsed() < timeout {
                                 sleep(Duration::from_millis(100)).await;
                             } else {
