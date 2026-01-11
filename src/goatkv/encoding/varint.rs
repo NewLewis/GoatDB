@@ -265,7 +265,7 @@ mod tests {
 
         for value in test_values {
             let encoded = encode(value);
-            let decoded = decode(&encoded).expect(&format!("解码编码值 {} 失败", value));
+            let decoded = decode(&encoded).unwrap_or_else(|_| panic!("解码编码值 {} 失败", value));
             assert_eq!(decoded, value, "值 {} 的往返测试失败", value);
         }
     }
@@ -309,10 +309,7 @@ mod tests {
         // 10 个 0x80（延续）然后 0x00
         // 这实际上是 0 的有效编码，但让我们测试真正的溢出：
         // 使用 10 个都有延续位的字节，然后是第 11 个
-        let mut long_varint = Vec::new();
-        for _ in 0..11 {
-            long_varint.push(0x80); // 所有字节都有延续
-        }
+        let mut long_varint = vec![0x80; 11];
         long_varint[10] = 0x00; // 在第 11 字节终止
 
         // 应该溢出，因为我们尝试处理 11 字节 * 7 位 = 77 位

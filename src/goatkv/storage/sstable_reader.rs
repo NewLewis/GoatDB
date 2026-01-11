@@ -130,8 +130,8 @@ impl SSTableReader {
         // 跳过 padding (应该是0字节)
         // padding 大小 = FOOTER_SIZE - 8(magic) - bloom_bytes_len - index_bytes_len
         // 验证 padding 都是0
-        for i in cursor..(footer.len() - 8) {
-            if footer[i] != 0 {
+        for &byte in footer.iter().take(footer.len() - 8).skip(cursor) {
+            if byte != 0 {
                 // 不返回错误，只是记录警告，因为可能有其他数据
             }
         }
@@ -622,7 +622,7 @@ mod tests {
         let _file_size = std::fs::metadata(&sst_path).unwrap().len();
         let mut _current_offset = 0;
 
-        for (_block_idx, entry) in reader.index_entries.iter().enumerate() {
+        for entry in reader.index_entries.iter() {
             let block_offset = entry.block_offset;
             let block_size = entry.block_size;
 

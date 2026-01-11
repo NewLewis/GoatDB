@@ -91,7 +91,7 @@ impl DbPathManager {
         // 创建子目录
         let dirs = [&self.data_dir, &self.wal_dir, &self.log_dir, &self.tmp_dir];
 
-        for dir in dirs.iter() {
+        for dir in &dirs {
             if !dir.exists() {
                 fs::create_dir_all(dir)?;
             }

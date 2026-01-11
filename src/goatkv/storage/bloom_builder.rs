@@ -8,6 +8,12 @@ pub struct BloomBuilder {
     k: usize,
 }
 
+impl Default for BloomBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BloomBuilder {
     /// 创建一个默认的 BloomBuilder，使用 1024 字节 (8192 位) 的位图
     pub fn new() -> Self {
@@ -29,7 +35,7 @@ impl BloomBuilder {
         // 根据公式计算所需的 bit 数: m = - (n * ln(p)) / (ln(2)^2)
         let m = (-((expected_items as f64) * false_positive_rate.ln()) / (2.0_f64.ln().powi(2)))
             .ceil() as usize;
-        let bytes = (m + 7) / 8; // 转换为字节数
+        let bytes = m.div_ceil(8); // 转换为字节数
         Self::with_capacity(bytes.max(1)) // 至少 1 字节
     }
 
@@ -216,7 +222,7 @@ mod tests {
 
         // 验证所有添加的 key 都返回 true
         for i in 0..100 {
-            let key = format!("key{}", i);
+            let key = format!("key{i}");
             assert!(filter.contains(key.as_bytes()));
         }
     }

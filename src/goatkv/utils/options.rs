@@ -67,24 +67,28 @@ impl KvEngineOptions {
     }
 
     /// Sets the data directory path
+    #[must_use]
     pub fn with_data_dir<P: AsRef<Path>>(mut self, data_dir: P) -> Self {
         self.data_dir = data_dir.as_ref().to_path_buf();
         self
     }
 
     /// Sets the maximum memtable size in bytes
+    #[must_use]
     pub fn with_mem_table_size(mut self, size: usize) -> Self {
         self.mem_table_size = size;
         self
     }
 
     /// Sets whether to attempt recovery from WAL on startup
+    #[must_use]
     pub fn with_recover_from_wal(mut self, recover: bool) -> Self {
         self.recover_from_wal = recover;
         self
     }
 
     /// Sets whether to synchronize WAL writes to disk
+    #[must_use]
     pub fn with_wal_sync(mut self, sync: bool) -> Self {
         self.wal_sync = sync;
         self

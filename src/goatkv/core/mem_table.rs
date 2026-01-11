@@ -23,7 +23,7 @@ impl MemTableInner {
 
     /// 插入键值对
     pub fn put(&self, key: InternalKey, value: Bytes) {
-        self.skiplist.write().unwrap().insert(key, value.into());
+        self.skiplist.write().unwrap().insert(key, value);
     }
 
     /// 获取值
@@ -53,7 +53,7 @@ impl MemTableInner {
         let guard = self.skiplist.read().unwrap();
 
         MemTableIterBuilder {
-            guard: guard,
+            guard,
             iter_builder: |guard| guard.iter(),
         }
         .build()
@@ -66,6 +66,10 @@ impl MemTableInner {
 
     pub fn len(&self) -> usize {
         self.skiplist.read().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn memory_usage(&self) -> usize {
@@ -126,6 +130,10 @@ impl MemTable {
         self.inner.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     pub fn memory_usage(&self) -> usize {
         self.inner.memory_usage()
     }
@@ -159,6 +167,10 @@ impl ImmutableMemTable {
         self.inner.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (InternalKey, Bytes)> + '_ {
         self.inner.iter()
     }
@@ -183,7 +195,7 @@ mod tests {
         assert_eq!(memtable.len(), 1000);
 
         let result = memtable.get(b"key_000500");
-        assert_eq!(result.is_some(), true);
+        assert!(result.is_some());
         let (_, val) = result.unwrap();
         assert_eq!(val, b"value_500".to_vec());
     }

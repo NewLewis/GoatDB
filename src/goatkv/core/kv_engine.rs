@@ -31,6 +31,12 @@ pub struct KvEngine {
     flush_task_id: AtomicUsize,
 }
 
+impl Default for KvEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KvEngine {
     /// 创建新的 KvEngine，使用默认数据目录（当前目录下的 goatdb_data）
     pub fn new() -> Self {
@@ -62,12 +68,8 @@ impl KvEngine {
         }
 
         // 创建 WAL 管理器
-        let wal_manager = WalManager::new(wal_path).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to open WAL file: {}", e),
-            )
-        })?;
+        let wal_manager = WalManager::new(wal_path)
+            .map_err(|e| std::io::Error::other(format!("Failed to open WAL file: {}", e)))?;
 
         // 创建 LSM 状态管理器
         let lsm_state = Arc::new(RwLock::new(LSMState::new(&options)));

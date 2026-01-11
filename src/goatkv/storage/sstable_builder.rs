@@ -21,7 +21,6 @@ const FOOTER_SIZE: usize = 48;
 /// SSTable文件的最大索引条目分隔符长度
 /// 用于限制索引块中的分隔符大小，防止内存过度使用
 // const MAX_SEPARATOR_LENGTH: usize = 256; // 暂未使用，注释掉避免警告
-
 /// SSTableBuilder用于构建SSTable文件
 ///
 /// # SSTable文件结构
@@ -145,6 +144,7 @@ impl SSTableBuilder {
         let file = OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(true)
             .open(&filename)?;
 
         Ok(Self {
@@ -261,7 +261,7 @@ impl SSTableBuilder {
 
         // 计算separator用于索引
         // separator是用于索引的特殊key，表示该数据块的key范围
-        let separator = Self::compute_separator(&last_key, key);
+        let separator = Self::compute_separator(last_key, key);
 
         // 将separator和数据块信息添加到索引块
         // 索引格式：separator -> (block_offset, block_size)
@@ -271,7 +271,7 @@ impl SSTableBuilder {
         self.index_block_builder.add(&separator, &separator_val);
 
         // 将数据块写入文件
-        self.writer.write_all(&block_content).unwrap();
+        self.writer.write_all(block_content).unwrap();
         self.offset += block_content.len() as u64;
 
         // 重置数据块构建器，准备开始新的数据块
@@ -322,10 +322,10 @@ impl SSTableBuilder {
             let mut separator_val = Vec::new();
             separator_val.extend_from_slice(&varint::encode(self.offset));
             separator_val.extend_from_slice(&varint::encode(block_content.len() as u64));
-            self.index_block_builder.add(&last_key, &separator_val);
+            self.index_block_builder.add(last_key, &separator_val);
 
             // 写入最后一个数据块
-            self.writer.write_all(&block_content).unwrap();
+            self.writer.write_all(block_content).unwrap();
             self.offset += block_content.len() as u64;
 
             // 重置数据块构建器
@@ -341,7 +341,7 @@ impl SSTableBuilder {
         // 写入IndexBlock
         // IndexBlock包含所有数据块的位置和大小信息
         let (block_content, _) = self.index_block_builder.finish();
-        self.writer.write_all(&block_content).unwrap();
+        self.writer.write_all(block_content).unwrap();
         let index_offset = self.offset;
         self.offset += block_content.len() as u64;
 
@@ -420,7 +420,8 @@ impl SSTableBuilder {
         }
 
         // 逐字节比较，找到第一个不同的位置
-        while i < last_key.len() && i < key.len() {
+        let min_len = last_key.len().min(key.len());
+        while i < min_len {
             if last_key[i] != key[i] {
                 // 找到不同位置，如果last_key[i] < 0xff，可以加1
                 if last_key[i] < 0xff {

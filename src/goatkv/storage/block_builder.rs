@@ -59,6 +59,12 @@ pub struct BlockBuilder {
     last_key: Vec<u8>,
 }
 
+impl Default for BlockBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BlockBuilder {
     /// 创建一个新的BlockBuilder
     ///
@@ -177,7 +183,7 @@ impl BlockBuilder {
     /// ```
     pub fn finish(&mut self) -> (&[u8], &[u8]) {
         // 将重启点数组追加到buffer末尾
-        self.buffer.extend_from_slice(&self.restarts.as_slice());
+        self.buffer.extend_from_slice(self.restarts.as_slice());
 
         // 追加重启点数量
         // 注意：restarts数组中每个重启点占用4字节，所以数量 = 字节数 / 4
@@ -244,6 +250,10 @@ impl BlockBuilder {
     /// ```
     pub fn len(&self) -> usize {
         self.buffer.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// 判断当前Block是否应该结束
@@ -328,7 +338,7 @@ mod tests {
         builder.add(b"key3", b"value3");
 
         // 验证不为空
-        assert!(!builder.empty());
+        assert!(!builder.is_empty());
 
         // 完成构建
         let (block_data, last_key) = builder.finish();
@@ -490,8 +500,7 @@ mod tests {
         builder.add(b"key1", b"value1");
         builder.add(b"key2", b"value2");
 
-        let len_before_finish = builder.len();
-        assert!(len_before_finish > 0);
+        assert!(!builder.is_empty());
 
         // 完成第一个block
         builder.finish();
@@ -506,7 +515,7 @@ mod tests {
         // 可以重新添加数据
         builder.add(b"key3", b"value3");
         assert!(!builder.empty());
-        assert!(builder.len() > 0);
+        assert!(!builder.is_empty());
     }
 
     /// 测试不同长度的key和value
@@ -520,7 +529,7 @@ mod tests {
         builder.add(b"a", b"v");
         builder.add(b"ab", b"val");
         builder.add(b"abc", b"value");
-        builder.add(&vec![b'x'; 100], &vec![b'y'; 200]);
+        builder.add(&[b'x'; 100], &[b'y'; 200]);
 
         let (block_data, _) = builder.finish();
 
@@ -529,7 +538,7 @@ mod tests {
 
         // 验证数据被编码（使用varint）
         // 长key和长value应该使用varint编码
-        assert!(block_data.len() > 0);
+        assert!(!block_data.is_empty());
     }
 
     /// 测试共享前缀计算

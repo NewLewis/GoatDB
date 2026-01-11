@@ -5,6 +5,12 @@ pub struct SequenceNumber {
     counter: AtomicU64,
 }
 
+impl Default for SequenceNumber {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SequenceNumber {
     pub fn new() -> Self {
         Self {

@@ -191,7 +191,7 @@ impl Iterator for WalIterator {
         }
 
         // 验证校验和
-        if WalManager::get_checksum(&key, key_len as u32, &value, value_len as u32) != checksum {
+        if WalManager::get_checksum(&key, key_len, &value, value_len) != checksum {
             return Some(Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(

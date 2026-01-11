@@ -53,7 +53,7 @@ impl GoatKvService for GoatKVServiceImpl {
 
         let reply = WriteResponse {
             success: true,
-            message: format!("Written successfully"),
+            message: "Written successfully".to_string(),
         };
 
         Ok(Response::new(reply))
@@ -81,7 +81,7 @@ impl GoatKvService for GoatKVServiceImpl {
             None => {
                 let reply = GetResponse {
                     success: false,
-                    message: format!("Key not found"),
+                    message: "Key not found".to_string(),
                     value: vec![],
                 };
                 Ok(Response::new(reply))
@@ -110,7 +110,7 @@ impl GoatKvService for GoatKVServiceImpl {
         if self.engine.get(&req.key).is_none() {
             let reply = UpdateResponse {
                 success: false,
-                message: format!("Key not found, cannot update"),
+                message: "Key not found, cannot update".to_string(),
             };
             return Ok(Response::new(reply));
         }
@@ -120,7 +120,7 @@ impl GoatKvService for GoatKVServiceImpl {
 
         let reply = UpdateResponse {
             success: true,
-            message: format!("Updated successfully"),
+            message: "Updated successfully".to_string(),
         };
 
         Ok(Response::new(reply))
@@ -144,7 +144,7 @@ impl GoatKvService for GoatKVServiceImpl {
 
         let reply = DeleteResponse {
             success: true,
-            message: format!("Deleted successfully"),
+            message: "Deleted successfully".to_string(),
         };
 
         Ok(Response::new(reply))
@@ -161,7 +161,7 @@ impl GoatKvService for GoatKVServiceImpl {
 
         let reply = FlushResponse {
             success: true,
-            message: format!("Flush triggered successfully"),
+            message: "Flush triggered successfully".to_string(),
         };
 
         Ok(Response::new(reply))

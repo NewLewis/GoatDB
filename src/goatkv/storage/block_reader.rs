@@ -120,9 +120,7 @@ impl<'a> BlockReader<'a> {
         }
 
         // 没有在重启点找到精确匹配，在最后的候选区间进行线性搜索
-        if left > 0 {
-            left -= 1;
-        }
+        left = left.saturating_sub(1);
         self.linear_search_from_restart(left, key)
     }
 
@@ -242,10 +240,10 @@ impl<'a> BlockReader<'a> {
 
     /// 在整个块中进行线性搜索（回退策略）
     fn linear_search_full(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let mut iter = self.iter();
+        let iter = self.iter();
         let mut prev_key = Vec::new();
 
-        while let Some((entry_key, entry_value)) = iter.next() {
+        for (entry_key, entry_value) in iter {
             // 重建完整的key
             let full_key = if prev_key.is_empty() {
                 entry_key.clone()
@@ -357,8 +355,6 @@ impl<'a> BlockReader<'a> {
         varint::decode_with_length(bytes)
     }
 
-    /// 静态方法：在指定位置解码varint（用于构造函数中）
-
     /// 计算两个键之间的共享前缀长度
     fn compute_shared(&self, key1: &[u8], key2: &[u8]) -> u32 {
         let min_len = key1.len().min(key2.len());
@@ -463,7 +459,7 @@ mod tests {
         builder.add(b"key2", b"value2");
         let (data, _) = builder.finish();
 
-        let reader = BlockReader::new(&data);
+        let reader = BlockReader::new(data);
         assert!(reader.is_ok());
     }
 
@@ -473,7 +469,7 @@ mod tests {
         let mut builder = BlockBuilder::new();
         let (data, _) = builder.finish();
 
-        let reader = BlockReader::new(&data).unwrap();
+        let reader = BlockReader::new(data).unwrap();
         assert_eq!(reader.restarts.len(), 0);
         assert_eq!(reader.entry_count(), 0);
     }
@@ -486,7 +482,7 @@ mod tests {
         builder.add(b"key3", b"value3");
         let (data, _) = builder.finish();
 
-        let reader = BlockReader::new(&data).unwrap();
+        let reader = BlockReader::new(data).unwrap();
         let mut iter = reader.iter();
 
         assert_eq!(iter.next(), Some((b"key1".to_vec(), b"value1".to_vec())));
@@ -503,7 +499,7 @@ mod tests {
         builder.add(b"key3", b"value3");
         let (data, _) = builder.finish();
 
-        let reader = BlockReader::new(&data).unwrap();
+        let reader = BlockReader::new(data).unwrap();
 
         let result1 = reader.get(b"key1");
         let result2 = reader.get(b"key2");
@@ -523,7 +519,7 @@ mod tests {
         builder.add(b"apply", b"value3");
         let (data, _) = builder.finish();
 
-        let reader = BlockReader::new(&data).unwrap();
+        let reader = BlockReader::new(data).unwrap();
 
         // 测试获取
         assert_eq!(reader.get(b"apple"), Some(b"value1".to_vec()));
@@ -555,7 +551,7 @@ mod tests {
         }
 
         let (data, _) = builder.finish();
-        let reader = BlockReader::new(&data).unwrap();
+        let reader = BlockReader::new(data).unwrap();
 
         // 验证所有条目都能正确读取
         for i in 0..10 {
