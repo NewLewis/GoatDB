@@ -12,24 +12,24 @@ Runs on every push and pull request to main branches.
 
 1. **Test Suite** - Runs on Linux, Windows, and macOS
    - Code formatting check (`cargo fmt`)
-   - Linting with Clippy
-   - Unit tests
-   - Integration tests
-   - E2E tests
+   - Linting with Clippy (`cargo clippy`)
+   - Build verification (`cargo build`)
+   - Unit tests (`cargo test --lib`)
+   - Integration and E2E tests (`cargo test --test '*'`)
 
 2. **Slow Tests** - Runs only on Linux after main tests pass
-   - Load tests with large datasets
-   - Performance regression tests
+   - Placeholder for future load and performance tests
+   - Currently outputs message indicating tests not yet implemented
 
 3. **Coverage** - Generates code coverage report
    - Uses `cargo-tarpaulin`
-   - Uploads to Codecov
+   - Uploads to Codecov (optional)
 
 **Key Features:**
 - ✅ Automatic protoc installation via `arduino/setup-protoc`
-- ✅ Cargo caching for faster builds
-- ✅ Multi-platform testing
-- ✅ Separate slow test job to keep CI fast
+- ✅ Unified cargo caching for faster builds
+- ✅ Multi-platform testing (Linux, Windows, macOS)
+- ✅ Separate slow test job structure for future expansion
 
 ### Release Workflow (`release.yml`)
 
@@ -41,8 +41,13 @@ Triggers on version tags (e.g., `v0.1.0`).
 - macOS (x86_64-apple-darwin)
 
 **Outputs:**
-- Stripped release binaries
+- Stripped release binaries (Linux/macOS)
 - GitHub Release with attached assets
+
+**Key Features:**
+- ✅ Multi-platform release builds
+- ✅ Caching for faster builds
+- ✅ Automatic asset upload to GitHub Releases
 
 ## Running Locally
 
@@ -56,14 +61,14 @@ cargo test
 cargo test --lib
 ```
 
-### E2E tests only
+### Integration and E2E tests only
 ```bash
-cargo test --test 'e2e_*'
+cargo test --test '*'
 ```
 
-### Load tests
+### Future load tests (when implemented)
 ```bash
-cargo test --release --test 'e2e_load' -- --ignored
+cargo test --release --test 'e2e_load' -- --ignored --test-threads=1
 ```
 
 ## Required Secrets
@@ -75,12 +80,18 @@ For full CI/CD functionality, configure these secrets in GitHub:
 
 ## Cache Strategy
 
-The CI uses three cache layers:
-1. Cargo registry (`~/.cargo/registry`)
-2. Cargo git index (`~/.cargo/git`)
-3. Build artifacts (`target/`)
+The CI uses a unified cache strategy:
+- Cargo registry (`~/.cargo/registry`)
+- Cargo git index (`~/.cargo/git`)
+- Build artifacts (`target/`)
 
-Caches are invalidated when `Cargo.lock` changes.
+Caches are invalidated when `Cargo.lock` changes and are shared across all jobs for consistency.
+
+## Performance Optimizations
+
+1. **Reduced test duplication** - Integration and E2E tests run in a single step
+2. **Unified caching** - Single cache configuration for better performance
+3. **Platform-specific optimizations** - Binary stripping for Linux/macOS releases
 
 ## Troubleshooting
 
@@ -90,14 +101,29 @@ The workflow uses `arduino/setup-protoc@v3` which should handle all platforms. I
 - Verify the action is up to date
 
 ### Tests timeout
-Default timeouts:
-- Integration tests: 15 minutes
-- E2E tests: 20 minutes
-- Load tests: 60 minutes
+Default timeout:
+- Integration and E2E tests: 25 minutes
 
 Adjust in the workflow file if needed.
+
+### Slow tests placeholder
+The slow-tests job currently only outputs a message. To add actual slow tests:
+1. Create test files with `#[ignore]` attribute
+2. Update the workflow to run them with `--ignored` flag
 
 ### Windows-specific issues
 Windows runners may have different path handling. The workflow uses:
 - PowerShell-compatible commands
 - Cross-platform cargo commands
+- Conditional steps for platform-specific operations (e.g., binary stripping)
+
+## Recent Changes
+
+### CI Configuration Updates (2024)
+- **Fixed test duplication**: Merged "Run integration tests" and "Run E2E tests" into a single step
+- **Unified caching**: Consolidated three separate cache steps into one unified cache configuration
+- **Fixed non-existent load tests**: Replaced reference to non-existent `e2e_load` tests with placeholder
+- **Added caching to release workflow**: Improved release build performance with dependency caching
+- **Formatting improvements**: Consistent quoting and indentation across workflow files
+
+These changes reduce CI runtime, improve maintainability, and ensure consistent behavior across all jobs.

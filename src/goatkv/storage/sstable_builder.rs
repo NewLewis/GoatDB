@@ -18,8 +18,8 @@ const MAGIC_NUMBER: u64 = 0x706A725F676F6174;
 #[cfg(test)]
 const FOOTER_SIZE: usize = 48;
 
-/// SSTable文件的最大索引条目分隔符长度
-/// 用于限制索引块中的分隔符大小，防止内存过度使用
+// SSTable文件的最大索引条目分隔符长度
+// 用于限制索引块中的分隔符大小，防止内存过度使用
 // const MAX_SEPARATOR_LENGTH: usize = 256; // 暂未使用，注释掉避免警告
 /// SSTableBuilder用于构建SSTable文件
 ///

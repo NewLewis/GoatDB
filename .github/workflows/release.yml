@@ -3,50 +3,33 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
+
+# 关键修复：添加写权限，解决报错问题
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  create-release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-    
-    steps:
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ github.ref }}
-          draft: false
-          prerelease: false
-
-  build-release:
-    name: Build Release
-    needs: create-release
+  build-and-release:
+    name: Build and Release
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false # 如果其中一个平台失败，不要取消其他平台的构建
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: goat_db
-            asset_name: goat_db-linux-amd64
+            platform: linux-amd64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: goat_db.exe
-            asset_name: goat_db-windows-amd64.exe
+            platform: windows-amd64
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact_name: goat_db
-            asset_name: goat_db-macos-amd64
-    
+            platform: macos-amd64
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -59,22 +42,78 @@ jobs:
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
         with:
-          version: '25.x'
+          version: "25.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
-      - name: Strip binary (Linux/macOS)
-        if: matrix.os != 'windows-latest'
-        run: strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+      # 构建所有二进制文件（client和server）
+      - name: Build release binaries
+        run: cargo build --release --target ${{ matrix.target }} --bin goatkv_client --bin goatkv_server
 
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
+      # 调试：列出生成的文件
+      - name: List built binaries
+        shell: bash
+        run: |
+          echo "Listing files in target directory:"
+          ls -la target/${{ matrix.target }}/release/
+          echo "Looking for goatkv binaries:"
+          ls -la target/${{ matrix.target }}/release/goatkv_* 2>/dev/null || echo "No goatkv binaries found"
+
+      # 为不同平台设置文件扩展名
+      - name: Setup binary names
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            echo "CLIENT_SRC=goatkv_client.exe" >> $GITHUB_ENV
+            echo "SERVER_SRC=goatkv_server.exe" >> $GITHUB_ENV
+            echo "CLIENT_DEST=goatdb-client-${{ matrix.platform }}.exe" >> $GITHUB_ENV
+            echo "SERVER_DEST=goatdb-server-${{ matrix.platform }}.exe" >> $GITHUB_ENV
+          else
+            echo "CLIENT_SRC=goatkv_client" >> $GITHUB_ENV
+            echo "SERVER_SRC=goatkv_server" >> $GITHUB_ENV
+            echo "CLIENT_DEST=goatdb-client-${{ matrix.platform }}" >> $GITHUB_ENV
+            echo "SERVER_DEST=goatdb-server-${{ matrix.platform }}" >> $GITHUB_ENV
+          fi
+
+      # 去除调试符号（Linux/macOS）
+      - name: Strip binaries (Linux/macOS)
+        if: ${{ matrix.os != 'windows-latest' }}
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          strip "$CLIENT_SRC"
+          strip "$SERVER_SRC"
+
+      # 重命名文件以便发布
+      - name: Rename binaries for release
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          mv "$CLIENT_SRC" "$CLIENT_DEST"
+          mv "$SERVER_SRC" "$SERVER_DEST"
+
+      # 创建Release并上传所有二进制文件
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            target/${{ matrix.target }}/release/${{ env.CLIENT_DEST }}
+            target/${{ matrix.target }}/release/${{ env.SERVER_DEST }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          update: true
+          overwrite: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
-          asset_name: ${{ matrix.asset_name }}
-          asset_content_type: application/octet-stream
