@@ -358,7 +358,7 @@ mod tests {
         let path = temp_file.path().to_path_buf();
 
         // 写入不完整的数据（只有部分校验和）
-        fs::write(&path, &[0x01, 0x02]).expect("Failed to write corrupted file");
+        fs::write(&path, [0x01, 0x02]).expect("Failed to write corrupted file");
 
         let iterator = WalIterator::new(&path);
         assert!(iterator.is_ok());

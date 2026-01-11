@@ -503,9 +503,9 @@ mod tests {
         // 我们只需确保调用不会panic
         let space = manager.available_disk_space();
         // 可以返回 None 或 Some(u64)
-        match space {
-            Some(bytes) => assert!(bytes >= 0), // 有效的磁盘空间
-            None => (),                         // 可以接受，表示无法获取
+        if let Some(_bytes) = space {
+            // 有效的磁盘空间，值应该是非负的
+            // 不需要断言，因为 u64 总是 >= 0
         }
     }
 
@@ -520,10 +520,10 @@ mod tests {
         assert!(has_space);
 
         // 测试大空间请求
-        let has_space_large = manager.has_enough_space(1_000_000_000_000); // 1TB
-                                                                           // 如果 available_disk_space 返回 None，则返回 true
-                                                                           // 如果返回 Some，则取决于实际可用空间
-                                                                           // 无论如何，调用不应panic
+        let _has_space_large = manager.has_enough_space(1_000_000_000_000); // 1TB
+                                                                            // 如果 available_disk_space 返回 None，则返回 true
+                                                                            // 如果返回 Some，则取决于实际可用空间
+                                                                            // 无论如何，调用不应panic
     }
 
     #[test]
@@ -561,7 +561,7 @@ mod tests {
         let initial_size = manager.directory_size();
         assert!(initial_size.is_ok());
         let initial_bytes = initial_size.unwrap();
-        assert!(initial_bytes >= 0);
+        // initial_bytes 是 u64，总是 >= 0
 
         // 添加一个文件
         let file_path = manager.data_dir().join("test_file.txt");
