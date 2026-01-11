@@ -5,7 +5,7 @@ on:
     tags:
       - "v*"
 
-# 1. 关键修复：添加写权限，解决报错问题
+# 关键修复：添加写权限，解决报错问题
 permissions:
   contents: write
 
@@ -22,16 +22,13 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: goat_db
-            asset_name: goat_db-linux-amd64
+            platform: linux-amd64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: goat_db.exe
-            asset_name: goat_db-windows-amd64.exe
+            platform: windows-amd64
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact_name: goat_db
-            asset_name: goat_db-macos-amd64
+            platform: macos-amd64
 
     steps:
       - name: Checkout code
@@ -59,31 +56,64 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+      # 构建所有二进制文件（client和server）
+      - name: Build release binaries
+        run: cargo build --release --target ${{ matrix.target }} --bin goatkv_client --bin goatkv_server
 
-      - name: Strip binary (Linux/macOS)
+      # 调试：列出生成的文件
+      - name: List built binaries
+        shell: bash
+        run: |
+          echo "Listing files in target directory:"
+          ls -la target/${{ matrix.target }}/release/
+          echo "Looking for goatkv binaries:"
+          ls -la target/${{ matrix.target }}/release/goatkv_* 2>/dev/null || echo "No goatkv binaries found"
+
+      # 为不同平台设置文件扩展名
+      - name: Setup binary names
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            echo "CLIENT_SRC=goatkv_client.exe" >> $GITHUB_ENV
+            echo "SERVER_SRC=goatkv_server.exe" >> $GITHUB_ENV
+            echo "CLIENT_DEST=goatdb-client-${{ matrix.platform }}.exe" >> $GITHUB_ENV
+            echo "SERVER_DEST=goatdb-server-${{ matrix.platform }}.exe" >> $GITHUB_ENV
+          else
+            echo "CLIENT_SRC=goatkv_client" >> $GITHUB_ENV
+            echo "SERVER_SRC=goatkv_server" >> $GITHUB_ENV
+            echo "CLIENT_DEST=goatdb-client-${{ matrix.platform }}" >> $GITHUB_ENV
+            echo "SERVER_DEST=goatdb-server-${{ matrix.platform }}" >> $GITHUB_ENV
+          fi
+
+      # 去除调试符号（Linux/macOS）
+      - name: Strip binaries (Linux/macOS)
         if: ${{ matrix.os != 'windows-latest' }}
-        run: strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
-
-      # 2. 新增步骤：在本地重命名文件
-      # softprops 插件上传时会直接使用文件名，所以我们先改成目标名字
-      # 使用 shell: bash 确保在 Windows 上也能用 mv 命令
-      - name: Rename binary for release
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          mv ${{ matrix.artifact_name }} ${{ matrix.asset_name }}
+          strip "$CLIENT_SRC"
+          strip "$SERVER_SRC"
 
-      # 3. 替换步骤：使用 softprops/action-gh-release 发布
-      - name: Create Release and Upload Asset
+      # 重命名文件以便发布
+      - name: Rename binaries for release
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          mv "$CLIENT_SRC" "$CLIENT_DEST"
+          mv "$SERVER_SRC" "$SERVER_DEST"
+
+      # 创建Release并上传所有二进制文件
+      - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: target/${{ matrix.target }}/release/${{ matrix.asset_name }}
-          # 如果你想自动生成 Release Notes，可以取消下面这行的注释
-          # generate_release_notes: true
+          files: |
+            target/${{ matrix.target }}/release/${{ env.CLIENT_DEST }}
+            target/${{ matrix.target }}/release/${{ env.SERVER_DEST }}
+          generate_release_notes: true
           draft: false
           prerelease: false
+          update: true
+          overwrite: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
