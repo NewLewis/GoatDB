@@ -6,6 +6,7 @@ use crate::goatkv::core::flush_worker::{FlushTask, FlushWorker};
 use crate::goatkv::core::lsm_state::LSMState;
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
 use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
+use crate::goatkv::metadata::version_edit::VersionEdit;
 use crate::goatkv::storage::wal_manager::{WalIterator, WalManager};
 
 use crate::goatkv::utils::db_path_manager::DbPathManager;

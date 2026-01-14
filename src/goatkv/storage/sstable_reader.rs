@@ -3,8 +3,8 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use crate::goatkv::encoding::coding;
 use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind, SEQUENCE_NUMBER_MAX};
-use crate::goatkv::encoding::varint;
 use crate::goatkv::storage::block_reader::BlockReader;
 
 /// SSTable 文件的 Magic Number
@@ -102,28 +102,30 @@ impl SSTableReader {
         let mut cursor = 0;
 
         // 解析 bloom_offset (varint)
-        let (bloom_offset, bloom_bytes_len) = match varint::decode_with_length(&footer[cursor..]) {
-            Ok(result) => result,
-            Err(e) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Failed to decode bloom filter offset: {}", e),
-                ));
-            }
-        };
+        let (bloom_offset, bloom_bytes_len) =
+            match coding::decode_varint64_with_length(&footer[cursor..]) {
+                Ok(result) => result,
+                Err(e) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Failed to decode bloom filter offset: {}", e),
+                    ));
+                }
+            };
 
         cursor += bloom_bytes_len;
 
         // 解析 index_offset (varint)
-        let (index_offset, index_bytes_len) = match varint::decode_with_length(&footer[cursor..]) {
-            Ok(result) => result,
-            Err(e) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Failed to decode index block offset: {}", e),
-                ));
-            }
-        };
+        let (index_offset, index_bytes_len) =
+            match coding::decode_varint64_with_length(&footer[cursor..]) {
+                Ok(result) => result,
+                Err(e) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Failed to decode index block offset: {}", e),
+                    ));
+                }
+            };
 
         cursor += index_bytes_len;
 
@@ -231,7 +233,8 @@ impl SSTableReader {
             }
 
             // 解码块偏移量
-            let (block_offset, offset_len) = match varint::decode_with_length(&offset_data) {
+            let (block_offset, offset_len) = match coding::decode_varint64_with_length(&offset_data)
+            {
                 Ok(result) => result,
                 Err(e) => {
                     return Err(io::Error::new(
@@ -243,7 +246,7 @@ impl SSTableReader {
 
             // 解码块大小
             let block_size_data = &offset_data[offset_len..];
-            let block_size = match varint::decode(block_size_data) {
+            let block_size = match coding::decode_varint64(block_size_data) {
                 Ok(size) => size,
                 Err(e) => {
                     return Err(io::Error::new(

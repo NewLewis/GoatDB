@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use crate::goatkv::encoding::varint;
+use crate::goatkv::encoding::coding;
 
 /// SSTable块读取器，用于解码BlockBuilder创建的块
 #[derive(Debug)]
@@ -352,7 +352,7 @@ impl<'a> BlockReader<'a> {
         }
 
         let bytes = &self.data[pos..self.data_end];
-        varint::decode_with_length(bytes)
+        coding::decode_varint64_with_length(bytes)
     }
 
     /// 静态方法：在指定位置解码varint（用于构造函数中）

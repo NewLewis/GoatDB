@@ -2,7 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use crate::goatkv::encoding::varint;
+use crate::goatkv::encoding::coding;
 use crate::goatkv::storage::block_builder::BlockBuilder;
 use crate::goatkv::storage::bloom_builder::BloomBuilder;
 use crate::goatkv::storage::sstable_reader::SSTable;
@@ -267,8 +267,8 @@ impl SSTableBuilder {
         // 将separator和数据块信息添加到索引块
         // 索引格式：separator -> (block_offset, block_size)
         let mut separator_val = Vec::new();
-        separator_val.extend_from_slice(&varint::encode(self.offset));
-        separator_val.extend_from_slice(&varint::encode(block_content.len() as u64));
+        coding::put_varint64(&mut separator_val, self.offset);
+        coding::put_varint64(&mut separator_val, block_content.len() as u64);
         self.index_block_builder.add(&separator, &separator_val);
 
         // 将数据块写入文件
@@ -321,8 +321,8 @@ impl SSTableBuilder {
             // 将最后一个数据块的信息添加到索引
             // 注意：这里使用last_key作为separator（因为这是最后一个数据块）
             let mut separator_val = Vec::new();
-            separator_val.extend_from_slice(&varint::encode(self.offset));
-            separator_val.extend_from_slice(&varint::encode(block_content.len() as u64));
+            coding::put_varint64(&mut separator_val, self.offset);
+            coding::put_varint64(&mut separator_val, block_content.len() as u64);
             self.index_block_builder.add(last_key, &separator_val);
 
             // 写入最后一个数据块
@@ -348,10 +348,10 @@ impl SSTableBuilder {
 
         // 写入Footer
         // Footer包含BloomFilter和IndexBlock的偏移量，用于读取时定位
-        let bloom_offset_bytes = varint::encode(bloom_offset);
+        let bloom_offset_bytes = coding::encode_varint64(bloom_offset);
         let bloom_offset_len = bloom_offset_bytes.len();
 
-        let index_offset_bytes = varint::encode(index_offset);
+        let index_offset_bytes = coding::encode_varint64(index_offset);
         let index_offset_len = index_offset_bytes.len();
 
         // 写入两个偏移量
@@ -698,10 +698,10 @@ mod tests {
         // 解析bloom_offset和index_offset
         let mut cursor = 0;
         let (bloom_offset, bloom_bytes_len) =
-            varint::decode_with_length(&footer[cursor..]).unwrap();
+            coding::decode_varint64_with_length(&footer[cursor..]).unwrap();
         cursor += bloom_bytes_len;
 
-        let (index_offset, _) = varint::decode_with_length(&footer[cursor..]).unwrap();
+        let (index_offset, _) = coding::decode_varint64_with_length(&footer[cursor..]).unwrap();
 
         // 验证偏移量合理
         assert!(bloom_offset < file_size, "Bloom offset out of bounds");
@@ -837,10 +837,10 @@ mod tests {
 
         let mut cursor = 0;
         let (bloom_offset, bloom_bytes_len) =
-            varint::decode_with_length(&footer[cursor..]).unwrap();
+            coding::decode_varint64_with_length(&footer[cursor..]).unwrap();
         cursor += bloom_bytes_len;
 
-        let (index_offset, _) = varint::decode_with_length(&footer[cursor..]).unwrap();
+        let (index_offset, _) = coding::decode_varint64_with_length(&footer[cursor..]).unwrap();
 
         // 验证BloomFilter在IndexBlock之前
         assert!(bloom_offset < index_offset);
@@ -882,10 +882,10 @@ mod tests {
 
         let mut cursor = 0;
         let (bloom_offset, bloom_bytes_len) =
-            varint::decode_with_length(&footer[cursor..]).unwrap();
+            coding::decode_varint64_with_length(&footer[cursor..]).unwrap();
         cursor += bloom_bytes_len;
 
-        let (index_offset, _) = varint::decode_with_length(&footer[cursor..]).unwrap();
+        let (index_offset, _) = coding::decode_varint64_with_length(&footer[cursor..]).unwrap();
 
         // 验证IndexBlock在文件末尾（在Footer之前）
         assert!(index_offset < file_size - FOOTER_SIZE as u64);
