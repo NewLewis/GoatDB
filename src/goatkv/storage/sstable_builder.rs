@@ -3,9 +3,9 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use crate::goatkv::encoding::coding;
+use crate::goatkv::metadata::version_edit::FileMetaData;
 use crate::goatkv::storage::block_builder::BlockBuilder;
 use crate::goatkv::storage::bloom_builder::BloomBuilder;
-use crate::goatkv::storage::sstable_reader::SSTable;
 
 /// SSTable文件的魔数（Magic Number）
 /// 用于标识文件格式，固定值为 0x706A725F676F6174
@@ -113,6 +113,11 @@ pub struct SSTableBuilder {
     id: u64,
     /// SSTable 文件路径
     path: PathBuf,
+
+    /// 最小的键（第一个写入的键）
+    smallest_key: Option<Vec<u8>>,
+    /// 最大的键（最后一个写入的键）
+    largest_key: Option<Vec<u8>>,
 }
 
 impl SSTableBuilder {
@@ -156,6 +161,8 @@ impl SSTableBuilder {
             offset: 0,
             id,
             path: filename.into(),
+            smallest_key: None,
+            largest_key: None,
         })
     }
 
@@ -215,6 +222,12 @@ impl SSTableBuilder {
     /// # }
     /// ```
     pub fn write(&mut self, key: &[u8], value: &[u8]) {
+        // 更新 smallest_key 和 largest_key
+        if self.smallest_key.is_none() {
+            self.smallest_key = Some(key.to_vec());
+        }
+        self.largest_key = Some(key.to_vec());
+
         // 检查当前数据块是否已满（>= 4KB）
         if self.data_block_builder.should_finish() {
             // 完成当前数据块，使用下一个key作为separator的参考
@@ -301,6 +314,13 @@ impl SSTableBuilder {
     /// - 确保调用finish()以完成文件写入
     /// - 内部会自动flush缓冲区
     ///
+    /// # 返回值
+    /// 返回 `FileMetaData`，包含文件的完整元数据：
+    /// - file_id: SSTable 的唯一标识符
+    /// - file_size: 文件总大小
+    /// - path: SSTable 文件路径
+    /// - smallest_key/largest_key: 文件中的最小/最大键
+    ///
     /// # 示例
     /// ```no_run
     /// # use std::path::PathBuf;
@@ -309,11 +329,11 @@ impl SSTableBuilder {
     /// let mut builder = SSTableBuilder::new(1, PathBuf::from("./data"))?;
     /// builder.write(b"key1", b"value1");
     /// builder.write(b"key2", b"value2");
-    /// builder.finish(); // 完成构建
+    /// let metadata = builder.finish()?; // 完成构建并获取元数据
     /// # Ok(())
     /// # }
     /// ```
-    pub fn finish(&mut self) -> io::Result<SSTable> {
+    pub fn finish(&mut self) -> io::Result<FileMetaData> {
         // 如果有未完成的数据块，先完成它
         if !self.data_block_builder.empty() {
             let (block_content, last_key) = self.data_block_builder.finish();
@@ -367,11 +387,27 @@ impl SSTableBuilder {
         // 写入魔数（8字节），标识文件格式
         self.writer.write_all(&MAGIC_NUMBER.to_le_bytes()).unwrap();
 
-        // 刷新缓冲区，确保所有数据写入磁盘
+        // 更新 offset 以反映 Footer 的大小
+        // Footer 总大小为 48 字节
+        self.offset += 48;
+
         // 刷新缓冲区，确保所有数据写入磁盘
         self.writer.flush()?;
 
-        Ok(SSTable::new(self.id, self.path.clone()))
+        // 创建并返回 FileMetaData
+        // 注意：smallest_key 和 largest_key 应该是 InternalKey，但为了简化，这里直接存储原始 key
+        // 序列号信息可以从 InternalKey 中解析出来（如果需要）
+        // 路径可以根据 file_id 和数据目录由调用方生成
+        let file_metadata = FileMetaData {
+            file_id: self.id,
+            file_size: self.offset, // offset 现在是完整的文件大小
+            smallest_key: self.smallest_key.clone().unwrap_or_default(),
+            largest_key: self.largest_key.clone().unwrap_or_default(),
+            smallest_seqno: 0, // TODO: 从 InternalKey 中解析
+            largest_seqno: 0,  // TODO: 从 InternalKey 中解析
+        };
+
+        Ok(file_metadata)
     }
 
     /// 计算索引中使用的分隔符（separator）
@@ -896,5 +932,69 @@ mod tests {
         // IndexBlock应该有合理的大小
         let index_size = file_size - FOOTER_SIZE as u64 - index_offset;
         assert!(index_size > 0, "IndexBlock should have data");
+    }
+
+    /// 测试 FileMetaData 集成
+    /// 验证 SSTableBuilder 可以正确创建包含 FileMetaData 的 SSTable
+    #[test]
+    fn test_sstable_with_file_metadata() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path();
+
+        let mut builder = SSTableBuilder::new(123, dir_path.to_path_buf()).unwrap();
+
+        // 写入一些测试数据
+        builder.write(b"apple", b"fruit1");
+        builder.write(b"banana", b"fruit2");
+        builder.write(b"cherry", b"fruit3");
+
+        // 完成构建，获取 FileMetaData
+        let metadata = builder.finish().unwrap();
+
+        // 验证 FileMetaData 字段
+        assert_eq!(metadata.file_id, 123);
+        assert!(metadata.file_size > 0);
+
+        // 验证 smallest_key 和 largest_key
+        assert_eq!(metadata.smallest_key, b"apple");
+        assert_eq!(metadata.largest_key, b"cherry");
+
+        // 根据 file_id 生成路径并验证文件存在
+        let sstable_path = dir_path.join("000123.sst");
+        assert!(sstable_path.exists());
+
+        // 验证文件大小与实际文件大小一致
+        let actual_file_size = std::fs::metadata(&sstable_path).unwrap().len();
+        assert_eq!(metadata.file_size, actual_file_size);
+
+        // 演示如何将 FileMetaData 添加到 VersionEdit
+        use crate::goatkv::metadata::version_edit::VersionEdit;
+        let mut version_edit = VersionEdit::new();
+        version_edit.add_file(0, metadata.clone()); // 添加到 Level 0
+        assert_eq!(version_edit.new_files.len(), 1);
+        assert_eq!(version_edit.new_files[0].0, 0); // Level 0
+        assert_eq!(version_edit.new_files[0].1.file_id, 123);
+    }
+
+    /// 测试空 SSTable 的 FileMetaData
+    #[test]
+    fn test_empty_sstable_metadata() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path();
+
+        let mut builder = SSTableBuilder::new(1, dir_path.to_path_buf()).unwrap();
+
+        // 立即完成，不写入任何数据
+        let metadata = builder.finish().unwrap();
+
+        // 验证 FileMetaData 字段
+        assert_eq!(metadata.file_id, 1);
+        assert!(metadata.file_size > 0); // 至少包含 Footer
+        assert!(metadata.smallest_key.is_empty());
+        assert!(metadata.largest_key.is_empty());
+
+        // 根据 file_id 生成路径并验证文件存在
+        let sstable_path = dir_path.join("000001.sst");
+        assert!(sstable_path.exists());
     }
 }

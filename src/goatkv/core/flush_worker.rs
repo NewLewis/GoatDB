@@ -4,6 +4,7 @@ use std::thread;
 use crate::goatkv::core::lsm_state::LSMState;
 use crate::goatkv::core::mem_table::MemTable;
 use crate::goatkv::storage::sstable_builder::SSTableBuilder;
+use crate::goatkv::storage::sstable_reader::SSTableReader;
 use crate::goatkv::utils::db_path_manager::DbPathManager;
 
 /// 刷盘任务
@@ -117,20 +118,23 @@ impl FlushWorker {
                 sst_builder.write(&key, &value);
             }
 
-            let sstable = match sst_builder.finish() {
-                Ok(sst) => sst,
+            let metadata = match sst_builder.finish() {
+                Ok(meta) => meta,
                 Err(e) => {
                     eprintln!("Failed to finish SSTable {}: {}", task.id, e);
                     continue;
                 }
             };
 
-            let reader = match sstable.open_reader() {
+            // 根据 file_id 生成 SSTable 路径
+            let sstable_path = db_path_manager.sstable_path_by_id(metadata.file_id);
+
+            let reader = match SSTableReader::open(&sstable_path) {
                 Ok(reader) => reader,
                 Err(e) => {
                     eprintln!(
                         "Failed to open newly created SSTable {:?}: {}",
-                        sstable.path, e
+                        sstable_path, e
                     );
                     continue;
                 }

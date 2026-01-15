@@ -145,6 +145,26 @@ impl DbPathManager {
         self.data_dir.join(name.as_ref())
     }
 
+    /// 根据 file_id 生成 SSTable 文件路径
+    ///
+    /// # 参数
+    /// - `file_id`: SSTable 文件 ID
+    ///
+    /// # 返回
+    /// SSTable 文件的完整路径
+    ///
+    /// # 文件命名规则
+    /// - 如果 file_id < 1,000,000：格式为 `{file_id:06}.sst`（如 000001.sst）
+    /// - 如果 file_id >= 1,000,000：格式为 `{file_id}.sst`（如 1234567.sst）
+    pub fn sstable_path_by_id(&self, file_id: u64) -> PathBuf {
+        let filename = if file_id < 1_000_000 {
+            format!("{:06}.sst", file_id)
+        } else {
+            format!("{}.sst", file_id)
+        };
+        self.data_dir.join(filename)
+    }
+
     /// 获取当前时间戳命名的SSTable文件路径（用于flush操作）
     pub fn timestamped_sstable_path(&self) -> PathBuf {
         use std::time::{SystemTime, UNIX_EPOCH};

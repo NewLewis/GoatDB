@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::goatkv::encoding::coding;
 use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind, SEQUENCE_NUMBER_MAX};
+use crate::goatkv::metadata::version_edit::FileMetaData;
 use crate::goatkv::storage::block_reader::BlockReader;
 
 /// SSTable 文件的 Magic Number
@@ -42,11 +43,45 @@ pub struct SSTableReader {
 pub struct SSTable {
     pub id: u64,
     pub path: PathBuf,
+    /// 完整的文件元数据（在 Builder 中创建时可用）
+    pub metadata: Option<FileMetaData>,
 }
 
 impl SSTable {
+    /// 创建一个简单的 SSTable 句柄（仅包含 ID 和路径）
+    /// 用于从文件读取 SSTable 的场景
     pub fn new(id: u64, path: PathBuf) -> Self {
-        Self { id, path }
+        Self {
+            id,
+            path,
+            metadata: None,
+        }
+    }
+
+    /// 创建一个包含完整元数据的 SSTable
+    /// 用于 SSTableBuilder 完成构建后返回
+    pub fn with_metadata(id: u64, path: PathBuf, metadata: FileMetaData) -> Self {
+        Self {
+            id,
+            path,
+            metadata: Some(metadata),
+        }
+    }
+
+    /// 获取 FileMetaData
+    /// 如果元数据不存在，返回 None（例如从文件读取的 SSTable）
+    pub fn file_metadata(&self) -> Option<&FileMetaData> {
+        self.metadata.as_ref()
+    }
+
+    /// 获取文件大小
+    /// 如果有元数据，从元数据获取；否则从文件系统读取
+    pub fn file_size(&self) -> io::Result<u64> {
+        if let Some(meta) = &self.metadata {
+            Ok(meta.file_size)
+        } else {
+            Ok(std::fs::metadata(&self.path)?.len())
+        }
     }
 
     pub fn open_reader(&self) -> io::Result<SSTableReader> {
