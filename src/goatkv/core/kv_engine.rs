@@ -21,7 +21,7 @@ pub struct KvEngine {
     wal_manager: Arc<Mutex<WalManager>>,
     /// 序列号生成器
     sequence_number: Arc<SequenceNumber>,
-    /// LSM 状态管理器
+    /// LSM 状态管理器（包含 VersionSet）
     lsm_state: Arc<RwLock<LSMState>>,
     /// 配置选项
     options: Arc<KvEngineOptions>,
@@ -71,11 +71,19 @@ impl KvEngine {
         let wal_manager = WalManager::new(wal_path)
             .map_err(|e| std::io::Error::other(format!("Failed to open WAL file: {}", e)))?;
 
-        // 创建 LSM 状态管理器
+        // 创建 LSM 状态管理器（内部会创建 VersionSet）
         let lsm_state = Arc::new(RwLock::new(LSMState::new(&options)));
 
-        // 创建后台刷盘 Worker
-        let flush_worker = FlushWorker::new(lsm_state.clone(), path_manager.clone());
+        // 创建后台刷盘 Worker（从 lsm_state 获取 VersionSet）
+        let version_set = {
+            let state = lsm_state.read().unwrap();
+            state.version_set.clone()
+        };
+        let flush_worker = FlushWorker::new(
+            lsm_state.clone(),
+            path_manager.clone(),
+            version_set,
+        );
 
         Ok(Self {
             path_manager,
@@ -117,6 +125,13 @@ impl KvEngine {
     /// 获取路径管理器引用
     pub fn path_manager(&self) -> &DbPathManager {
         &self.path_manager
+    }
+
+    /// 获取 VersionSet 引用（用于测试和元数据访问）
+    #[allow(dead_code)]
+    pub fn version_set(&self) -> Arc<RwLock<crate::goatkv::metadata::version_set::VersionSet>> {
+        let state = self.lsm_state.read().unwrap();
+        state.version_set.clone()
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -376,5 +391,41 @@ mod tests {
         assert_eq!(state.sstables.len(), 1);
         let sstable = state.sstables[0].lock().unwrap();
         assert!(sstable.may_contain(b"persist_key"));
+    }
+
+    #[test]
+    fn test_versionset_integration() {
+        let engine = KvEngine::new_for_test();
+
+        // 1. Write data and flush
+        engine.put(b"key1".to_vec(), b"value1".to_vec());
+        engine.flush();
+
+        // Wait for flush to complete
+        let mut flushed = false;
+        for _ in 0..50 {
+            let state = engine.lsm_state.read().unwrap();
+            if !state.sstables.is_empty() {
+                flushed = true;
+                break;
+            }
+            drop(state);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(flushed, "Flush timed out");
+
+        // 2. Verify VersionSet has the SSTable metadata
+        let version_set = engine.version_set();
+        let vs = version_set.read().unwrap();
+        let current = vs.current();
+
+        // Level 0 should have one file
+        assert_eq!(current.get_files(0).len(), 1);
+
+        // Verify file metadata
+        let file = &current.get_files(0)[0];
+        // File ID starts from 1 (allocated by VersionSet)
+        assert_eq!(file.file_id, 1);
+        assert!(file.file_size > 0);
     }
 }

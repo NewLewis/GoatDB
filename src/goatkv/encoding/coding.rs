@@ -35,13 +35,13 @@
 ///
 /// # 示例
 /// ```
-/// use goat_db::goatkv::encoding::varint;
+/// use goat_db::goatkv::encoding::coding;
 ///
-/// assert_eq!(varint::encode(0), vec![0x00]);
-/// assert_eq!(varint::encode(1), vec![0x01]);
-/// assert_eq!(varint::encode(127), vec![0x7F]);
-/// assert_eq!(varint::encode(128), vec![0x80, 0x01]);
-/// assert_eq!(varint::encode(300), vec![0xAC, 0x02]);
+/// assert_eq!(coding::encode_varint64(0), vec![0x00]);
+/// assert_eq!(coding::encode_varint64(1), vec![0x01]);
+/// assert_eq!(coding::encode_varint64(127), vec![0x7F]);
+/// assert_eq!(coding::encode_varint64(128), vec![0x80, 0x01]);
+/// assert_eq!(coding::encode_varint64(300), vec![0xAC, 0x02]);
 /// ```
 pub fn encode_varint64(value: u64) -> Vec<u8> {
     let mut result = Vec::new();
@@ -82,13 +82,13 @@ pub fn put_varint64(buf: &mut Vec<u8>, mut value: u64) {
 ///
 /// # 示例
 /// ```
-/// use goat_db::goatkv::encoding::varint;
+/// use goat_db::goatkv::encoding::coding;
 ///
-/// assert_eq!(varint::decode(&[0x00]), Ok(0));
-/// assert_eq!(varint::decode(&[0x01]), Ok(1));
-/// assert_eq!(varint::decode(&[0x7F]), Ok(127));
-/// assert_eq!(varint::decode(&[0x80, 0x01]), Ok(128));
-/// assert_eq!(varint::decode(&[0xAC, 0x02]), Ok(300));
+/// assert_eq!(coding::decode_varint64(&[0x00]), Ok(0));
+/// assert_eq!(coding::decode_varint64(&[0x01]), Ok(1));
+/// assert_eq!(coding::decode_varint64(&[0x7F]), Ok(127));
+/// assert_eq!(coding::decode_varint64(&[0x80, 0x01]), Ok(128));
+/// assert_eq!(coding::decode_varint64(&[0xAC, 0x02]), Ok(300));
 /// ```
 pub fn decode_varint64(bytes: &[u8]) -> Result<u64, &'static str> {
     decode_varint64_with_length(bytes).map(|(value, _)| value)
@@ -107,13 +107,13 @@ pub fn decode_varint64(bytes: &[u8]) -> Result<u64, &'static str> {
 ///
 /// # 示例
 /// ```
-/// use goat_db::goatkv::encoding::varint;
+/// use goat_db::goatkv::encoding::coding;
 ///
-/// assert_eq!(varint::decode_with_length(&[0x00]), Ok((0, 1)));
-/// assert_eq!(varint::decode_with_length(&[0x01]), Ok((1, 1)));
-/// assert_eq!(varint::decode_with_length(&[0x7F]), Ok((127, 1)));
-/// assert_eq!(varint::decode_with_length(&[0x80, 0x01]), Ok((128, 2)));
-/// assert_eq!(varint::decode_with_length(&[0xAC, 0x02]), Ok((300, 2)));
+/// assert_eq!(coding::decode_varint64_with_length(&[0x00]), Ok((0, 1)));
+/// assert_eq!(coding::decode_varint64_with_length(&[0x01]), Ok((1, 1)));
+/// assert_eq!(coding::decode_varint64_with_length(&[0x7F]), Ok((127, 1)));
+/// assert_eq!(coding::decode_varint64_with_length(&[0x80, 0x01]), Ok((128, 2)));
+/// assert_eq!(coding::decode_varint64_with_length(&[0xAC, 0x02]), Ok((300, 2)));
 /// ```
 pub fn decode_varint64_with_length(bytes: &[u8]) -> Result<(u64, usize), &'static str> {
     let mut result = 0u64;

@@ -485,15 +485,17 @@ mod tests {
     use super::*;
     use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
     use crate::goatkv::storage::sstable_builder::SSTableBuilder;
+    use crate::goatkv::utils::db_path_manager::DbPathManager;
     use std::io::Write;
     use tempfile::TempDir;
 
     /// 创建测试用的 SSTable 文件
-    fn create_test_sstable() -> TempDir {
+    /// 返回 (TempDir, SSTable路径)
+    fn create_test_sstable() -> (TempDir, PathBuf) {
         let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path();
+        let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, dir_path.to_path_buf()).unwrap();
+        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
 
         // 添加一些测试数据，使用 InternalKey 格式（与生产环境一致）
         // 使用递减的序列号以确保正确的排序
@@ -519,13 +521,13 @@ mod tests {
 
         builder.finish().unwrap();
 
-        temp_dir
+        let sst_path = db_path_manager.sstable_path_by_id(1);
+        (temp_dir, sst_path)
     }
 
     #[test]
     fn test_sstable_reader_open() {
-        let temp_dir = create_test_sstable();
-        let sst_path = temp_dir.path().join("000001.sst");
+        let (_temp_dir, sst_path) = create_test_sstable();
 
         // 先检查文件是否存在
         assert!(sst_path.exists());
@@ -551,8 +553,7 @@ mod tests {
 
     #[test]
     fn test_sstable_reader_get() {
-        let temp_dir = create_test_sstable();
-        let sst_path = temp_dir.path().join("000001.sst");
+        let (_temp_dir, sst_path) = create_test_sstable();
         let mut reader = SSTableReader::open(&sst_path).unwrap();
 
         // 测试存在的key
@@ -576,8 +577,7 @@ mod tests {
 
     #[test]
     fn test_sstable_reader_may_contain() {
-        let temp_dir = create_test_sstable();
-        let sst_path = temp_dir.path().join("000001.sst");
+        let (_temp_dir, sst_path) = create_test_sstable();
         let reader = SSTableReader::open(&sst_path).unwrap();
 
         // BloomFilter 应该对存在的key返回true
@@ -617,8 +617,8 @@ mod tests {
     fn test_sstable_iter_all_data() {
         // 创建200条数据并测试完整迭代
         let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path();
-        let mut builder = SSTableBuilder::new(1, dir_path.to_path_buf()).unwrap();
+        let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
+        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
 
         let mut test_data = Vec::new();
         for i in 0..200 {
@@ -633,7 +633,7 @@ mod tests {
 
         builder.finish().unwrap();
 
-        let sst_path = temp_dir.path().join("000001.sst");
+        let sst_path = db_path_manager.sstable_path_by_id(1);
         let mut reader = SSTableReader::open(&sst_path).unwrap();
 
         // 由于SSTable按key排序，我们先对测试数据排序

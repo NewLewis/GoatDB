@@ -1,11 +1,12 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::path::PathBuf;
+
 
 use crate::goatkv::encoding::coding;
 use crate::goatkv::metadata::version_edit::FileMetaData;
 use crate::goatkv::storage::block_builder::BlockBuilder;
 use crate::goatkv::storage::bloom_builder::BloomBuilder;
+use crate::goatkv::utils::db_path_manager::DbPathManager;
 
 /// SSTable文件的魔数（Magic Number）
 /// 用于标识文件格式，固定值为 0x706A725F676F6174
@@ -78,10 +79,11 @@ const FOOTER_SIZE: usize = 48;
 ///
 /// # 示例
 /// ```no_run
-/// # use std::path::PathBuf;
+/// # use goat_db::goatkv::utils::db_path_manager::DbPathManager;
 /// # use goat_db::goatkv::storage::sstable_builder::SSTableBuilder;
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let mut builder = SSTableBuilder::new(1, PathBuf::from("./data"))?;
+/// let path_manager = DbPathManager::new("./data")?;
+/// let mut builder = SSTableBuilder::new(1, &path_manager)?;
 /// builder.write(b"apple", b"fruit");
 /// builder.write(b"banana", b"fruit");
 /// builder.finish();
@@ -111,8 +113,7 @@ pub struct SSTableBuilder {
 
     /// SSTable ID
     id: u64,
-    /// SSTable 文件路径
-    path: PathBuf,
+
 
     /// 最小的键（第一个写入的键）
     smallest_key: Option<Vec<u8>>,
@@ -125,33 +126,34 @@ impl SSTableBuilder {
     ///
     /// # 参数
     /// - `id`: SSTable的唯一标识符
-    /// - `path`: 存放SSTable文件的目录路径
+    /// - `db_path_manager`: 数据库路径管理器
     ///
-    /// # 文件命名规则
-    /// - 如果id < 1,000,000：格式为 `{id:06}.sst`（如 000001.sst）
-    /// - 如果id >= 1,000,000：格式为 `{id}.sst`（如 1234567.sst）
+    /// # 文件命名规则（由 DbPathManager 管理）
+    /// - 如果 file_id < 1,000,000：格式为 `{file_id:06}.sst`（如 000001.sst）
+    /// - 如果 file_id >= 1,000,000：格式为 `{file_id}.sst`（如 1234567.sst）
     ///
     /// # 错误
     /// 返回io::Error，如果文件创建失败
     ///
     /// # 示例
     /// ```no_run
-    /// # use std::path::PathBuf;
     /// # use goat_db::goatkv::storage::sstable_builder::SSTableBuilder;
+    /// # use goat_db::goatkv::utils::db_path_manager::DbPathManager;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let builder = SSTableBuilder::new(1, PathBuf::from("./data"))?;
+    /// let path_manager = DbPathManager::new("./data")?;
+    /// let builder = SSTableBuilder::new(1, &path_manager)?;
     /// // 创建文件 ./data/000001.sst
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new(id: u64, path: PathBuf) -> io::Result<Self> {
-        let filename = Self::get_file_name(id, path);
+    pub fn new(id: u64, db_path_manager: &DbPathManager) -> io::Result<Self> {
+        let sstable_path = db_path_manager.sstable_path_by_id(id);
 
         let file = OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
-            .open(&filename)?;
+            .open(&sstable_path)?;
 
         Ok(Self {
             writer: io::BufWriter::new(file),
@@ -160,32 +162,10 @@ impl SSTableBuilder {
             bloom_builder: BloomBuilder::new(),
             offset: 0,
             id,
-            path: filename.into(),
+
             smallest_key: None,
             largest_key: None,
         })
-    }
-
-    /// 生成SSTable文件名
-    ///
-    /// # 参数
-    /// - `id`: SSTable的唯一标识符
-    /// - `path`: 存放文件的目录路径
-    ///
-    /// # 返回值
-    /// 返回完整的文件路径字符串
-    ///
-    /// # 示例
-    /// ```text
-    /// get_file_name(1, "./data")      -> "./data/000001.sst"
-    /// get_file_name(1234567, "./data") -> "./data/1234567.sst"
-    /// ```
-    fn get_file_name(id: u64, path: PathBuf) -> String {
-        if id < 1000000 {
-            format!("{}/{:06}.sst", path.display(), id)
-        } else {
-            format!("{}/{}.sst", path.display(), id)
-        }
     }
 
     /// 向SSTable中写入一个key-value对
@@ -211,10 +191,11 @@ impl SSTableBuilder {
     ///
     /// # 示例
     /// ```no_run
-    /// # use std::path::PathBuf;
+    /// # use goat_db::goatkv::utils::db_path_manager::DbPathManager;
     /// # use goat_db::goatkv::storage::sstable_builder::SSTableBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut builder = SSTableBuilder::new(1, PathBuf::from("./data"))?;
+    /// let path_manager = DbPathManager::new("./data")?;
+    /// let mut builder = SSTableBuilder::new(1, &path_manager)?;
     /// builder.write(b"apple", b"fruit");
     /// builder.write(b"banana", b"fruit");
     /// builder.write(b"cherry", b"fruit");
@@ -323,13 +304,14 @@ impl SSTableBuilder {
     ///
     /// # 示例
     /// ```no_run
-    /// # use std::path::PathBuf;
+    /// # use goat_db::goatkv::utils::db_path_manager::DbPathManager;
     /// # use goat_db::goatkv::storage::sstable_builder::SSTableBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut builder = SSTableBuilder::new(1, PathBuf::from("./data"))?;
+    /// let path_manager = DbPathManager::new("./data")?;
+    /// let mut builder = SSTableBuilder::new(1, &path_manager)?;
     /// builder.write(b"key1", b"value1");
     /// builder.write(b"key2", b"value2");
-    /// let metadata = builder.finish()?; // 完成构建并获取元数据
+    /// let metadata = builder.finish()?;
     /// # Ok(())
     /// # }
     /// ```
@@ -487,9 +469,9 @@ mod tests {
     #[test]
     fn test_sstable_builder_basic() {
         let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path();
+        let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, dir_path.to_path_buf()).unwrap();
+        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
 
         // 写入几个简单的key-value对
         builder.write(b"apple", b"fruit");
@@ -500,7 +482,7 @@ mod tests {
         builder.finish().unwrap();
 
         // 验证文件已创建
-        let sst_path = dir_path.join("000001.sst");
+        let sst_path = db_path_manager.sstable_path_by_id(1);
         assert!(sst_path.exists());
 
         // 验证文件不为空
@@ -511,28 +493,31 @@ mod tests {
     /// 测试文件名生成
     #[test]
     fn test_sstable_builder_file_name() {
-        // 测试id < 1,000,000的情况
-        let filename1 = SSTableBuilder::get_file_name(1, PathBuf::from("./data"));
-        assert_eq!(filename1, "./data/000001.sst");
+        let temp_dir = TempDir::new().unwrap();
+        let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let filename2 = SSTableBuilder::get_file_name(999999, PathBuf::from("./data"));
-        assert_eq!(filename2, "./data/999999.sst");
+        // 测试id < 1,000,000的情况
+        let filename1 = db_path_manager.sstable_path_by_id(1);
+        assert!(filename1.ends_with("000001.sst"));
+
+        let filename2 = db_path_manager.sstable_path_by_id(999999);
+        assert!(filename2.ends_with("999999.sst"));
 
         // 测试id >= 1,000,000的情况
-        let filename3 = SSTableBuilder::get_file_name(1000000, PathBuf::from("./data"));
-        assert_eq!(filename3, "./data/1000000.sst");
+        let filename3 = db_path_manager.sstable_path_by_id(1000000);
+        assert!(filename3.ends_with("1000000.sst"));
 
-        let filename4 = SSTableBuilder::get_file_name(1234567, PathBuf::from("./data"));
-        assert_eq!(filename4, "./data/1234567.sst");
+        let filename4 = db_path_manager.sstable_path_by_id(1234567);
+        assert!(filename4.ends_with("1234567.sst"));
     }
 
     /// 测试单个数据块的情况（数据量小于4KB）
     #[test]
     fn test_sstable_builder_single_block() {
         let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path();
+        let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, dir_path.to_path_buf()).unwrap();
+        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
 
         // 只写入少量数据，不会触发多个数据块
         for i in 0..10 {
@@ -543,7 +528,7 @@ mod tests {
 
         builder.finish().unwrap();
 
-        let sst_path = dir_path.join("000001.sst");
+        let sst_path = db_path_manager.sstable_path_by_id(1);
         assert!(sst_path.exists());
 
         // 验证文件大小合理（包含数据块、BloomFilter、IndexBlock和Footer）
@@ -555,9 +540,9 @@ mod tests {
     #[test]
     fn test_sstable_builder_multiple_blocks() {
         let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path();
+        let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, dir_path.to_path_buf()).unwrap();
+        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
 
         // 写入大量数据以触发多个数据块
         for i in 0..500 {
@@ -568,7 +553,7 @@ mod tests {
 
         builder.finish().unwrap();
 
-        let sst_path = dir_path.join("000001.sst");
+        let sst_path = db_path_manager.sstable_path_by_id(1);
         assert!(sst_path.exists());
 
         // 验证文件较大（应该包含多个数据块）
@@ -611,9 +596,9 @@ mod tests {
     #[test]
     fn test_sstable_builder_empty_key() {
         let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path();
+        let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, dir_path.to_path_buf()).unwrap();
+        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
 
         // 写入包含空key的数据
         builder.write(b"", b"empty_key_value");
@@ -621,7 +606,7 @@ mod tests {
 
         builder.finish().unwrap();
 
-        let sst_path = dir_path.join("000001.sst");
+        let sst_path = db_path_manager.sstable_path_by_id(1);
         assert!(sst_path.exists());
     }
 
@@ -629,9 +614,9 @@ mod tests {
     #[test]
     fn test_sstable_builder_empty_value() {
         let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path();
+        let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, dir_path.to_path_buf()).unwrap();
+        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
 
         // 写入包含空value的数据
         builder.write(b"key1", b"");
@@ -640,7 +625,7 @@ mod tests {
 
         builder.finish().unwrap();
 
-        let sst_path = dir_path.join("000001.sst");
+        let sst_path = db_path_manager.sstable_path_by_id(1);
         assert!(sst_path.exists());
     }
 
@@ -648,9 +633,9 @@ mod tests {
     #[test]
     fn test_sstable_builder_special_keys() {
         let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path();
+        let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, dir_path.to_path_buf()).unwrap();
+        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
 
         // 写入包含特殊字符的key
         builder.write(b"key_with_underscore", b"value1");
@@ -661,7 +646,7 @@ mod tests {
 
         builder.finish().unwrap();
 
-        let sst_path = dir_path.join("000001.sst");
+        let sst_path = db_path_manager.sstable_path_by_id(1);
         assert!(sst_path.exists());
     }
 
@@ -669,9 +654,9 @@ mod tests {
     #[test]
     fn test_sstable_builder_large_value() {
         let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path();
+        let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, dir_path.to_path_buf()).unwrap();
+        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
 
         // 写入包含大value的数据
         let large_value = vec![b'x'; 10000];
@@ -680,7 +665,7 @@ mod tests {
 
         builder.finish().unwrap();
 
-        let sst_path = dir_path.join("000001.sst");
+        let sst_path = db_path_manager.sstable_path_by_id(1);
         assert!(sst_path.exists());
 
         // 验证文件较大
@@ -692,9 +677,9 @@ mod tests {
     #[test]
     fn test_sstable_builder_footer() {
         let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path();
+        let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, dir_path.to_path_buf()).unwrap();
+        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
 
         // 写入一些数据
         for i in 0..50 {
@@ -705,7 +690,7 @@ mod tests {
 
         builder.finish().unwrap();
 
-        let sst_path = dir_path.join("000001.sst");
+        let sst_path = db_path_manager.sstable_path_by_id(1);
 
         // 读取文件内容
         let mut file = File::open(&sst_path).unwrap();
@@ -752,11 +737,11 @@ mod tests {
     #[test]
     fn test_sstable_builder_multiple_files() {
         let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path();
+        let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
         // 创建多个SSTable
         for id in 1..=5 {
-            let mut builder = SSTableBuilder::new(id, dir_path.to_path_buf()).unwrap();
+            let mut builder = SSTableBuilder::new(id, &db_path_manager).unwrap();
 
             for i in 0..10 {
                 let key = format!("key_{}_{}", id, i);
@@ -769,7 +754,7 @@ mod tests {
 
         // 验证所有文件都已创建
         for id in 1..=5 {
-            let sst_path = dir_path.join(format!("{:06}.sst", id));
+            let sst_path = db_path_manager.sstable_path_by_id(id);
             assert!(sst_path.exists(), "SSTable {} not created", id);
         }
     }
@@ -778,9 +763,9 @@ mod tests {
     #[test]
     fn test_sstable_builder_sequential_writes() {
         let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path();
+        let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, dir_path.to_path_buf()).unwrap();
+        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
 
         // 连续写入100个key-value对
         for i in 0..100 {
@@ -791,7 +776,7 @@ mod tests {
 
         builder.finish().unwrap();
 
-        let sst_path = dir_path.join("000001.sst");
+        let sst_path = db_path_manager.sstable_path_by_id(1);
         assert!(sst_path.exists());
     }
 
@@ -799,9 +784,9 @@ mod tests {
     #[test]
     fn test_sstable_builder_small_entries() {
         let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path();
+        let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, dir_path.to_path_buf()).unwrap();
+        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
 
         // 写入单字节的key和value
         builder.write(b"a", b"1");
@@ -810,7 +795,7 @@ mod tests {
 
         builder.finish().unwrap();
 
-        let sst_path = dir_path.join("000001.sst");
+        let sst_path = db_path_manager.sstable_path_by_id(1);
         assert!(sst_path.exists());
     }
 
@@ -818,9 +803,9 @@ mod tests {
     #[test]
     fn test_sstable_builder_many_entries() {
         let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path();
+        let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, dir_path.to_path_buf()).unwrap();
+        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
 
         // 写入1000个条目
         for i in 0..1000 {
@@ -831,7 +816,7 @@ mod tests {
 
         builder.finish().unwrap();
 
-        let sst_path = dir_path.join("000001.sst");
+        let sst_path = db_path_manager.sstable_path_by_id(1);
         assert!(sst_path.exists());
 
         // 验证文件较大
@@ -845,9 +830,9 @@ mod tests {
     #[test]
     fn test_sstable_builder_bloom_filter() {
         let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path();
+        let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, dir_path.to_path_buf()).unwrap();
+        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
 
         // 写入一些已知的key
         for i in 0..10 {
@@ -858,7 +843,7 @@ mod tests {
 
         builder.finish().unwrap();
 
-        let sst_path = dir_path.join("000001.sst");
+        let sst_path = db_path_manager.sstable_path_by_id(1);
         assert!(sst_path.exists());
 
         // 读取文件并验证BloomFilter存在
@@ -890,9 +875,9 @@ mod tests {
     #[test]
     fn test_sstable_builder_index_block() {
         let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path();
+        let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, dir_path.to_path_buf()).unwrap();
+        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
 
         // 写入足够多的数据以创建多个数据块
         for i in 0..100 {
@@ -903,7 +888,7 @@ mod tests {
 
         builder.finish().unwrap();
 
-        let sst_path = dir_path.join("000001.sst");
+        let sst_path = db_path_manager.sstable_path_by_id(1);
         assert!(sst_path.exists());
 
         // 读取文件并验证IndexBlock存在
@@ -939,9 +924,9 @@ mod tests {
     #[test]
     fn test_sstable_with_file_metadata() {
         let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path();
+        let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(123, dir_path.to_path_buf()).unwrap();
+        let mut builder = SSTableBuilder::new(123, &db_path_manager).unwrap();
 
         // 写入一些测试数据
         builder.write(b"apple", b"fruit1");
@@ -960,7 +945,7 @@ mod tests {
         assert_eq!(metadata.largest_key, b"cherry");
 
         // 根据 file_id 生成路径并验证文件存在
-        let sstable_path = dir_path.join("000123.sst");
+        let sstable_path = db_path_manager.sstable_path_by_id(123);
         assert!(sstable_path.exists());
 
         // 验证文件大小与实际文件大小一致
@@ -980,9 +965,9 @@ mod tests {
     #[test]
     fn test_empty_sstable_metadata() {
         let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path();
+        let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, dir_path.to_path_buf()).unwrap();
+        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
 
         // 立即完成，不写入任何数据
         let metadata = builder.finish().unwrap();
@@ -994,7 +979,7 @@ mod tests {
         assert!(metadata.largest_key.is_empty());
 
         // 根据 file_id 生成路径并验证文件存在
-        let sstable_path = dir_path.join("000001.sst");
+        let sstable_path = db_path_manager.sstable_path_by_id(1);
         assert!(sstable_path.exists());
     }
 }
