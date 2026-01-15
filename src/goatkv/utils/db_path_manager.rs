@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// 数据库路径管理器，类似PostgreSQL的pgdata目录
 /// 统一管理数据库的所有物理文件路径
@@ -79,6 +80,129 @@ impl DbPathManager {
         ));
 
         Self::new(temp_dir)
+    }
+
+    /// 初始化全局 DbPathManager 单例
+    ///
+    /// # 参数
+    /// - `base_path`: 基础数据目录路径
+    ///
+    /// # 返回
+    /// - `Ok(())`: 初始化成功
+    /// - `Err(std::io::Error)`: 创建目录失败或已初始化
+    ///
+    /// # Panics
+    /// 如果已经初始化过，会 panic
+    ///
+    /// # 示例
+    /// ```no_run
+    /// # use goat_db::goatkv::utils::db_path_manager::DbPathManager;
+    /// DbPathManager::init("./data").unwrap();
+    /// let manager = DbPathManager::global();
+    /// ```
+    pub fn init<P: AsRef<Path>>(base_path: P) -> Result<(), std::io::Error> {
+        let manager = Self::new(base_path)?;
+        GLOBAL_PATH_MANAGER.set(manager).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "DbPathManager already initialized",
+            )
+        })?;
+        Ok(())
+    }
+
+    /// 尝试初始化全局 DbPathManager 单例
+    ///
+    /// # 参数
+    /// - `base_path`: 基础数据目录路径
+    ///
+    /// # 返回
+    /// - `Ok(true)`: 成功初始化
+    /// - `Ok(false)`: 已经初始化过，使用现有的
+    /// - `Err(std::io::Error)`: 创建目录失败
+    ///
+    /// # 示例
+    /// ```no_run
+    /// # use goat_db::goatkv::utils::db_path_manager::DbPathManager;
+    /// let initialized = DbPathManager::try_init("./data").unwrap();
+    /// let manager = DbPathManager::global();
+    /// ```
+    pub fn try_init<P: AsRef<Path>>(base_path: P) -> Result<bool, std::io::Error> {
+        if GLOBAL_PATH_MANAGER.get().is_some() {
+            return Ok(false); // Already initialized
+        }
+
+        let manager = Self::new(base_path)?;
+        Ok(GLOBAL_PATH_MANAGER.set(manager).is_ok())
+    }
+
+    /// 移除并返回当前的 DbPathManager（重置全局状态）
+    ///
+    /// # 返回
+    /// - `Some(manager)`: 返回被移除的 manager
+    /// - `None`: 如果没有初始化过
+    ///
+    /// # 注意
+    /// 注意
+    /// 此方法主要用于测试，用于在测试间重置全局状态
+    ///
+    /// # 示例
+    /// ```no_run
+    /// # use goat_db::goatkv::utils::db_path_manager::DbPathManager;
+    /// DbPathManager::init("./data").unwrap();
+    /// let manager = DbPathManager::take().unwrap(); // Reset
+    /// ```
+    #[cfg(test)]
+    pub fn take() -> Option<DbPathManager> {
+        // Use OnceLock::take() to get the inner value
+        // Note: OnceLock::take() requires mutable access, so we use an unsafe block
+        // This is safe because:
+        // 1. This method is only used in tests
+        // 2. Tests run sequentially (--test-threads=1)
+        // 3. We ensure no other references exist when calling take()
+        unsafe {
+            let ptr = &GLOBAL_PATH_MANAGER as *const OnceLock<DbPathManager>
+                as *mut OnceLock<DbPathManager>;
+            (*ptr).take()
+        }
+    }
+
+    /// 获取全局 DbPathManager 单例
+    ///
+    /// # 返回
+    /// 返回全局 DbPathManager 的引用
+    ///
+    /// # Panics
+    /// 如果没有初始化过，会 panic
+    ///
+    /// # 示例
+    /// ```no_run
+    /// # use goat_db::goatkv::utils::db_path_manager::DbPathManager;
+    /// DbPathManager::init("./data").unwrap();
+    /// let manager = DbPathManager::global();
+    /// let path = manager.data_dir();
+    /// ```
+    pub fn global() -> &'static Self {
+        GLOBAL_PATH_MANAGER
+            .get()
+            .expect("DbPathManager not initialized. Call DbPathManager::init() first.")
+    }
+
+    /// 尝试获取全局 DbPathManager 单例
+    ///
+    /// # 返回
+    /// - `Some(&'static Self)`: 如果已初始化
+    /// - `None`: 如果未初始化
+    ///
+    /// # 示例
+    /// ```no_run
+    /// # use goat_db::goatkv::utils::db_path_manager::DbPathManager;
+    /// if let Some(manager) = DbPathManager::try_global() {
+    ///     let path = manager.data_dir();
+    /// }
+    /// ```
+    pub fn try_global() -> Option<&'static Self> {
+        GLOBAL_PATH_MANAGER.get()
     }
 
     /// 创建所有必要的目录结构
@@ -354,11 +478,128 @@ impl DbPathManager {
     }
 }
 
+/// 全局 DbPathManager 单例
+static GLOBAL_PATH_MANAGER: OnceLock<DbPathManager> = OnceLock::new();
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_singleton_init_and_global() {
+        let _ = DbPathManager::take(); // Reset any previous state
+        let temp_dir = tempdir().unwrap();
+
+        // 第一次初始化应该成功
+        let result = DbPathManager::init(temp_dir.path());
+        assert!(result.is_ok());
+
+        // 获取全局实例
+        let manager = DbPathManager::global();
+
+        // 验证路径正确
+        assert_eq!(manager.base_path(), temp_dir.path());
+        assert!(manager.data_dir().exists());
+        assert!(manager.wal_dir().exists());
+    }
+
+    #[test]
+    fn test_singleton_double_init_fails() {
+        let _ = DbPathManager::take(); // Reset any previous state
+        let temp_dir = tempdir().unwrap();
+        let temp_dir2 = tempdir().unwrap();
+
+        // 第一次初始化应该成功
+        assert!(DbPathManager::init(temp_dir.path()).is_ok());
+
+        // 第二次初始化应该失败
+        let result = DbPathManager::init(temp_dir2.path());
+        assert!(result.is_err());
+
+        // 错误类型应该是 AlreadyExists
+        if let Err(e) = result {
+            assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        }
+    }
+
+    #[test]
+    fn test_try_init() {
+        let _ = DbPathManager::take(); // Reset any previous state
+        let temp_dir = tempdir().unwrap();
+        let temp_dir2 = tempdir().unwrap();
+
+        // 第一次 try_init 应该返回 true
+        let initialized = DbPathManager::try_init(temp_dir.path()).unwrap();
+        assert!(initialized);
+
+        // 第二次 try_init 应该返回 false（已存在）
+        let initialized2 = DbPathManager::try_init(temp_dir2.path()).unwrap();
+        assert!(!initialized2);
+
+        // 路径应该还是第一次的
+        let manager = DbPathManager::global();
+        assert_eq!(manager.base_path(), temp_dir.path());
+    }
+
+    #[test]
+    fn test_try_global() {
+        let _ = DbPathManager::take(); // Reset any previous state
+                                       // 未初始化时应该返回 None
+        assert!(DbPathManager::try_global().is_none());
+
+        let temp_dir = tempdir().unwrap();
+
+        // 初始化后应该返回 Some
+        assert!(DbPathManager::init(temp_dir.path()).is_ok());
+        assert!(DbPathManager::try_global().is_some());
+
+        // 验证返回的是同一个实例
+        let manager1 = DbPathManager::try_global().unwrap();
+        let manager2 = DbPathManager::global();
+        assert_eq!(manager1.base_path(), manager2.base_path());
+    }
+
+    #[test]
+    fn test_global_before_init_panics() {
+        let _ = DbPathManager::take(); // Reset any previous state
+                                       // 在未初始化的情况下调用 global 应该 panic
+        let result = std::panic::catch_unwind(|| {
+            DbPathManager::global();
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_singleton_is_thread_safe() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let temp_dir = tempdir().unwrap();
+        let _ = DbPathManager::take(); // Reset any previous state
+        DbPathManager::init(temp_dir.path()).unwrap();
+        let barrier = Arc::new(Barrier::new(4));
+        let mut handles = vec![];
+
+        // 创建多个线程同时访问全局实例
+        for _ in 0..4 {
+            let barrier = barrier.clone();
+            let handle = thread::spawn(move || {
+                barrier.wait();
+
+                // 所有线程都能获取到全局实例
+                let manager = DbPathManager::global();
+                assert!(manager.data_dir().exists());
+            });
+            handles.push(handle);
+        }
+
+        // 等待所有线程完成
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
 
     #[test]
     fn test_create_path_manager() {

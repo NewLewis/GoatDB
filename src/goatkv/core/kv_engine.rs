@@ -8,7 +8,6 @@ use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
 use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
 use crate::goatkv::storage::sstable_reader::SSTableReader;
 use crate::goatkv::storage::wal_manager::{WalIterator, WalManager};
-
 use crate::goatkv::utils::db_path_manager::DbPathManager;
 use crate::goatkv::utils::options::KvEngineOptions;
 use crate::goatkv::utils::sequence_number::SequenceNumber;
@@ -16,8 +15,6 @@ use crate::goatkv::utils::sequence_number::SequenceNumber;
 /// LSM-Tree 键值存储引擎
 #[derive(Debug)]
 pub struct KvEngine {
-    /// 路径管理器，统一管理所有数据库文件路径
-    path_manager: Arc<DbPathManager>,
     /// WAL 管理器，负责写前日志
     wal_manager: Arc<Mutex<WalManager>>,
     /// 序列号生成器
@@ -54,11 +51,12 @@ impl KvEngine {
     /// - `Ok(KvEngine)`: 创建成功
     /// - `Err(std::io::Error)`: 创建目录或初始化失败
     pub fn new_with_options(options: KvEngineOptions) -> Result<Self, std::io::Error> {
-        // 创建路径管理器
-        let path_manager = Arc::new(DbPathManager::new(&options.data_dir)?);
+        // 初始化全局路径管理器单例
+        // 使用 try_init 以便在测试中可以重用已初始化的单例
+        let _ = DbPathManager::try_init(&options.data_dir)?;
 
         // 获取主 WAL 文件路径
-        let wal_path = path_manager.main_wal_path();
+        let wal_path = DbPathManager::global().main_wal_path();
 
         // 创建内存表
         let mut mem_table = MemTable::new(options.mem_table_size);
@@ -80,10 +78,9 @@ impl KvEngine {
             let state = lsm_state.read().unwrap();
             state.version_set.clone()
         };
-        let flush_worker = FlushWorker::new(lsm_state.clone(), path_manager.clone(), version_set);
+        let flush_worker = FlushWorker::new(lsm_state.clone(), version_set);
 
         Ok(Self {
-            path_manager,
             wal_manager: Arc::new(Mutex::new(wal_manager)),
             sequence_number: Arc::new(SequenceNumber::new()),
             lsm_state,
@@ -119,9 +116,9 @@ impl KvEngine {
 }
 
 impl KvEngine {
-    /// 获取路径管理器引用
-    pub fn path_manager(&self) -> &DbPathManager {
-        &self.path_manager
+    /// 获取路径管理器引用（全局单例）
+    pub fn path_manager() -> &'static DbPathManager {
+        DbPathManager::global()
     }
 
     /// 获取 VersionSet 引用（用于测试和元数据访问）
@@ -171,7 +168,7 @@ impl KvEngine {
         for level in 0..version.num_levels() {
             for file_meta in version.get_files(level) {
                 // Construct the SSTable file path using file_id
-                let sstable_path = self.path_manager.sstable_path_by_id(file_meta.file_id);
+                let sstable_path = DbPathManager::global().sstable_path_by_id(file_meta.file_id);
 
                 // Open the file and read from it
                 // Note: Opening file every time is slower, but this allows the SSTableReader
@@ -361,8 +358,8 @@ mod tests {
 
     #[test]
     fn test_path_manager_integration() {
-        let engine = KvEngine::new_for_test();
-        let path_manager = engine.path_manager();
+        let _engine = KvEngine::new_for_test();
+        let path_manager = KvEngine::path_manager();
 
         // Verify path manager is properly integrated
         assert!(path_manager.base_path().exists());

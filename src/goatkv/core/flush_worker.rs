@@ -7,8 +7,6 @@ use crate::goatkv::metadata::version_edit::VersionEdit;
 use crate::goatkv::metadata::version_set::VersionSet;
 use crate::goatkv::storage::sstable_builder::SSTableBuilder;
 
-use crate::goatkv::utils::db_path_manager::DbPathManager;
-
 /// 刷盘任务
 #[derive(Debug)]
 pub struct FlushTask {
@@ -31,21 +29,16 @@ impl FlushWorker {
     /// 创建新的 FlushWorker 并启动后台线程
     ///
     /// # 参数
-    /// - `lsm_state`: LSM 状态管理器，用于访问 immutable memtables 和 sstables
-    /// - `db_path_manager`: 数据库路径管理器，用于创建 SSTable 文件
+    /// - `lsm_state`: LSM 状态管理器，用于访问 immutable memtables
     /// - `version_set`: VersionSet 用于记录 SSTable 元数据变更
     ///
     /// # 返回
     /// 返回新创建的 FlushWorker 实例
-    pub fn new(
-        lsm_state: Arc<RwLock<LSMState>>,
-        db_path_manager: Arc<DbPathManager>,
-        version_set: Arc<RwLock<VersionSet>>,
-    ) -> Self {
+    pub fn new(lsm_state: Arc<RwLock<LSMState>>, version_set: Arc<RwLock<VersionSet>>) -> Self {
         let (tx, rx) = mpsc::channel();
 
         let handle = thread::spawn(move || {
-            Self::run_loop(rx, lsm_state, db_path_manager, version_set);
+            Self::run_loop(rx, lsm_state, version_set);
         });
 
         Self {
@@ -71,13 +64,11 @@ impl FlushWorker {
     /// 持续从 channel 接收刷盘任务并执行：
     /// 1. 从 immutable memtable 读取数据
     /// 2. 创建 SSTable 文件
-    /// 3. 将 SSTableReader 添加到 LSM 状态
-    /// 4. 创建 VersionEdit 并应用到 VersionSet
-    /// 5. 移除已刷盘的 immutable memtable
+    /// 3. 创建 VersionEdit 并应用到 VersionSet
+    /// 4. 移除已刷盘的 immutable memtable
     fn run_loop(
         rx: mpsc::Receiver<FlushTask>,
         lsm_state: Arc<RwLock<LSMState>>,
-        db_path_manager: Arc<DbPathManager>,
         version_set: Arc<RwLock<VersionSet>>,
     ) {
         while let Ok(task) = rx.recv() {
@@ -87,7 +78,7 @@ impl FlushWorker {
                 vs.allocate_file_number()
             };
 
-            let mut sst_builder = match SSTableBuilder::new(file_id, &db_path_manager) {
+            let mut sst_builder = match SSTableBuilder::new(file_id) {
                 Ok(builder) => builder,
                 Err(e) => {
                     eprintln!("Failed to create SSTableBuilder: {}", e);

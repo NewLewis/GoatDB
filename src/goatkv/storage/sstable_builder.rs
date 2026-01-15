@@ -1,7 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 
-
 use crate::goatkv::encoding::coding;
 use crate::goatkv::metadata::version_edit::FileMetaData;
 use crate::goatkv::storage::block_builder::BlockBuilder;
@@ -114,7 +113,6 @@ pub struct SSTableBuilder {
     /// SSTable ID
     id: u64,
 
-
     /// 最小的键（第一个写入的键）
     smallest_key: Option<Vec<u8>>,
     /// 最大的键（最后一个写入的键）
@@ -126,7 +124,6 @@ impl SSTableBuilder {
     ///
     /// # 参数
     /// - `id`: SSTable的唯一标识符
-    /// - `db_path_manager`: 数据库路径管理器
     ///
     /// # 文件命名规则（由 DbPathManager 管理）
     /// - 如果 file_id < 1,000,000：格式为 `{file_id:06}.sst`（如 000001.sst）
@@ -135,18 +132,37 @@ impl SSTableBuilder {
     /// # 错误
     /// 返回io::Error，如果文件创建失败
     ///
+    /// # 注意
+    /// 使用全局 DbPathManager 单例，必须先调用 `DbPathManager::init()` 初始化
+    ///
     /// # 示例
     /// ```no_run
     /// # use goat_db::goatkv::storage::sstable_builder::SSTableBuilder;
     /// # use goat_db::goatkv::utils::db_path_manager::DbPathManager;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let path_manager = DbPathManager::new("./data")?;
-    /// let builder = SSTableBuilder::new(1, &path_manager)?;
+    /// DbPathManager::init("./data")?;
+    /// let builder = SSTableBuilder::new(1)?;
     /// // 创建文件 ./data/000001.sst
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new(id: u64, db_path_manager: &DbPathManager) -> io::Result<Self> {
+    pub fn new(id: u64) -> io::Result<Self> {
+        let db_path_manager = DbPathManager::global();
+        Self::new_with_manager(id, db_path_manager)
+    }
+
+    /// 创建一个新的SSTableBuilder，使用指定的DbPathManager
+    ///
+    /// # 参数
+    /// - `id`: SSTable的唯一标识符
+    /// - `db_path_manager`: 数据库路径管理器引用
+    ///
+    /// # 错误
+    /// 返回io::Error，如果文件创建失败
+    ///
+    /// # 注意
+    /// 此方法主要用于测试，允许使用临时DbPathManager而不影响全局单例
+    pub fn new_with_manager(id: u64, db_path_manager: &DbPathManager) -> io::Result<Self> {
         let sstable_path = db_path_manager.sstable_path_by_id(id);
 
         let file = OpenOptions::new()
@@ -194,8 +210,8 @@ impl SSTableBuilder {
     /// # use goat_db::goatkv::utils::db_path_manager::DbPathManager;
     /// # use goat_db::goatkv::storage::sstable_builder::SSTableBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let path_manager = DbPathManager::new("./data")?;
-    /// let mut builder = SSTableBuilder::new(1, &path_manager)?;
+    /// DbPathManager::init("./data")?;
+    /// let mut builder = SSTableBuilder::new(1)?;
     /// builder.write(b"apple", b"fruit");
     /// builder.write(b"banana", b"fruit");
     /// builder.write(b"cherry", b"fruit");
@@ -307,8 +323,8 @@ impl SSTableBuilder {
     /// # use goat_db::goatkv::utils::db_path_manager::DbPathManager;
     /// # use goat_db::goatkv::storage::sstable_builder::SSTableBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let path_manager = DbPathManager::new("./data")?;
-    /// let mut builder = SSTableBuilder::new(1, &path_manager)?;
+    /// DbPathManager::init("./data")?;
+    /// let mut builder = SSTableBuilder::new(1)?;
     /// builder.write(b"key1", b"value1");
     /// builder.write(b"key2", b"value2");
     /// let metadata = builder.finish()?;
@@ -468,10 +484,12 @@ mod tests {
     /// 测试SSTableBuilder的基本创建和写入功能
     #[test]
     fn test_sstable_builder_basic() {
+        // 测试标签：使用独立的 DbPathManager 实例，避免全局单例状态污染
+        // 注意：生产代码应使用 SSTableBuilder::new()，它会自动使用 DbPathManager::global()
         let temp_dir = TempDir::new().unwrap();
         let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
 
         // 写入几个简单的key-value对
         builder.write(b"apple", b"fruit");
@@ -493,8 +511,10 @@ mod tests {
     /// 测试文件名生成
     #[test]
     fn test_sstable_builder_file_name() {
+        let _ = DbPathManager::take(); // Reset any previous state
         let temp_dir = TempDir::new().unwrap();
-        let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
+        DbPathManager::init(temp_dir.path()).unwrap();
+        let db_path_manager = DbPathManager::global();
 
         // 测试id < 1,000,000的情况
         let filename1 = db_path_manager.sstable_path_by_id(1);
@@ -514,10 +534,11 @@ mod tests {
     /// 测试单个数据块的情况（数据量小于4KB）
     #[test]
     fn test_sstable_builder_single_block() {
+        // 测试标签：使用独立的 DbPathManager 实例，避免全局单例状态污染
         let temp_dir = TempDir::new().unwrap();
         let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
 
         // 只写入少量数据，不会触发多个数据块
         for i in 0..10 {
@@ -539,10 +560,11 @@ mod tests {
     /// 测试多个数据块的情况（数据量超过4KB）
     #[test]
     fn test_sstable_builder_multiple_blocks() {
+        // 测试标签：使用独立的 DbPathManager 实例，避免全局单例状态污染
         let temp_dir = TempDir::new().unwrap();
         let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
 
         // 写入大量数据以触发多个数据块
         for i in 0..500 {
@@ -595,10 +617,11 @@ mod tests {
     /// 测试空key的处理
     #[test]
     fn test_sstable_builder_empty_key() {
+        // 测试标签：使用独立的 DbPathManager 实例，避免全局单例状态污染
         let temp_dir = TempDir::new().unwrap();
         let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
 
         // 写入包含空key的数据
         builder.write(b"", b"empty_key_value");
@@ -616,7 +639,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
 
         // 写入包含空value的数据
         builder.write(b"key1", b"");
@@ -635,7 +658,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
 
         // 写入包含特殊字符的key
         builder.write(b"key_with_underscore", b"value1");
@@ -656,7 +679,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
 
         // 写入包含大value的数据
         let large_value = vec![b'x'; 10000];
@@ -679,7 +702,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
 
         // 写入一些数据
         for i in 0..50 {
@@ -741,7 +764,7 @@ mod tests {
 
         // 创建多个SSTable
         for id in 1..=5 {
-            let mut builder = SSTableBuilder::new(id, &db_path_manager).unwrap();
+            let mut builder = SSTableBuilder::new_with_manager(id, &db_path_manager).unwrap();
 
             for i in 0..10 {
                 let key = format!("key_{}_{}", id, i);
@@ -765,7 +788,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
 
         // 连续写入100个key-value对
         for i in 0..100 {
@@ -786,7 +809,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
 
         // 写入单字节的key和value
         builder.write(b"a", b"1");
@@ -805,7 +828,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
 
         // 写入1000个条目
         for i in 0..1000 {
@@ -832,7 +855,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
 
         // 写入一些已知的key
         for i in 0..10 {
@@ -877,7 +900,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
 
         // 写入足够多的数据以创建多个数据块
         for i in 0..100 {
@@ -926,7 +949,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(123, &db_path_manager).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
 
         // 写入一些测试数据
         builder.write(b"apple", b"fruit1");
@@ -937,7 +960,7 @@ mod tests {
         let metadata = builder.finish().unwrap();
 
         // 验证 FileMetaData 字段
-        assert_eq!(metadata.file_id, 123);
+        assert_eq!(metadata.file_id, 1);
         assert!(metadata.file_size > 0);
 
         // 验证 smallest_key 和 largest_key
@@ -945,7 +968,7 @@ mod tests {
         assert_eq!(metadata.largest_key, b"cherry");
 
         // 根据 file_id 生成路径并验证文件存在
-        let sstable_path = db_path_manager.sstable_path_by_id(123);
+        let sstable_path = db_path_manager.sstable_path_by_id(1);
         assert!(sstable_path.exists());
 
         // 验证文件大小与实际文件大小一致
@@ -958,7 +981,7 @@ mod tests {
         version_edit.add_file(0, metadata.clone()); // 添加到 Level 0
         assert_eq!(version_edit.new_files.len(), 1);
         assert_eq!(version_edit.new_files[0].0, 0); // Level 0
-        assert_eq!(version_edit.new_files[0].1.file_id, 123);
+        assert_eq!(version_edit.new_files[0].1.file_id, 1);
     }
 
     /// 测试空 SSTable 的 FileMetaData
@@ -967,7 +990,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, &db_path_manager).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
 
         // 立即完成，不写入任何数据
         let metadata = builder.finish().unwrap();
