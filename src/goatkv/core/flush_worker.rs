@@ -1,4 +1,4 @@
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{mpsc, Arc, RwLock};
 use std::thread;
 
 use crate::goatkv::core::lsm_state::LSMState;
@@ -6,7 +6,7 @@ use crate::goatkv::core::mem_table::MemTable;
 use crate::goatkv::metadata::version_edit::VersionEdit;
 use crate::goatkv::metadata::version_set::VersionSet;
 use crate::goatkv::storage::sstable_builder::SSTableBuilder;
-use crate::goatkv::storage::sstable_reader::SSTableReader;
+
 use crate::goatkv::utils::db_path_manager::DbPathManager;
 
 /// 刷盘任务
@@ -87,14 +87,13 @@ impl FlushWorker {
                 vs.allocate_file_number()
             };
 
-            let mut sst_builder =
-                match SSTableBuilder::new(file_id, &db_path_manager) {
-                    Ok(builder) => builder,
-                    Err(e) => {
-                        eprintln!("Failed to create SSTableBuilder: {}", e);
-                        continue;
-                    }
-                };
+            let mut sst_builder = match SSTableBuilder::new(file_id, &db_path_manager) {
+                Ok(builder) => builder,
+                Err(e) => {
+                    eprintln!("Failed to create SSTableBuilder: {}", e);
+                    continue;
+                }
+            };
 
             // 获取 immutable_memtable 并克隆数据，避免长时间持有锁
             let entries: Vec<(Vec<u8>, Vec<u8>)> = {
@@ -141,20 +140,6 @@ impl FlushWorker {
                 }
             };
 
-            // 根据 file_id 生成 SSTable 路径
-            let sstable_path = db_path_manager.sstable_path_by_id(metadata.file_id);
-
-            let reader = match SSTableReader::open(&sstable_path) {
-                Ok(reader) => reader,
-                Err(e) => {
-                    eprintln!(
-                        "Failed to open newly created SSTable {:?}: {}",
-                        sstable_path, e
-                    );
-                    continue;
-                }
-            };
-
             // 创建 VersionEdit 记录新增的 SSTable
             let mut version_edit = VersionEdit::new();
             version_edit.add_file(0, metadata.clone());
@@ -168,16 +153,9 @@ impl FlushWorker {
                 }
             }
 
-            // 从 immutable_mem_tables 中移除已刷盘的 memtable，并将 SSTableReader 添加到 sstables
+            // 从 immutable_mem_tables 中移除已刷盘的 memtable
             // 注意：需要获取写锁
             let mut lsm_state_guard = lsm_state.write().unwrap();
-
-            // 添加到 SSTable 列表头部（最新的在最前面）
-            lsm_state_guard
-                .sstables
-                .insert(0, Arc::new(Mutex::new(reader)));
-
-            // 移除 old memtable
             lsm_state_guard.immutable_mem_tables.pop_front();
         }
     }

@@ -6,6 +6,7 @@ use crate::goatkv::core::flush_worker::{FlushTask, FlushWorker};
 use crate::goatkv::core::lsm_state::LSMState;
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
 use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
+use crate::goatkv::storage::sstable_reader::SSTableReader;
 use crate::goatkv::storage::wal_manager::{WalIterator, WalManager};
 
 use crate::goatkv::utils::db_path_manager::DbPathManager;
@@ -79,11 +80,7 @@ impl KvEngine {
             let state = lsm_state.read().unwrap();
             state.version_set.clone()
         };
-        let flush_worker = FlushWorker::new(
-            lsm_state.clone(),
-            path_manager.clone(),
-            version_set,
-        );
+        let flush_worker = FlushWorker::new(lsm_state.clone(), path_manager.clone(), version_set);
 
         Ok(Self {
             path_manager,
@@ -159,16 +156,41 @@ impl KvEngine {
             }
         }
 
-        // Then check sstables
-        let sstables = lsm_state.sstables.clone();
-        for sstable in sstables {
-            let mut reader = sstable.lock().unwrap();
-            match reader.get(key) {
-                Ok(Some(value)) => return Some(value),
-                Ok(None) => continue, // Not found in this sstable, check next
-                Err(e) => {
-                    eprintln!("Failed to read from sstable: {}", e);
-                    continue;
+        // Then check sstables from version_set metadata
+        // Release lsm_state lock before reading from files to avoid holding lock during I/O
+        drop(lsm_state);
+
+        let version_set = self.version_set();
+        let version = {
+            let vs_guard = version_set.read().unwrap();
+            vs_guard.current().clone()
+        };
+
+        // Iterate through all levels and files (from newest to oldest)
+        // Level 0 first (newest, may overlap), then higher levels
+        for level in 0..version.num_levels() {
+            for file_meta in version.get_files(level) {
+                // Construct the SSTable file path using file_id
+                let sstable_path = self.path_manager.sstable_path_by_id(file_meta.file_id);
+
+                // Open the file and read from it
+                // Note: Opening file every time is slower, but this allows the SSTableReader
+                // to serve as a cache layer in the future
+                match SSTableReader::open(&sstable_path) {
+                    Ok(mut reader) => {
+                        match reader.get(key) {
+                            Ok(Some(value)) => return Some(value),
+                            Ok(None) => continue, // Not found in this sstable, check next
+                            Err(e) => {
+                                eprintln!("Failed to read from sstable {:?}: {}", sstable_path, e);
+                                continue;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to open sstable {:?}: {}", sstable_path, e);
+                        continue;
+                    }
                 }
             }
         }
@@ -365,16 +387,18 @@ mod tests {
         // 2. Trigger flush
         engine.flush();
 
-        // 3. Wait for flush to complete (poll sstables count)
-        // Since flush is async, we wait until sstables count becomes 1
+        // 3. Wait for flush to complete (poll version_set for SSTable metadata)
+        // Since flush is async, we wait until version_set has one file in Level 0
         let mut flushed = false;
         for _ in 0..50 {
-            let state = engine.lsm_state.read().unwrap();
-            if !state.sstables.is_empty() {
+            let version_set = engine.version_set();
+            let vs = version_set.read().unwrap();
+            if vs.current().get_files(0).len() > 0 {
                 flushed = true;
                 break;
             }
-            drop(state); // release lock
+            drop(vs); // release lock
+            drop(version_set);
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         assert!(flushed, "Flush timed out or failed");
@@ -385,12 +409,6 @@ mod tests {
         // but flush creates a NEW empty memtable. The OLD one became immutable and then flushed.
         // So the key is definitely NOT in the current memtable.)
         assert_eq!(engine.get(b"persist_key"), Some(b"persist_value".to_vec()));
-
-        // 5. Verify it's actually in SSTable (white-box check)
-        let state = engine.lsm_state.read().unwrap();
-        assert_eq!(state.sstables.len(), 1);
-        let sstable = state.sstables[0].lock().unwrap();
-        assert!(sstable.may_contain(b"persist_key"));
     }
 
     #[test]
@@ -404,12 +422,14 @@ mod tests {
         // Wait for flush to complete
         let mut flushed = false;
         for _ in 0..50 {
-            let state = engine.lsm_state.read().unwrap();
-            if !state.sstables.is_empty() {
+            let version_set = engine.version_set();
+            let vs = version_set.read().unwrap();
+            if vs.current().get_files(0).len() > 0 {
                 flushed = true;
                 break;
             }
-            drop(state);
+            drop(vs);
+            drop(version_set);
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         assert!(flushed, "Flush timed out");

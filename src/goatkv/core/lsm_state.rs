@@ -1,10 +1,9 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::{Mutex, RwLock};
+use std::sync::RwLock;
 
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
 use crate::goatkv::metadata::version_set::{VersionSet, VersionSetOptions};
-use crate::goatkv::storage::sstable_reader::SSTableReader;
 use crate::goatkv::utils::options::KvEngineOptions;
 
 #[derive(Debug)]
@@ -13,9 +12,6 @@ pub struct LSMState {
     pub mem_table: Arc<MemTable>,
     /// 不可变内存表队列（待刷盘）
     pub immutable_mem_tables: VecDeque<Arc<ImmutableMemTable>>,
-    /// SSTable 列表 (L0)
-    /// 使用 Mutex 因为 SSTableReader::get 需要 &mut self (文件IO)
-    pub sstables: Vec<Arc<Mutex<SSTableReader>>>,
     /// VersionSet 管理所有 SSTable 元数据
     pub version_set: Arc<RwLock<VersionSet>>,
 }
@@ -43,7 +39,6 @@ impl LSMState {
         LSMState {
             mem_table: Arc::new(MemTable::new(options.mem_table_size)),
             immutable_mem_tables: VecDeque::new(),
-            sstables: Vec::new(),
             version_set,
         }
     }
