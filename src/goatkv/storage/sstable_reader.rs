@@ -269,48 +269,9 @@ impl SSTableReader {
             return Ok(None);
         }
 
-        // 2. 在索引中查找对应的数据块
-        // 构造 probe key: InternalKey(user_key, MAX_SEQ, Lookup/Put)
-        // 我们想找到第一个 InternalKey >= (user_key, MAX_SEQ) 的条目
-        // 注意：InternalKey 排序是 (UserKey Asc, Seq Desc)
-        // 所以 (UserKey, MAX_SEQ) 是该 UserKey 的"最小"InternalKey（排最前面）
-        // 只要 block 的 separator >= probe_key，该 block 就可能包含目标 UserKey
         let probe_key = InternalKey::new(key.to_vec(), SEQUENCE_NUMBER_MAX, InternalKeyKind::Put);
 
-        // MemTable flush logic:
-        // `sstable_builder` just wrote bytes.
-        // `mem_table` flush constructed it manually.
-        // InternalKey struct has `encoded_sequence_number`.
-        // Format: user_key + 8 bytes (big endian? No, usually le bytes of u64? Let's check mem_table logic)
-
-        // MemTable flush logic:
-        /*
-        serialized_key.extend_from_slice(key.user_key());
-        serialized_key.extend_from_slice(&key.encoded_sequence_number().to_le_bytes());
-        */
-
-        let mut target_key_bytes = Vec::new();
-        target_key_bytes.extend_from_slice(key);
-
-        // 启发式检测：检查 SSTable 中 key 的格式
-        // 如果第一个索引条目的分隔键长度 >= 8，假设是 InternalKey 格式（包含序列号）
-        // 否则假设是纯 UserKey 格式（测试中的情况）
-        let use_internal_key_format = self
-            .index_entries
-            .first()
-            .map(|entry| entry.separator.len() >= 8)
-            .unwrap_or(false);
-
-        if use_internal_key_format {
-            // 实际系统使用的格式：大端序 + 取反
-            target_key_bytes
-                .extend_from_slice(&(!probe_key.encoded_sequence_number()).to_be_bytes());
-        } else {
-            // 测试使用的格式：小端序（或无序列号）
-            target_key_bytes.extend_from_slice(&probe_key.encoded_sequence_number().to_le_bytes());
-        }
-
-        let block_info = self.find_block_for_key(&target_key_bytes);
+        let block_info = self.find_block_for_key(&probe_key.serialize());
 
         let (block_offset, block_size) = match block_info {
             Some(info) => info,
@@ -362,14 +323,10 @@ impl SSTableReader {
                     // 2. Invert back to get real encoded seq
                     let encoded_seq = !inverted_seq;
 
-                    // Kind is lowest byte of encoded_seq
-                    // Kind is lowest byte
-                    let kind = encoded_seq & 0xFF; // 0=Put, 1=Delete
-                    if kind == 1 {
-                        return Ok(None); // Deleted
-                    } else {
-                        return Ok(Some(v));
-                    }
+                    return Ok(Some((
+                        InternalKey::from_encoded(user_key_part.to_vec(), encoded_seq),
+                        v,
+                    )));
                 }
                 Ordering::Greater => {
                     // Moved past target user key
@@ -485,10 +442,12 @@ mod tests {
         for i in 0..200 {
             let key = format!("key_{:03}", i);
             let value = format!("value_{:03}", i);
+
+            let internal_key = InternalKey::new(key.as_bytes().to_vec(), i, InternalKeyKind::Put);
             let key_bytes = key.as_bytes().to_vec();
             let value_bytes = value.as_bytes().to_vec();
 
-            builder.write(&key_bytes, &value_bytes);
+            builder.write(&internal_key.serialize(), &value_bytes);
             test_data.push((key_bytes, value_bytes));
         }
 
@@ -580,14 +539,14 @@ mod tests {
         // 测试存在的key
         let result = reader.get(b"apple");
         assert!(result.is_ok());
-        let value = result.unwrap();
-        assert_eq!(value, Some(b"fruit1".to_vec()));
+        let (_, value) = result.unwrap().unwrap();
+        assert_eq!(value, b"fruit1".to_vec());
 
         // 测试另一个存在的key
         let result = reader.get(b"cherry");
         assert!(result.is_ok());
-        let value = result.unwrap();
-        assert_eq!(value, Some(b"fruit3".to_vec()));
+        let (_, value) = result.unwrap().unwrap();
+        assert_eq!(value, b"fruit3".to_vec());
 
         // 测试不存在的key
         let result = reader.get(b"fig");

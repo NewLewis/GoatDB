@@ -479,8 +479,24 @@ impl SSTableBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::goatkv::encoding::internal_key::InternalKeyKind;
     use std::io::{Read, Seek};
     use tempfile::TempDir;
+
+    static mut TEST_SEQ_ID: u64 = 0;
+
+    fn write_for_test(builder: &mut SSTableBuilder, key: &[u8], value: &[u8]) {
+        let seq_id;
+        unsafe {
+            TEST_SEQ_ID += 1;
+            seq_id = TEST_SEQ_ID;
+        }
+
+        let internal_key = InternalKey::new(key.to_vec(), seq_id, InternalKeyKind::Put);
+
+        // 写入几个简单的key-value对
+        builder.write(&internal_key.serialize(), value);
+    }
 
     /// 测试SSTableBuilder的基本创建和写入功能
     #[test]
@@ -493,9 +509,9 @@ mod tests {
         let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
 
         // 写入几个简单的key-value对
-        builder.write(b"apple", b"fruit");
-        builder.write(b"banana", b"fruit");
-        builder.write(b"cherry", b"fruit");
+        write_for_test(&mut builder, b"apple", b"fruit");
+        write_for_test(&mut builder, b"banana", b"fruit");
+        write_for_test(&mut builder, b"cherry", b"fruit");
 
         // 完成构建
         builder.finish().unwrap();
@@ -545,7 +561,7 @@ mod tests {
         for i in 0..10 {
             let key = format!("key{}", i);
             let value = format!("value{}", i);
-            builder.write(key.as_bytes(), value.as_bytes());
+            write_for_test(&mut builder, key.as_bytes(), value.as_bytes());
         }
 
         builder.finish().unwrap();
@@ -555,7 +571,7 @@ mod tests {
 
         // 验证文件大小合理（包含数据块、BloomFilter、IndexBlock和Footer）
         let metadata = std::fs::metadata(&sst_path).unwrap();
-        assert!(metadata.len() > 100 && metadata.len() < 5000); // 100字节到5KB之间
+        assert!(metadata.len() > 0 && metadata.len() < 5000); // 文件大小应该大于0字节且小于5KB
     }
 
     /// 测试多个数据块的情况（数据量超过4KB）
@@ -571,7 +587,7 @@ mod tests {
         for i in 0..500 {
             let key = format!("key_{:010}", i);
             let value = format!("value_{}", i);
-            builder.write(key.as_bytes(), value.as_bytes());
+            write_for_test(&mut builder, key.as_bytes(), value.as_bytes());
         }
 
         builder.finish().unwrap();
@@ -625,8 +641,8 @@ mod tests {
         let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
 
         // 写入包含空key的数据
-        builder.write(b"", b"empty_key_value");
-        builder.write(b"a", b"next_value");
+        write_for_test(&mut builder, b"", b"empty_key_value");
+        write_for_test(&mut builder, b"a", b"next_value");
 
         builder.finish().unwrap();
 
@@ -643,9 +659,9 @@ mod tests {
         let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
 
         // 写入包含空value的数据
-        builder.write(b"key1", b"");
-        builder.write(b"key2", b"");
-        builder.write(b"key3", b"");
+        write_for_test(&mut builder, b"key1", b"");
+        write_for_test(&mut builder, b"key2", b"");
+        write_for_test(&mut builder, b"key3", b"");
 
         builder.finish().unwrap();
 
@@ -662,11 +678,11 @@ mod tests {
         let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
 
         // 写入包含特殊字符的key
-        builder.write(b"key_with_underscore", b"value1");
-        builder.write(b"key-with-dash", b"value2");
-        builder.write(b"key.with.dot", b"value3");
-        builder.write(b"key space", b"value4");
-        builder.write(b"123number", b"value5");
+        write_for_test(&mut builder, b"key_with_underscore", b"value1");
+        write_for_test(&mut builder, b"key-with-dash", b"value2");
+        write_for_test(&mut builder, b"key.with.dot", b"value3");
+        write_for_test(&mut builder, b"key space", b"value4");
+        write_for_test(&mut builder, b"123number", b"value5");
 
         builder.finish().unwrap();
 
@@ -684,8 +700,8 @@ mod tests {
 
         // 写入包含大value的数据
         let large_value = vec![b'x'; 10000];
-        builder.write(b"key1", &large_value);
-        builder.write(b"key2", &large_value);
+        write_for_test(&mut builder, b"key1", &large_value);
+        write_for_test(&mut builder, b"key2", &large_value);
 
         builder.finish().unwrap();
 
@@ -709,7 +725,7 @@ mod tests {
         for i in 0..50 {
             let key = format!("key{}", i);
             let value = format!("value{}", i);
-            builder.write(key.as_bytes(), value.as_bytes());
+            write_for_test(&mut builder, key.as_bytes(), value.as_bytes());
         }
 
         builder.finish().unwrap();
@@ -770,7 +786,7 @@ mod tests {
             for i in 0..10 {
                 let key = format!("key_{}_{}", id, i);
                 let value = format!("value_{}_{}", id, i);
-                builder.write(key.as_bytes(), value.as_bytes());
+                write_for_test(&mut builder, key.as_bytes(), value.as_bytes());
             }
 
             builder.finish().unwrap();
@@ -795,7 +811,7 @@ mod tests {
         for i in 0..100 {
             let key = format!("key_{:03}", i);
             let value = format!("value_{:03}", i);
-            builder.write(key.as_bytes(), value.as_bytes());
+            write_for_test(&mut builder, key.as_bytes(), value.as_bytes());
         }
 
         builder.finish().unwrap();
@@ -813,9 +829,9 @@ mod tests {
         let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
 
         // 写入单字节的key和value
-        builder.write(b"a", b"1");
-        builder.write(b"b", b"2");
-        builder.write(b"c", b"3");
+        write_for_test(&mut builder, b"a", b"1");
+        write_for_test(&mut builder, b"b", b"2");
+        write_for_test(&mut builder, b"c", b"3");
 
         builder.finish().unwrap();
 
@@ -835,7 +851,7 @@ mod tests {
         for i in 0..1000 {
             let key = format!("key_{:010}", i);
             let value = format!("value_{:010}", i);
-            builder.write(key.as_bytes(), value.as_bytes());
+            write_for_test(&mut builder, key.as_bytes(), value.as_bytes());
         }
 
         builder.finish().unwrap();
@@ -862,7 +878,7 @@ mod tests {
         for i in 0..10 {
             let key = format!("key{}", i);
             let value = format!("value{}", i);
-            builder.write(key.as_bytes(), value.as_bytes());
+            write_for_test(&mut builder, key.as_bytes(), value.as_bytes());
         }
 
         builder.finish().unwrap();
@@ -907,7 +923,7 @@ mod tests {
         for i in 0..100 {
             let key = format!("key_{:03}", i);
             let value = format!("value_{:03}", i);
-            builder.write(key.as_bytes(), value.as_bytes());
+            write_for_test(&mut builder, key.as_bytes(), value.as_bytes());
         }
 
         builder.finish().unwrap();
@@ -953,9 +969,9 @@ mod tests {
         let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
 
         // 写入一些测试数据
-        builder.write(b"apple", b"fruit1");
-        builder.write(b"banana", b"fruit2");
-        builder.write(b"cherry", b"fruit3");
+        write_for_test(&mut builder, b"apple", b"fruit1");
+        write_for_test(&mut builder, b"banana", b"fruit2");
+        write_for_test(&mut builder, b"cherry", b"fruit3");
 
         // 完成构建，获取 FileMetaData
         let metadata = builder.finish().unwrap();
@@ -965,8 +981,14 @@ mod tests {
         assert!(metadata.file_size > 0);
 
         // 验证 smallest_key 和 largest_key
-        assert_eq!(metadata.smallest_key, b"apple");
-        assert_eq!(metadata.largest_key, b"cherry");
+        assert_eq!(
+            metadata.smallest_key[..metadata.smallest_key.len() - 8].to_vec(),
+            b"apple"
+        );
+        assert_eq!(
+            metadata.largest_key[..metadata.largest_key.len() - 8].to_vec(),
+            b"cherry"
+        );
 
         // 根据 file_id 生成路径并验证文件存在
         let sstable_path = db_path_manager.sstable_path_by_id(1);

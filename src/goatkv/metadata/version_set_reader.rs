@@ -3,17 +3,19 @@ use std::sync::RwLock;
 
 use crate::goatkv::encoding::internal_key::InternalKey;
 use crate::goatkv::metadata::version_set::VersionSet;
+use crate::goatkv::storage::sstable_reader::SSTableReader;
+use crate::goatkv::utils::db_path_manager::DbPathManager;
 
-struct VersionSetReader {
+pub struct VersionSetReader {
     version_set: Arc<RwLock<VersionSet>>,
 }
 
 impl VersionSetReader {
-    fn new(version_set: Arc<RwLock<VersionSet>>) -> Self {
+    pub fn new(version_set: Arc<RwLock<VersionSet>>) -> Self {
         VersionSetReader { version_set }
     }
 
-    fn get(&self, key: &[u8]) -> Option<(InternalKey, Vec<u8>)> {
+    pub fn get(&self, key: &[u8]) -> Option<(InternalKey, Vec<u8>)> {
         let version = {
             let vs_guard = self.version_set.read().unwrap();
             vs_guard.current().clone()
@@ -32,7 +34,7 @@ impl VersionSetReader {
                 match SSTableReader::open(&sstable_path) {
                     Ok(mut reader) => {
                         match reader.get(key) {
-                            Ok(Some(value)) => return Some(value),
+                            Ok(Some(result)) => return Some(result),
                             Ok(None) => continue, // Not found in this sstable, check next
                             Err(e) => {
                                 eprintln!("Failed to read from sstable {:?}: {}", sstable_path, e);
@@ -47,5 +49,7 @@ impl VersionSetReader {
                 }
             }
         }
+
+        None
     }
 }
