@@ -169,8 +169,7 @@ impl VersionSet {
             if *level >= self.options.num_levels {
                 return Err(format!(
                     "Invalid level {} (max {})",
-                    level,
-                    self.options.num_levels
+                    level, self.options.num_levels
                 ));
             }
 
@@ -209,13 +208,13 @@ impl VersionSet {
     /// 创建新 Version
     fn create_new_version(&self, edit: &VersionEdit) -> Result<Arc<Version>, String> {
         // 复制当前版本的所有文件
-        let mut new_files: Vec<Vec<Arc<FileMetaData>>> = self
-            .current
-            .all_files()
-            .fold(vec![Vec::new(); self.options.num_levels], |mut acc, (level, file)| {
+        let mut new_files: Vec<Vec<Arc<FileMetaData>>> = self.current.all_files().fold(
+            vec![Vec::new(); self.options.num_levels],
+            |mut acc, (level, file)| {
                 acc[level].push(file);
                 acc
-            });
+            },
+        );
 
         // 应用删除的文件
         for (level, file_num) in &edit.deleted_files {
@@ -434,7 +433,8 @@ mod tests {
     #[test]
     fn test_versionset_new() {
         let temp_dir = TempDir::new().unwrap();
-        let vs = VersionSet::new(temp_dir.path(), "leveldb.BytewiseComparator".to_string()).unwrap();
+        let vs =
+            VersionSet::new(temp_dir.path(), "leveldb.BytewiseComparator".to_string()).unwrap();
 
         assert_eq!(vs.current().num_levels(), 7);
         assert_eq!(vs.next_file_number(), 1);
@@ -449,10 +449,7 @@ mod tests {
             VersionSet::new(temp_dir.path(), "leveldb.BytewiseComparator".to_string()).unwrap();
 
         let mut edit = VersionEdit::new();
-        edit.add_file(
-            0,
-            make_file_meta(1, b"a", b"z", 1000),
-        );
+        edit.add_file(0, make_file_meta(1, b"a", b"z", 1000));
 
         vs.apply_edit(edit).unwrap();
 

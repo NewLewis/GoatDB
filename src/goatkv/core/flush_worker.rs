@@ -91,22 +91,7 @@ impl FlushWorker {
             // 在不持有锁的情况下处理数据
             let entries: Vec<(Vec<u8>, Vec<u8>)> = imm_table
                 .iter()
-                .map(|(key, value)| {
-                    let mut serialized_key = Vec::new();
-                    serialized_key.extend_from_slice(key.user_key());
-                    // 关键修正：使用 Big Endian 并取反 (!seq)
-                    // 原因：
-                    // 1. 我们希望 Sequence Number 越大，Key 越小 (Logical Order: Seq Desc)
-                    // 2. SSTable 字节序排序是 Ascending
-                    // 3. !seq (取反) 后，大 Seq 变成小数值
-                    // 4. Big Endian 保证字节序比较等同于数值比较
-                    // 例如:
-                    // Seq 200 (Encoded) -> !200 -> Small Value -> Small Bytes -> First in SSTable
-                    // Seq 100 (Encoded) -> !100 -> Large Value -> Large Bytes -> Later in SSTable
-                    serialized_key
-                        .extend_from_slice(&(!key.encoded_sequence_number()).to_be_bytes());
-                    (serialized_key, value.to_vec())
-                })
+                .map(|(key, value)| (key.serialize(), value.to_vec()))
                 .collect();
 
             // 在不持有锁的情况下写入 SSTable

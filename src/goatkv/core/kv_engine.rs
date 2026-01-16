@@ -118,16 +118,19 @@ impl KvEngine {
     }
 
     /// 获取 VersionSet 引用（用于测试和元数据访问）
-    #[allow(dead_code)]
     pub fn version_set(&self) -> Arc<RwLock<crate::goatkv::metadata::version_set::VersionSet>> {
         let state = self.lsm_state.read().unwrap();
         state.version_set.clone()
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let lsm_state = self.lsm_state.read().unwrap();
-        let mem_table = lsm_state.mem_table.clone();
-        let immutable_mem_tables = lsm_state.immutable_mem_tables.clone();
+        let (mem_table, immutable_mem_tables, version_set) = {
+            let lsm_state = self.lsm_state.read().unwrap();
+            let mem_table = lsm_state.mem_table.clone();
+            let immutable_mem_tables = lsm_state.immutable_mem_tables.clone();
+            let version_set = lsm_state.version_set.clone();
+            (mem_table, immutable_mem_tables, version_set)
+        };
 
         // First check memtable
         if let Some((internal_key, value)) = mem_table.get(key) {
@@ -146,6 +149,15 @@ impl KvEngine {
                 } else {
                     return None;
                 }
+            }
+        }
+
+        let vs_reader = VersionSetReader::new(version_set.clone());
+        if let Some((internal_key, value)) = vs_reader.get(key) {
+            if internal_key.kind() != InternalKeyKind::Delete {
+                return Some(value);
+            } else {
+                return None;
             }
         }
 

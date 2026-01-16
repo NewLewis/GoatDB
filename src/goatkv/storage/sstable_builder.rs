@@ -2,6 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 
 use crate::goatkv::encoding::coding;
+use crate::goatkv::encoding::internal_key::InternalKey;
 use crate::goatkv::metadata::version_edit::FileMetaData;
 use crate::goatkv::storage::block_builder::BlockBuilder;
 use crate::goatkv::storage::bloom_builder::BloomBuilder;
@@ -238,13 +239,9 @@ impl SSTableBuilder {
         // 将key添加到布隆过滤器
         // 注意：BloomFilter 应该索引 UserKey，以便于查询
         // key 是 InternalKey (UserKey + 8 bytes Seq/Kind)
-        if key.len() >= 8 {
-            let user_key = &key[..key.len() - 8];
-            self.bloom_builder.add(user_key);
-        } else {
-            // Fallback (should not happen for valid InternalKey)
-            self.bloom_builder.add(key);
-        }
+        debug_assert!(key.len() >= 8);
+        let user_key = &key[..key.len() - 8];
+        self.bloom_builder.add(user_key);
     }
 
     /// 完成当前数据块的构建并写入文件
@@ -272,14 +269,18 @@ impl SSTableBuilder {
 
         // 计算separator用于索引
         // separator是用于索引的特殊key，表示该数据块的key范围
-        let separator = Self::compute_separator(last_key, key);
+        // 只用userkey来计算
+        let separator_user_key =
+            Self::compute_separator(&last_key[0..last_key.len() - 8], &key[0..key.len() - 8]);
+        let separator = InternalKey::new_separator(separator_user_key);
 
         // 将separator和数据块信息添加到索引块
         // 索引格式：separator -> (block_offset, block_size)
         let mut separator_val = Vec::new();
         coding::put_varint64(&mut separator_val, self.offset);
         coding::put_varint64(&mut separator_val, block_content.len() as u64);
-        self.index_block_builder.add(&separator, &separator_val);
+        self.index_block_builder
+            .add(&separator.serialize(), &separator_val);
 
         // 将数据块写入文件
         self.writer.write_all(block_content).unwrap();
