@@ -23,6 +23,8 @@ pub struct DbPathManager {
     log_dir: PathBuf,
     /// 临时文件目录
     tmp_dir: PathBuf,
+    /// CURRENT文件路径
+    current_file: PathBuf,
 }
 
 impl DbPathManager {
@@ -42,6 +44,7 @@ impl DbPathManager {
         let wal_dir = base_path.join("wal");
         let log_dir = base_path.join("log");
         let tmp_dir = base_path.join("tmp");
+        let current_file = base_path.join("CURRENT");
 
         let manager = Self {
             base_path,
@@ -49,6 +52,7 @@ impl DbPathManager {
             wal_dir,
             log_dir,
             tmp_dir,
+            current_file,
         };
 
         // 创建所有目录
@@ -269,6 +273,11 @@ impl DbPathManager {
         self.data_dir.join(name.as_ref())
     }
 
+    /// 获取CURRENT文件路径
+    pub fn current_file(&self) -> &Path {
+        &self.current_file
+    }
+
     /// 根据 file_id 生成 SSTable 文件路径
     ///
     /// # 参数
@@ -447,6 +456,7 @@ impl DbPathManager {
             (&self.wal_dir, "wal_dir"),
             (&self.log_dir, "log_dir"),
             (&self.tmp_dir, "tmp_dir"),
+            (&self.current_file, "current_file"),
         ];
 
         for (dir, name) in dirs.iter() {
@@ -472,8 +482,14 @@ impl DbPathManager {
              Data: {:?}\n\
              WAL:  {:?}\n\
              Log:  {:?}\n\
-             Temp: {:?}",
-            self.base_path, self.data_dir, self.wal_dir, self.log_dir, self.tmp_dir,
+             Temp: {:?}\n\
+             Current: {:?}",
+            self.base_path,
+            self.data_dir,
+            self.wal_dir,
+            self.log_dir,
+            self.tmp_dir,
+            self.current_file,
         )
     }
 }

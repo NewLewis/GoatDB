@@ -73,12 +73,8 @@ impl KvEngine {
         // 创建 LSM 状态管理器（内部会创建 VersionSet）
         let lsm_state = Arc::new(RwLock::new(LSMState::new(&options)));
 
-        // 创建后台刷盘 Worker（从 lsm_state 获取 VersionSet）
-        let version_set = {
-            let state = lsm_state.read().unwrap();
-            state.version_set.clone()
-        };
-        let flush_worker = FlushWorker::new(lsm_state.clone(), version_set);
+        // 创建后台刷盘 Worker
+        let flush_worker = FlushWorker::new(lsm_state.clone());
 
         Ok(Self {
             wal_manager: Arc::new(Mutex::new(wal_manager)),
@@ -143,7 +139,7 @@ impl KvEngine {
         }
 
         // Then check immutable memtables in order (newer first)
-        for table in immutable_mem_tables {
+        for table in immutable_mem_tables.iter().rev() {
             if let Some((internal_key, value)) = table.get(key) {
                 if internal_key.kind() != InternalKeyKind::Delete {
                     return Some(value);
@@ -248,29 +244,29 @@ impl KvEngine {
     }
 
     pub fn flush(&self) {
-        let mem_table = {
+        let immutable_mem_table = {
             let mut state = self.lsm_state.write().unwrap();
 
             // 克隆当前的 memtable
             let mem_table = state.mem_table.clone();
 
             // 创建 immutable_mem_table
-            let immutable_mem_table = ImmutableMemTable::new(mem_table.inner());
+            let immutable_mem_table = Arc::new(ImmutableMemTable::new(mem_table.inner()));
 
             // 将 immutable_mem_table 放入队列并创建新的 memtable
             state
                 .immutable_mem_tables
-                .push_front(Arc::new(immutable_mem_table));
+                .push_back(immutable_mem_table.clone());
             state.mem_table = Arc::new(MemTable::new(self.options.mem_table_size));
 
-            mem_table
+            immutable_mem_table
         };
 
         // 发送 flush 任务到后台线程
         let task_id = self.flush_task_id.fetch_add(1, Ordering::SeqCst);
         if let Err(e) = self.flush_worker.submit_task(FlushTask {
             id: task_id,
-            mem_table,
+            immutable_mem_table,
         }) {
             eprintln!("Failed to send flush task: {}", e);
         }
