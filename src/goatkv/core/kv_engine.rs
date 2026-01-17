@@ -6,6 +6,8 @@ use crate::goatkv::core::flush_worker::{FlushTask, FlushWorker};
 use crate::goatkv::core::lsm_state::LSMState;
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
 use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
+use crate::goatkv::metadata::current;
+use crate::goatkv::metadata::manifest::{ManifestWriter, INIT_MANIFEST_FILE_NAME};
 use crate::goatkv::metadata::version_set_reader::VersionSetReader;
 use crate::goatkv::storage::wal_manager::{WalIterator, WalManager};
 use crate::goatkv::utils::db_path_manager::DbPathManager;
@@ -57,6 +59,25 @@ impl KvEngine {
 
         // 获取主 WAL 文件路径
         let wal_path = DbPathManager::global().main_wal_path();
+
+        // 如果 CURRENT文件不存在，则创建它
+        if !current::current_path().exists() {
+            match current::find_latest_manifest() {
+                Ok(Some(manifest_name)) => {
+                    current::write_current(&manifest_name).expect("Failed to write current file");
+                }
+                Ok(None) | Err(_) => {
+                    // 创建初始 MANIFEST 文件
+                    let db_path_manager = DbPathManager::global();
+                    let manifest_path = db_path_manager.data_dir().join(INIT_MANIFEST_FILE_NAME);
+                    let _ = ManifestWriter::create(&manifest_path)?;
+                    // 创建current文件，并写入当前 MANIFEST 文件名到 CURRENT 文件
+                    current::write_current(INIT_MANIFEST_FILE_NAME)
+                        .expect("Failed to write current file");
+                }
+            }
+        } else {
+        }
 
         // 创建内存表
         let mut mem_table = MemTable::new(options.mem_table_size);

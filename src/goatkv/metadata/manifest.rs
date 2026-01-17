@@ -4,6 +4,8 @@ use std::path::Path;
 
 use crate::goatkv::metadata::version_edit::VersionEdit;
 
+pub const INIT_MANIFEST_FILE_NAME: &str = "MANIFEST-0";
+
 /// MANIFEST 文件写入器
 #[derive(Debug)]
 pub struct ManifestWriter {
@@ -36,10 +38,7 @@ impl ManifestWriter {
 
     /// 从已有文件创建（用于恢复后追加）
     pub fn open_for_append(path: &Path, file_number: u64) -> Result<Self, std::io::Error> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
 
         // 获取当前文件大小
         let metadata = file.metadata()?;

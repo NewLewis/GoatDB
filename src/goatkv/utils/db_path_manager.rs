@@ -23,8 +23,6 @@ pub struct DbPathManager {
     log_dir: PathBuf,
     /// 临时文件目录
     tmp_dir: PathBuf,
-    /// CURRENT文件路径
-    current_file: PathBuf,
 }
 
 impl DbPathManager {
@@ -44,7 +42,6 @@ impl DbPathManager {
         let wal_dir = base_path.join("wal");
         let log_dir = base_path.join("log");
         let tmp_dir = base_path.join("tmp");
-        let current_file = base_path.join("CURRENT");
 
         let manager = Self {
             base_path,
@@ -52,7 +49,6 @@ impl DbPathManager {
             wal_dir,
             log_dir,
             tmp_dir,
-            current_file,
         };
 
         // 创建所有目录
@@ -273,11 +269,6 @@ impl DbPathManager {
         self.data_dir.join(name.as_ref())
     }
 
-    /// 获取CURRENT文件路径
-    pub fn current_file(&self) -> &Path {
-        &self.current_file
-    }
-
     /// 根据 file_id 生成 SSTable 文件路径
     ///
     /// # 参数
@@ -481,14 +472,8 @@ impl DbPathManager {
              Data: {:?}\n\
              WAL:  {:?}\n\
              Log:  {:?}\n\
-             Temp: {:?}\n\
-             Current: {:?}",
-            self.base_path,
-            self.data_dir,
-            self.wal_dir,
-            self.log_dir,
-            self.tmp_dir,
-            self.current_file,
+             Temp: {:?}",
+            self.base_path, self.data_dir, self.wal_dir, self.log_dir, self.tmp_dir,
         )
     }
 }
@@ -738,26 +723,6 @@ mod tests {
 
         // 临时目录本身应该仍然存在
         assert!(manager.tmp_dir().exists());
-    }
-
-    #[test]
-    fn test_validate_paths() {
-        // 使用独立的测试环境，避免与其他测试冲突
-        std::env::set_var("GOATDB_TEST_MODE", "true");
-
-        let temp_dir = tempdir().unwrap();
-        let manager = DbPathManager::new(temp_dir.path()).unwrap();
-
-        // 创建 CURRENT 文件以满足 validate_paths 的要求
-        // 注意：create_directories 只创建目录，不创建 CURRENT 文件
-        // 但 validate_paths 期望 CURRENT 文件存在
-        // 这是一个程序代码的问题，但为了测试通过，我们创建这个文件
-        std::fs::File::create(&manager.current_file).unwrap();
-
-        // 应该验证通过（所有目录和 CURRENT 文件都已创建）
-        manager.validate_paths().unwrap();
-
-        std::env::remove_var("GOATDB_TEST_MODE");
     }
 
     #[test]
