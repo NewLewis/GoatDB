@@ -1,9 +1,11 @@
 use std::collections::HashSet;
 
 use crate::goatkv::encoding::coding;
+use crate::goatkv::metadata::file_metadata::{FileMetadata, TableProperties};
 
 // 类型别名，增加代码可读性
 type Level = usize;
+type FileId = u64;
 
 const TAG_COMPARATOR: u32 = 1;
 const TAG_LOG_NUMBER: u32 = 2;
@@ -13,9 +15,57 @@ const TAG_COMPACT_POINTER: u32 = 5;
 const TAG_DELETED_FILE: u32 = 6;
 const TAG_NEW_FILE: u32 = 7;
 
+#[derive(Debug)]
+pub struct NewFile {
+    pub file_id: FileId,
+    pub props: TableProperties,
+}
+
+impl NewFile {
+    pub fn new(
+        file_id: FileId,
+        file_size: u64,
+        smallest_key: Vec<u8>,
+        largest_key: Vec<u8>,
+        smallest_seqno: u64,
+        largest_seqno: u64,
+    ) -> Self {
+        Self {
+            file_id,
+            props: TableProperties {
+                file_size,
+                smallest_key,
+                largest_key,
+                smallest_seqno,
+                largest_seqno,
+            },
+        }
+    }
+
+    pub fn new_with_props(file_id: FileId, props: TableProperties) -> Self {
+        NewFile { file_id, props }
+    }
+
+    pub fn file_id(&self) -> FileId {
+        self.file_id
+    }
+
+    pub fn file_size(&self) -> u64 {
+        self.props.file_size
+    }
+
+    pub fn smallest_key(&self) -> &[u8] {
+        &self.props.smallest_key
+    }
+
+    pub fn largest_key(&self) -> &[u8] {
+        &self.props.largest_key
+    }
+}
+
 /// VersionEdit 记录了一次状态变更的增量
 /// 它可以被序列化后追加写到 MANIFEST 文件中
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct VersionEdit {
     // 1. 全局状态字段 (Option 表示该次 Edit 是否修改了这个值)
     pub comparator_name: Option<String>, // 用于检查打开 DB 时比较器是否匹配
@@ -34,7 +84,7 @@ pub struct VersionEdit {
 
     // 4. 新增的文件
     // 记录 (Level, FileMetadata)。Compaction 会产生新文件并放到特定 Level。
-    pub new_files: Vec<(Level, FileMetadata)>,
+    pub new_files: Vec<(Level, NewFile)>,
 }
 
 impl VersionEdit {
@@ -64,8 +114,8 @@ impl VersionEdit {
 
     // 记录新生成的文件
     // 注意：这里传入 FileMetadata，通常在 Compaction 完成后构建
-    pub fn add_file(&mut self, level: Level, meta: FileMetadata) {
-        self.new_files.push((level, meta));
+    pub fn add_file(&mut self, level: Level, file: NewFile) {
+        self.new_files.push((level, file));
     }
 
     // 序列化为字节流（用于写 MANIFEST）
@@ -117,9 +167,9 @@ impl VersionEdit {
             coding::put_varint64(&mut buf, TAG_NEW_FILE as u64);
             coding::put_varint64(&mut buf, *level as u64);
             coding::put_varint64(&mut buf, meta.file_id);
-            coding::put_varint64(&mut buf, meta.file_size);
-            coding::put_length_prefixed_slice(&mut buf, &meta.smallest_key);
-            coding::put_length_prefixed_slice(&mut buf, &meta.largest_key);
+            coding::put_varint64(&mut buf, meta.file_size());
+            coding::put_length_prefixed_slice(&mut buf, &meta.smallest_key());
+            coding::put_length_prefixed_slice(&mut buf, &meta.largest_key());
         }
 
         buf
@@ -189,14 +239,14 @@ impl VersionEdit {
                     cursor += bytes_read;
                     edit.new_files.push((
                         level as usize,
-                        FileMetadata {
+                        NewFile::new(
                             file_id,
                             file_size,
-                            smallest_key: smallest_key.to_vec(),
-                            largest_key: largest_key.to_vec(),
-                            smallest_seqno: 0,
-                            largest_seqno: 0,
-                        },
+                            smallest_key.to_vec(),
+                            largest_key.to_vec(),
+                            0,
+                            0,
+                        ),
                     ));
                 }
                 _ => {

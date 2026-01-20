@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -30,7 +29,8 @@ pub struct VersionSet {
 
     // 全局序列号生成器
     log_number: u64,
-    prev_log_number: u64, // 很多时候需要记录前一个日志号以防崩溃
+    // todo 防止青黄不接的状态
+    // prev_log_number: u64, // 很多时候需要记录前一个日志号以防崩溃
     next_file_number: u64,
     last_sequence: u64,
 
@@ -72,15 +72,16 @@ impl Default for VersionSetOptions {
 
 impl VersionSet {
     /// 创建一个新的空 VersionSet（用于新数据库）
-    pub fn new(db_path: &Path) -> Result<Self, std::io::Error> {
+    pub fn new(db_path: &Path, obsolete_sender: Sender<u64>) -> Result<Self, std::io::Error> {
         let options = VersionSetOptions::default();
-        Self::new_with_options(db_path, options)
+        Self::new_with_options(db_path, options, obsolete_sender)
     }
 
     /// 使用指定选项创建 VersionSet
     pub fn new_with_options(
         db_path: &Path,
         options: VersionSetOptions,
+        obsolete_sender: Sender<u64>,
     ) -> Result<Self, std::io::Error> {
         // 创建空的当前版本
         let current = Arc::new(Version::new(options.num_levels));
@@ -93,9 +94,9 @@ impl VersionSet {
             log_number: 0,
             next_file_number: 1,
             last_sequence: 0,
-            obsolete_sender: Vec::new(),
+            obsolete_sender,
             db_path: db_path.to_path_buf(),
-            options,
+            options: Arc::new(options),
         })
     }
 

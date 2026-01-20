@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::goatkv::encoding::internal_key::InternalKey;
-use crate::goatkv::metadata::file_metadata::FileMetadata;
+use crate::goatkv::metadata::file_metadata::{TableProperties, FileMetadata;
 use crate::goatkv::storage::sstable_reader::SSTableReader;
 use crate::goatkv::utils::db_path_manager::DbPathManager;
 
@@ -246,10 +246,12 @@ mod tests {
         largest_key: &[u8],
         size: u64,
     ) -> Arc<FileMetadata> {
+        let (tx, rx) = std::sync::mpsc::channel();
         let props = TableProperties::new(size, smallest_key, largest_key, 0, 0);
         Arc::new(FileMetadata {
             file_id,
-            properties: props,
+            props: props,
+            tx,
         })
     }
 
