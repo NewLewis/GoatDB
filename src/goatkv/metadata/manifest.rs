@@ -2,6 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
+use crate::goatkv::metadata::current;
 use crate::goatkv::metadata::version_edit::VersionEdit;
 
 pub const INIT_MANIFEST_FILE_NAME: &str = "MANIFEST-0";
@@ -87,6 +88,64 @@ impl ManifestWriter {
     }
 }
 
+#[derive(Debug)]
+pub struct ManifestHandler {
+    writer: Option<ManifestWriter>,
+    file_number: u64,
+}
+
+impl ManifestHandler {
+    // 1. 恢复流程：读取 CURRENT，找到并重放 Manifest
+    pub fn recover(db_path: &Path) -> Result<Vec<VersionEdit>, std::io::Error> {
+        // Step 1: Read CURRENT file content (e.g., "MANIFEST-00005\n")
+        match current::read_current() {
+            Ok(Some(file_name)) => {
+                // Step 2: Open that MANIFEST file
+                let manifest_path = db_path.join(&file_name);
+                let mut reader = ManifestReader::new(&manifest_path)?;
+                let mut edits = Vec::new();
+
+                // Step 3: Replay all edits
+                loop {
+                    if let Ok(Some(edit)) = reader.read_next_edit() {
+                        edits.push(edit);
+                    } else {
+                        break;
+                    }
+                }
+
+                // Step 4: Return (last_sequence, edits)
+                return Ok(edits);
+            }
+            Ok(None) => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    // 2. 写入新状态：LogAndApply 的核心部分
+    pub fn add_record(&mut self, edit: &VersionEdit) -> Result<(), std::io::Error> {
+        // Step 1: 将 edit 序列化并 append 到当前的 MANIFEST 文件
+        self.writer.as_mut().unwrap().append_edit(edit)?;
+
+        // Step 2 (Optional but recommended):
+        // 如果 Manifest 太大了，生成一个新的 MANIFEST 文件，
+        // 并原子更新 CURRENT 文件指向它。
+        // todo
+        Ok(())
+    }
+
+    // 3. 原子更新 CURRENT 文件 (关键!)
+    pub fn set_current_file(&self, manifest_file_number: u64) -> Result<()> {
+        // 技巧：先写到临时文件 CURRENT.tmp，然后 rename 为 CURRENT
+        // 保证 crash safe
+        let tmp_path = self.db_path.join("CURRENT.tmp");
+        let content = format!("MANIFEST-{:06}\n", manifest_file_number);
+        std::fs::write(&tmp_path, content)?;
+        std::fs::rename(&tmp_path, self.db_path.join("CURRENT"))?;
+        Ok(())
+    }
+}
+
 /// MANIFEST 文件读取器（用于恢复）
 pub struct ManifestReader {
     reader: BufReader<File>,
@@ -94,7 +153,7 @@ pub struct ManifestReader {
 
 impl ManifestReader {
     /// 打开 MANIFEST 文件读取
-    pub fn open(path: &Path) -> Result<Self, std::io::Error> {
+    pub fn new(path: &Path) -> Result<Self, std::io::Error> {
         let file = File::open(path)?;
         Ok(ManifestReader {
             reader: BufReader::new(file),

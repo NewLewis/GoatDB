@@ -1,7 +1,10 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::goatkv::encoding::internal_key::InternalKey;
 use crate::goatkv::metadata::version_edit::FileMetaData;
+use crate::goatkv::storage::sstable_reader::SSTableReader;
+use crate::goatkv::utils::db_path_manager::DbPathManager;
 
 /// Version 代表某一时刻数据库的完整状态
 /// 一旦创建后不可修改，支持并发无锁读取
@@ -45,19 +48,54 @@ impl Version {
 
     /// 查找包含指定 key 的 SSTable
     /// 返回 (level, file_meta) 如果找到
-    pub fn get(&self, key: &[u8]) -> Option<(usize, Arc<FileMetaData>)> {
+    pub fn get(&self, key: &[u8]) -> Option<(InternalKey, Vec<u8>)> {
         // 先检查 Level 0
+        // todo level 0的遍历顺序问题
         for file in &self.files[0] {
             // Level 0 的文件可能重叠，需要检查所有文件
+            // todo key的比较，以及smallest_key存的是什么？
             if key >= file.smallest_key.as_slice() && key <= file.largest_key.as_slice() {
-                return Some((0, Arc::clone(file)));
+                // key在文件范围中，说明该文件中可能包含key
+                let sstable_path = DbPathManager::global().sstable_path_by_id(file.file_id);
+                match SSTableReader::open(&sstable_path) {
+                    Ok(mut reader) => {
+                        match reader.get(key) {
+                            Ok(Some(result)) => return Some(result),
+                            Ok(None) => continue, // Not found in this sstable, check next
+                            Err(e) => {
+                                println!("Failed to read from sstable {:?}: {}", sstable_path, e);
+                                return None;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("Failed to open sstable {:?}: {}", sstable_path, e);
+                        return None;
+                    }
+                }
             }
         }
 
         // 对于其他层级，由于文件不重叠且有序，可以使用二分查找
         for level in 1..self.files.len() {
             if let Some(file) = self.search_level(level, key) {
-                return Some((level, file));
+                let sstable_path = DbPathManager::global().sstable_path_by_id(file.file_id);
+                match SSTableReader::open(&sstable_path) {
+                    Ok(mut reader) => {
+                        match reader.get(key) {
+                            Ok(Some(result)) => return Some(result),
+                            Ok(None) => return None, // Not found in this sstable, check next
+                            Err(e) => {
+                                println!("Failed to read from sstable {:?}: {}", sstable_path, e);
+                                return None;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("Failed to open sstable {:?}: {}", sstable_path, e);
+                        return None;
+                    }
+                }
             }
         }
 
