@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::goatkv::encoding::internal_key::InternalKey;
-use crate::goatkv::metadata::version_edit::FileMetaData;
+use crate::goatkv::metadata::file_metadata::FileMetadata;
 use crate::goatkv::storage::sstable_reader::SSTableReader;
 use crate::goatkv::utils::db_path_manager::DbPathManager;
 
@@ -11,8 +11,8 @@ use crate::goatkv::utils::db_path_manager::DbPathManager;
 #[derive(Debug, Clone)]
 pub struct Version {
     /// 每层包含的 SSTable 文件元数据
-    /// files[level] = Vec<Arc<FileMetaData>>
-    files: Vec<Vec<Arc<FileMetaData>>>,
+    /// files[level] = Vec<Arc<FileMetadata>>
+    files: Vec<Vec<Arc<FileMetadata>>>,
 
     /// 每层的总大小（用于触发压缩）
     level_size_bytes: Vec<u64>,
@@ -32,11 +32,11 @@ impl Version {
     }
 
     /// 从文件列表构建 Version
-    pub fn from_files(files: Vec<Vec<Arc<FileMetaData>>>, creation_seqno: u64) -> Self {
+    pub fn from_files(files: Vec<Vec<Arc<FileMetadata>>>, creation_seqno: u64) -> Self {
         // 计算层级大小
         let level_size_bytes: Vec<u64> = files
             .iter()
-            .map(|level_files| level_files.iter().map(|f| f.file_size).sum())
+            .map(|level_files| level_files.iter().map(|f| f.file_size()).sum())
             .collect();
 
         Self {
@@ -105,7 +105,7 @@ impl Version {
 
     /// 在指定层级（非 Level 0）中查找包含 key 的文件
     /// 使用二分查找，因为该层级的文件按键有序且不重叠
-    fn search_level(&self, level: usize, key: &[u8]) -> Option<Arc<FileMetaData>> {
+    fn search_level(&self, level: usize, key: &[u8]) -> Option<Arc<FileMetadata>> {
         let files = &self.files[level];
         if files.is_empty() {
             return None;
@@ -133,7 +133,7 @@ impl Version {
     }
 
     /// 获取指定层级的所有文件
-    pub fn get_files(&self, level: usize) -> &[Arc<FileMetaData>] {
+    pub fn get_files(&self, level: usize) -> &[Arc<FileMetadata>] {
         if level >= self.files.len() {
             &[]
         } else {
@@ -161,7 +161,7 @@ impl Version {
     }
 
     /// 获取所有文件（用于遍历）
-    pub fn all_files(&self) -> impl Iterator<Item = (usize, Arc<FileMetaData>)> + '_ {
+    pub fn all_files(&self) -> impl Iterator<Item = (usize, Arc<FileMetadata>)> + '_ {
         self.files
             .iter()
             .enumerate()
@@ -201,7 +201,7 @@ impl Version {
         level: usize,
         smallest_key: &[u8],
         largest_key: &[u8],
-    ) -> Vec<Arc<FileMetaData>> {
+    ) -> Vec<Arc<FileMetadata>> {
         if level >= self.files.len() {
             return Vec::new();
         }
@@ -211,9 +211,7 @@ impl Version {
         if level == 0 {
             // Level 0: 需要检查所有文件
             for file in &self.files[level] {
-                if file.smallest_key.as_slice() <= largest_key
-                    && file.largest_key.as_slice() >= smallest_key
-                {
+                if file.smallest_key() <= largest_key && file.largest_key() >= smallest_key {
                     overlapping.push(Arc::clone(file));
                 }
             }
@@ -222,11 +220,11 @@ impl Version {
             let files = &self.files[level];
             for file in files {
                 // 文件在范围左侧
-                if file.largest_key.as_slice() < smallest_key {
+                if file.largest_key() < smallest_key {
                     continue;
                 }
                 // 文件在范围右侧
-                if file.smallest_key.as_slice() > largest_key {
+                if file.smallest_key() > largest_key {
                     break;
                 }
                 // 文件与范围重叠
@@ -247,14 +245,11 @@ mod tests {
         smallest_key: &[u8],
         largest_key: &[u8],
         size: u64,
-    ) -> Arc<FileMetaData> {
-        Arc::new(FileMetaData {
+    ) -> Arc<FileMetadata> {
+        let props = TableProperties::new(size, smallest_key, largest_key, 0, 0);
+        Arc::new(FileMetadata {
             file_id,
-            file_size: size,
-            smallest_key: smallest_key.to_vec(),
-            largest_key: largest_key.to_vec(),
-            smallest_seqno: 0,
-            largest_seqno: 0,
+            properties: props,
         })
     }
 

@@ -3,7 +3,7 @@ use std::io::{self, Write};
 
 use crate::goatkv::encoding::coding;
 use crate::goatkv::encoding::internal_key::InternalKey;
-use crate::goatkv::metadata::version_edit::FileMetaData;
+use crate::goatkv::metadata::file_metadata::TableProperties;
 use crate::goatkv::storage::block_builder::BlockBuilder;
 use crate::goatkv::storage::bloom_builder::BloomBuilder;
 use crate::goatkv::utils::db_path_manager::DbPathManager;
@@ -313,7 +313,7 @@ impl SSTableBuilder {
     /// - 内部会自动flush缓冲区
     ///
     /// # 返回值
-    /// 返回 `FileMetaData`，包含文件的完整元数据：
+    /// 返回 `FileMetadata`，包含文件的完整元数据：
     /// - file_id: SSTable 的唯一标识符
     /// - file_size: 文件总大小
     /// - path: SSTable 文件路径
@@ -332,7 +332,7 @@ impl SSTableBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn finish(&mut self) -> io::Result<FileMetaData> {
+    pub fn finish(&mut self) -> io::Result<TableProperties> {
         // 如果有未完成的数据块，先完成它
         if !self.data_block_builder.empty() {
             let (block_content, last_key) = self.data_block_builder.finish();
@@ -393,12 +393,11 @@ impl SSTableBuilder {
         // 刷新缓冲区，确保所有数据写入磁盘
         self.writer.flush()?;
 
-        // 创建并返回 FileMetaData
+        // 创建并返回 FileMetadata
         // 注意：smallest_key 和 largest_key 应该是 InternalKey，但为了简化，这里直接存储原始 key
         // 序列号信息可以从 InternalKey 中解析出来（如果需要）
         // 路径可以根据 file_id 和数据目录由调用方生成
-        let file_metadata = FileMetaData {
-            file_id: self.id,
+        let file_metadata = TableProperties {
             file_size: self.offset, // offset 现在是完整的文件大小
             smallest_key: self.smallest_key.clone().unwrap_or_default(),
             largest_key: self.largest_key.clone().unwrap_or_default(),
@@ -959,8 +958,8 @@ mod tests {
         assert!(index_size > 0, "IndexBlock should have data");
     }
 
-    /// 测试 FileMetaData 集成
-    /// 验证 SSTableBuilder 可以正确创建包含 FileMetaData 的 SSTable
+    /// 测试 FileMetadata 集成
+    /// 验证 SSTableBuilder 可以正确创建包含 FileMetadata 的 SSTable
     #[test]
     fn test_sstable_with_file_metadata() {
         let temp_dir = TempDir::new().unwrap();
@@ -973,11 +972,10 @@ mod tests {
         write_for_test(&mut builder, b"banana", b"fruit2");
         write_for_test(&mut builder, b"cherry", b"fruit3");
 
-        // 完成构建，获取 FileMetaData
+        // 完成构建，获取 FileMetadata
         let metadata = builder.finish().unwrap();
 
-        // 验证 FileMetaData 字段
-        assert_eq!(metadata.file_id, 1);
+        // 验证 FileMetadata 字段
         assert!(metadata.file_size > 0);
 
         // 验证 smallest_key 和 largest_key
@@ -998,7 +996,7 @@ mod tests {
         let actual_file_size = std::fs::metadata(&sstable_path).unwrap().len();
         assert_eq!(metadata.file_size, actual_file_size);
 
-        // 演示如何将 FileMetaData 添加到 VersionEdit
+        // 演示如何将 FileMetadata 添加到 VersionEdit
         use crate::goatkv::metadata::version_edit::VersionEdit;
         let mut version_edit = VersionEdit::new();
         version_edit.add_file(0, metadata.clone()); // 添加到 Level 0
@@ -1007,7 +1005,7 @@ mod tests {
         assert_eq!(version_edit.new_files[0].1.file_id, 1);
     }
 
-    /// 测试空 SSTable 的 FileMetaData
+    /// 测试空 SSTable 的 FileMetadata
     #[test]
     fn test_empty_sstable_metadata() {
         let temp_dir = TempDir::new().unwrap();
@@ -1018,8 +1016,7 @@ mod tests {
         // 立即完成，不写入任何数据
         let metadata = builder.finish().unwrap();
 
-        // 验证 FileMetaData 字段
-        assert_eq!(metadata.file_id, 1);
+        // 验证 FileMetadata 字段
         assert!(metadata.file_size > 0); // 至少包含 Footer
         assert!(metadata.smallest_key.is_empty());
         assert!(metadata.largest_key.is_empty());

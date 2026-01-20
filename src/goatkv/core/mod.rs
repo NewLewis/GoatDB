@@ -1,5 +1,6 @@
 // LSM Tree 核心组件
 // 设计文档：docs/goatkv/core/skip_list_implementation.md（跳表实现详解）
+pub mod cleanup_worker;
 pub mod flush_worker;
 pub mod kv_engine;
 pub mod lsm_state;

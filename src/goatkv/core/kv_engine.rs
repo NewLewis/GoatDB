@@ -2,15 +2,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::goatkv::core::cleanup_worker::CleanupWorker;
 use crate::goatkv::core::flush_worker::{FlushTask, FlushWorker};
 use crate::goatkv::core::lsm_state::LSMState;
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
 use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
 use crate::goatkv::metadata::current;
 use crate::goatkv::metadata::manifest::{ManifestWriter, INIT_MANIFEST_FILE_NAME};
-use crate::goatkv::metadata::version_set_reader::VersionSetReader;
 use crate::goatkv::storage::wal_manager::{WalIterator, WalManager};
-use crate::goatkv::utils::db_path_manager::DbPathManager;
+use crate::goatkv::utils::db_path_manager::{self, DbPathManager};
 use crate::goatkv::utils::options::KvEngineOptions;
 use crate::goatkv::utils::sequence_number::SequenceNumber;
 
@@ -27,6 +27,8 @@ pub struct KvEngine {
     options: Arc<KvEngineOptions>,
     /// 后台刷盘 Worker
     flush_worker: FlushWorker,
+    /// 后台清理 Worker
+    cleanup_worker: CleanupWorker,
     /// 当前正在执行的 FlushTask 的 ID
     flush_task_id: AtomicUsize,
 }
@@ -94,8 +96,11 @@ impl KvEngine {
         // 创建 LSM 状态管理器（内部会创建 VersionSet）
         let lsm_state = Arc::new(RwLock::new(LSMState::new(&options)));
 
+        let (cleanup_worker, obsolete_sender) =
+            CleanupWorker::new(DbPathManager::global().data_dir().into());
+
         // 创建后台刷盘 Worker
-        let flush_worker = FlushWorker::new(lsm_state.clone());
+        let flush_worker = FlushWorker::new(lsm_state.clone(), obsolete_sender);
 
         Ok(Self {
             wal_manager: Arc::new(Mutex::new(wal_manager)),
@@ -103,6 +108,7 @@ impl KvEngine {
             lsm_state,
             options: Arc::new(options),
             flush_worker,
+            cleanup_worker,
             flush_task_id: AtomicUsize::new(0),
         })
     }

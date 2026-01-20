@@ -4,7 +4,6 @@ use crate::goatkv::encoding::coding;
 
 // 类型别名，增加代码可读性
 type Level = usize;
-type FileId = u64;
 
 const TAG_COMPARATOR: u32 = 1;
 const TAG_LOG_NUMBER: u32 = 2;
@@ -13,51 +12,6 @@ const TAG_LAST_SEQUENCE: u32 = 4;
 const TAG_COMPACT_POINTER: u32 = 5;
 const TAG_DELETED_FILE: u32 = 6;
 const TAG_NEW_FILE: u32 = 7;
-
-/// FileMetaData 描述了一个具体的 SSTable 文件的元数据
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileMetaData {
-    pub file_id: FileId,
-    pub file_size: u64,
-    // 最小 Key 和 最大 Key 用于读路径上的快速过滤
-    // 必须存储为 Vec<u8> 因为 Key 是二进制安全的
-    pub smallest_key: Vec<u8>,
-    pub largest_key: Vec<u8>,
-
-    // 可选：记录该文件的生成序列号范围，用于 MVCC
-    pub smallest_seqno: u64,
-    pub largest_seqno: u64,
-}
-
-impl FileMetaData {
-    pub fn new(
-        file_id: FileId,
-        file_size: u64,
-        smallest_key: Vec<u8>,
-        largest_key: Vec<u8>,
-        smallest_seqno: u64,
-        largest_seqno: u64,
-    ) -> Self {
-        FileMetaData {
-            file_id,
-            file_size,
-            smallest_key,
-            largest_key,
-            smallest_seqno,
-            largest_seqno,
-        }
-    }
-
-    pub fn smallest_user_key(&self) -> &[u8] {
-        assert!(self.smallest_key.len() >= 8);
-        &self.smallest_key[..self.smallest_key.len() - 8]
-    }
-
-    pub fn largest_user_key(&self) -> &[u8] {
-        assert!(self.largest_key.len() >= 8);
-        &self.largest_key[..self.largest_key.len() - 8]
-    }
-}
 
 /// VersionEdit 记录了一次状态变更的增量
 /// 它可以被序列化后追加写到 MANIFEST 文件中
@@ -79,8 +33,8 @@ pub struct VersionEdit {
     pub deleted_files: HashSet<(Level, FileId)>,
 
     // 4. 新增的文件
-    // 记录 (Level, FileMetaData)。Compaction 会产生新文件并放到特定 Level。
-    pub new_files: Vec<(Level, FileMetaData)>,
+    // 记录 (Level, FileMetadata)。Compaction 会产生新文件并放到特定 Level。
+    pub new_files: Vec<(Level, FileMetadata)>,
 }
 
 impl VersionEdit {
@@ -109,8 +63,8 @@ impl VersionEdit {
     }
 
     // 记录新生成的文件
-    // 注意：这里传入 FileMetaData，通常在 Compaction 完成后构建
-    pub fn add_file(&mut self, level: Level, meta: FileMetaData) {
+    // 注意：这里传入 FileMetadata，通常在 Compaction 完成后构建
+    pub fn add_file(&mut self, level: Level, meta: FileMetadata) {
         self.new_files.push((level, meta));
     }
 
@@ -235,7 +189,7 @@ impl VersionEdit {
                     cursor += bytes_read;
                     edit.new_files.push((
                         level as usize,
-                        FileMetaData {
+                        FileMetadata {
                             file_id,
                             file_size,
                             smallest_key: smallest_key.to_vec(),

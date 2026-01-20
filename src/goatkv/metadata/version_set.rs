@@ -1,48 +1,46 @@
+use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use crate::goatkv::metadata::manifest::ManifestWriter;
 use crate::goatkv::metadata::version::Version;
-use crate::goatkv::metadata::version_edit::{FileMetaData, VersionEdit};
+use crate::goatkv::metadata::version_edit::{FileMetadata, VersionEdit};
 
 /// VersionSet 管理所有版本和增量变更
 #[derive(Debug)]
 pub struct VersionSet {
-    /// 当前活跃版本（读取操作的视图）
+    // ---------------- 版本管理 ----------------
+    /// 只是一个简单的 ID 计数器，还是实际的 Version 链表头？
+    /// 建议：使用双向链表管理 Version 或者是 VecDeque，
+    /// dummy_versions 节点通常用于作为链表头方便插入删除。
+    /// 这里简化为使用 Vec，但在高频写入下 Vec 的 remove 开销可能是 O(N)。
+    versions: VecDeque<Arc<Version>>,
+
+    // 注意：`current` 其实通常就是 versions.back()，
+    // 单独存一个字段为了方便读取是可以的。
     current: Arc<Version>,
 
-    /// 历史版本列表（用于旧读取操作和压缩）
-    versions: Vec<Arc<Version>>,
+    // ---------------- 持久化 & 元数据 ----------------
 
-    /// 增量变更列表（用于重放）
-    version_edits: Vec<VersionEdit>,
-
-    /// MANIFEST 文件管理
-    manifest_file: Option<ManifestWriter>,
+    // 建议把 Manifest 相关的封装到一个独立的 struct 中，分离关注点
+    manifest_writer: Option<ManifestWriter>,
     manifest_file_number: u64,
 
-    /// 全局状态
+    // 全局序列号生成器
     log_number: u64,
+    prev_log_number: u64, // 很多时候需要记录前一个日志号以防崩溃
     next_file_number: u64,
     last_sequence: u64,
-    comparator_name: String,
 
-    /// SSTable 引用计数
-    /// file_id -> count，用于判断文件是否可删除
-    file_refs: HashMap<u64, usize>,
+    /// 待物理删除的文件列表。
+    /// 建议直接存 FileMetadata 或 file_number
+    obsolete_sender: Sender<u64>,
 
-    /// 待删除的 SSTable 文件
-    obsolete_files: Vec<FileMetaData>,
-
-    /// 待处理的删除文件 ID（引用计数归零但还未从版本中移除）
-    pending_deletion: HashSet<u64>,
-
-    /// 数据库目录
+    // ---------------- 环境配置 ----------------
     db_path: PathBuf,
-
-    /// 配置选项
-    options: VersionSetOptions,
+    options: Arc<VersionSetOptions>, // Options 通常只读，用 Arc 共享
 }
 
 /// VersionSet 配置选项（内部使用，通过 KvEngineOptions 配置）
@@ -74,15 +72,14 @@ impl Default for VersionSetOptions {
 
 impl VersionSet {
     /// 创建一个新的空 VersionSet（用于新数据库）
-    pub fn new(db_path: &Path, comparator_name: String) -> Result<Self, std::io::Error> {
+    pub fn new(db_path: &Path) -> Result<Self, std::io::Error> {
         let options = VersionSetOptions::default();
-        Self::new_with_options(db_path, comparator_name, options)
+        Self::new_with_options(db_path, options)
     }
 
     /// 使用指定选项创建 VersionSet
     pub fn new_with_options(
         db_path: &Path,
-        comparator_name: String,
         options: VersionSetOptions,
     ) -> Result<Self, std::io::Error> {
         // 创建空的当前版本
@@ -90,17 +87,13 @@ impl VersionSet {
 
         Ok(Self {
             current,
-            versions: Vec::new(),
-            version_edits: Vec::new(),
-            manifest_file: None,
+            versions: VecDeque::new(),
+            manifest_writer: None,
             manifest_file_number: 0,
             log_number: 0,
             next_file_number: 1,
             last_sequence: 0,
-            comparator_name,
-            file_refs: HashMap::new(),
-            obsolete_files: Vec::new(),
-            pending_deletion: HashSet::new(),
+            obsolete_sender: Vec::new(),
             db_path: db_path.to_path_buf(),
             options,
         })
@@ -208,7 +201,7 @@ impl VersionSet {
     /// 创建新 Version
     fn create_new_version(&self, edit: &VersionEdit) -> Result<Arc<Version>, String> {
         // 复制当前版本的所有文件
-        let mut new_files: Vec<Vec<Arc<FileMetaData>>> = self.current.all_files().fold(
+        let mut new_files: Vec<Vec<Arc<FileMetadata>>> = self.current.all_files().fold(
             vec![Vec::new(); self.options.num_levels],
             |mut acc, (level, file)| {
                 acc[level].push(file);
@@ -267,7 +260,7 @@ impl VersionSet {
     }
 
     /// 查找文件元数据（从所有版本中查找）
-    fn find_file_meta(&self, file_id: u64) -> Option<FileMetaData> {
+    fn find_file_meta(&self, file_id: u64) -> Option<FileMetadata> {
         // 先从当前版本查找
         for (_, file) in self.current.all_files() {
             if file.file_id == file_id {
@@ -363,7 +356,7 @@ impl VersionSet {
     }
 
     /// 获取待删除的文件
-    pub fn obsolete_files(&self) -> &[FileMetaData] {
+    pub fn obsolete_files(&self) -> &[FileMetadata] {
         &self.obsolete_files
     }
 
@@ -415,8 +408,8 @@ mod tests {
         smallest_key: &[u8],
         largest_key: &[u8],
         size: u64,
-    ) -> FileMetaData {
-        FileMetaData {
+    ) -> FileMetadata {
+        FileMetadata {
             file_id,
             file_size: size,
             smallest_key: smallest_key.to_vec(),

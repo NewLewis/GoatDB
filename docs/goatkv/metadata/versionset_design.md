@@ -17,8 +17,8 @@ VersionSet 是 GoatDB 的核心元数据管理组件，负责：
 /// 代表某一时刻数据库的完整状态
 pub struct Version {
     /// 每层包含的 SSTable 文件元数据
-    /// files[level] = Vec<FileMetaData>
-    files: Vec<Vec<Arc<FileMetaData>>>,
+    /// files[level] = Vec<FileMetadata>
+    files: Vec<Vec<Arc<FileMetadata>>>,
 
     /// 用于快速查找的索引
     /// key -> (level, file_id) 映射，加速查找
@@ -33,10 +33,10 @@ pub struct Version {
 
 impl Version {
     /// 查找包含指定 key 的 SSTable
-    pub fn get(&self, key: &[u8]) -> Option<(usize, Arc<FileMetaData>)>;
+    pub fn get(&self, key: &[u8]) -> Option<(usize, Arc<FileMetadata>)>;
 
     /// 获取指定层级的所有文件
-    pub fn get_files(&self, level: usize) -> &[Arc<FileMetaData>];
+    pub fn get_files(&self, level: usize) -> &[Arc<FileMetadata>];
 
     /// 计算层级总大小
     pub fn get_level_size(&self, level: usize) -> u64;
@@ -82,7 +82,7 @@ pub struct VersionSet {
     file_refs: HashMap<u64, usize>,
 
     /// 待删除的 SSTable 文件
-    obsolete_files: Vec<FileMetaData>,
+    obsolete_files: Vec<FileMetadata>,
 
     /// 配置选项
     options: VersionSetOptions,
@@ -494,7 +494,7 @@ impl VersionSet {
 // 在 flush_worker.rs 中
 
 impl FlushWorker {
-    fn flush_memtable(&mut self, memtable: ImmutableMemTable) -> Result<FileMetaData> {
+    fn flush_memtable(&mut self, memtable: ImmutableMemTable) -> Result<FileMetadata> {
         // 1. 构建 SSTable
         let (meta, reader) = self.build_sstable(memtable)?;
 
@@ -698,7 +698,7 @@ pub const LEVEL_COMPACTION_TRIGGER: [usize; 7] = [
 ## 性能考虑
 
 ### 内存优化
-- Version 使用 Arc 共享 FileMetaData
+- Version 使用 Arc 共享 FileMetadata
 - 限制历史版本数量
 - 文件索引使用 HashMap 加速查找
 
@@ -716,6 +716,6 @@ pub const LEVEL_COMPACTION_TRIGGER: [usize; 7] = [
 
 1. **压缩调度器**：基于 Version 信息调度压缩
 2. **统计信息**：每个文件的读取/写入统计
-3. **布隆过滤器**：集成到 FileMetaData
+3. **布隆过滤器**：集成到 FileMetadata
 4. **快照功能**：支持用户创建时间点快照
 5. **增量备份**：基于 VersionEdit 的增量备份

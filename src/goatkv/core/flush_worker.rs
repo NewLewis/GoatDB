@@ -3,6 +3,7 @@ use std::thread;
 
 use crate::goatkv::core::lsm_state::LSMState;
 use crate::goatkv::core::mem_table::ImmutableMemTable;
+use crate::goatkv::metadata::file_metadata::FileMetadata;
 use crate::goatkv::metadata::version_edit::VersionEdit;
 use crate::goatkv::storage::sstable_builder::SSTableBuilder;
 
@@ -31,11 +32,11 @@ impl FlushWorker {
     ///
     /// # 返回
     /// 返回新创建的 FlushWorker 实例
-    pub fn new(lsm_state: Arc<RwLock<LSMState>>) -> Self {
+    pub fn new(lsm_state: Arc<RwLock<LSMState>>, obsolete_sender: mpsc::Sender<u64>) -> Self {
         let (tx, rx) = mpsc::channel();
 
         let handle = thread::spawn(move || {
-            Self::run_loop(rx, lsm_state);
+            Self::run_loop(rx, lsm_state, obsolete_sender);
         });
 
         Self {
@@ -63,7 +64,11 @@ impl FlushWorker {
     /// 2. 创建 SSTable 文件
     /// 3. 创建 VersionEdit 并应用到 VersionSet
     /// 4. 移除已刷盘的 immutable memtable
-    fn run_loop(rx: mpsc::Receiver<FlushTask>, lsm_state: Arc<RwLock<LSMState>>) {
+    fn run_loop(
+        rx: mpsc::Receiver<FlushTask>,
+        lsm_state: Arc<RwLock<LSMState>>,
+        obsolete_sender: mpsc::Sender<u64>,
+    ) {
         while let Ok(task) = rx.recv() {
             // 从任务中获取要刷盘的 immutable memtable
             let imm_table = task.immutable_mem_table.clone();
@@ -99,13 +104,18 @@ impl FlushWorker {
                 sst_builder.write(&key, &value);
             }
 
-            let metadata = match sst_builder.finish() {
+            let props = match sst_builder.finish() {
                 Ok(meta) => meta,
                 Err(e) => {
                     eprintln!("Failed to finish SSTable {}: {}", task.id, e);
                     continue;
                 }
             };
+            let metadata = Arc::new(FileMetadata {
+                file_id,
+                props,
+                obsolete_sender,
+            });
 
             // 创建 VersionEdit 记录新增的 SSTable
             let mut version_edit = VersionEdit::new();
