@@ -29,6 +29,36 @@ pub struct FileMetaData {
     pub largest_seqno: u64,
 }
 
+impl FileMetaData {
+    pub fn new(
+        file_id: FileId,
+        file_size: u64,
+        smallest_key: Vec<u8>,
+        largest_key: Vec<u8>,
+        smallest_seqno: u64,
+        largest_seqno: u64,
+    ) -> Self {
+        FileMetaData {
+            file_id,
+            file_size,
+            smallest_key,
+            largest_key,
+            smallest_seqno,
+            largest_seqno,
+        }
+    }
+
+    pub fn smallest_user_key(&self) -> &[u8] {
+        assert!(self.smallest_key.len() >= 8);
+        &self.smallest_key[..self.smallest_key.len() - 8]
+    }
+
+    pub fn largest_user_key(&self) -> &[u8] {
+        assert!(self.largest_key.len() >= 8);
+        &self.largest_key[..self.largest_key.len() - 8]
+    }
+}
+
 /// VersionEdit 记录了一次状态变更的增量
 /// 它可以被序列化后追加写到 MANIFEST 文件中
 #[derive(Debug, Clone, Default)]
@@ -153,7 +183,8 @@ impl VersionEdit {
 
             match tag as u32 {
                 TAG_COMPARATOR => {
-                    let (name_data, bytes_read) = coding::get_length_prefixed_slice(&data[cursor..])?;
+                    let (name_data, bytes_read) =
+                        coding::get_length_prefixed_slice(&data[cursor..])?;
                     cursor += bytes_read;
                     edit.comparator_name = Some(String::from_utf8_lossy(name_data).to_string());
                 }
@@ -182,20 +213,25 @@ impl VersionEdit {
                 TAG_DELETED_FILE => {
                     let (level, bytes_read) = coding::decode_varint64_with_length(&data[cursor..])?;
                     cursor += bytes_read;
-                    let (file_id, bytes_read) = coding::decode_varint64_with_length(&data[cursor..])?;
+                    let (file_id, bytes_read) =
+                        coding::decode_varint64_with_length(&data[cursor..])?;
                     cursor += bytes_read;
                     edit.deleted_files.insert((level as usize, file_id));
                 }
                 TAG_NEW_FILE => {
                     let (level, bytes_read) = coding::decode_varint64_with_length(&data[cursor..])?;
                     cursor += bytes_read;
-                    let (file_id, bytes_read) = coding::decode_varint64_with_length(&data[cursor..])?;
+                    let (file_id, bytes_read) =
+                        coding::decode_varint64_with_length(&data[cursor..])?;
                     cursor += bytes_read;
-                    let (file_size, bytes_read) = coding::decode_varint64_with_length(&data[cursor..])?;
+                    let (file_size, bytes_read) =
+                        coding::decode_varint64_with_length(&data[cursor..])?;
                     cursor += bytes_read;
-                    let (smallest_key, bytes_read) = coding::get_length_prefixed_slice(&data[cursor..])?;
+                    let (smallest_key, bytes_read) =
+                        coding::get_length_prefixed_slice(&data[cursor..])?;
                     cursor += bytes_read;
-                    let (largest_key, bytes_read) = coding::get_length_prefixed_slice(&data[cursor..])?;
+                    let (largest_key, bytes_read) =
+                        coding::get_length_prefixed_slice(&data[cursor..])?;
                     cursor += bytes_read;
                     edit.new_files.push((
                         level as usize,

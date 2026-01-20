@@ -48,13 +48,14 @@ impl Version {
 
     /// 查找包含指定 key 的 SSTable
     /// 返回 (level, file_meta) 如果找到
+    // todo table cache
     pub fn get(&self, key: &[u8]) -> Option<(InternalKey, Vec<u8>)> {
         // 先检查 Level 0
         // todo level 0的遍历顺序问题
         for file in &self.files[0] {
             // Level 0 的文件可能重叠，需要检查所有文件
-            // todo key的比较，以及smallest_key存的是什么？
-            if key >= file.smallest_key.as_slice() && key <= file.largest_key.as_slice() {
+            // smallest_key和largest_key都存在的是internal_key不能直接用于比较，需要转换为user_key进行比较
+            if key >= file.smallest_user_key() && key <= file.largest_user_key() {
                 // key在文件范围中，说明该文件中可能包含key
                 let sstable_path = DbPathManager::global().sstable_path_by_id(file.file_id);
                 match SSTableReader::open(&sstable_path) {
@@ -118,9 +119,9 @@ impl Version {
             let mid = left + (right - left) / 2;
             let file = &files[mid];
 
-            if key < file.smallest_key.as_slice() {
+            if key < file.smallest_user_key() {
                 right = mid;
-            } else if key > file.largest_key.as_slice() {
+            } else if key > file.largest_user_key() {
                 left = mid + 1;
             } else {
                 // key 在这个文件的范围内

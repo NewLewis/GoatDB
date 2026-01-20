@@ -135,7 +135,7 @@ impl ManifestHandler {
     }
 
     // 3. 原子更新 CURRENT 文件 (关键!)
-    pub fn set_current_file(&self, manifest_file_number: u64) -> Result<()> {
+    pub fn update_current_file(&self, manifest_file_number: u64) -> Result<()> {
         // 技巧：先写到临时文件 CURRENT.tmp，然后 rename 为 CURRENT
         // 保证 crash safe
         let tmp_path = self.db_path.join("CURRENT.tmp");
@@ -262,7 +262,7 @@ mod tests {
 
         // 读取所有编辑
         {
-            let mut reader = ManifestReader::open(&manifest_path).unwrap();
+            let mut reader = ManifestReader::new(&manifest_path).unwrap();
             let edits = reader.read_all_edits().unwrap();
 
             assert_eq!(edits.len(), 2);
@@ -281,7 +281,7 @@ mod tests {
 
         // 读取应该返回空列表
         {
-            let mut reader = ManifestReader::open(&manifest_path).unwrap();
+            let mut reader = ManifestReader::new(&manifest_path).unwrap();
             let edits = reader.read_all_edits().unwrap();
 
             assert_eq!(edits.len(), 0);

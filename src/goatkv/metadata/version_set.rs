@@ -530,7 +530,7 @@ mod tests {
         // 读取
         {
             use crate::goatkv::metadata::manifest::ManifestReader;
-            let mut reader = ManifestReader::open(&manifest_path).unwrap();
+            let mut reader = ManifestReader::new(&manifest_path).unwrap();
             let edits = reader.read_all_edits().unwrap();
 
             assert_eq!(edits.len(), 1);
