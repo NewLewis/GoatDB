@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::goatkv::encoding::coding;
-use crate::goatkv::metadata::file_metadata::{FileMetadata, TableProperties};
+use crate::goatkv::metadata::file_metadata::TableProperties;
 
 // 类型别名，增加代码可读性
 type Level = usize;
@@ -15,7 +15,7 @@ const TAG_COMPACT_POINTER: u32 = 5;
 const TAG_DELETED_FILE: u32 = 6;
 const TAG_NEW_FILE: u32 = 7;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NewFile {
     pub file_id: FileId,
     pub props: TableProperties,

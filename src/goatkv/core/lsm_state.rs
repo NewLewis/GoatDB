@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::RwLock;
 
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
 use crate::goatkv::metadata::version::Version;
@@ -13,7 +12,7 @@ pub struct LSMState {
     /// 不可变内存表队列（待刷盘）
     pub immutable_mem_tables: VecDeque<Arc<ImmutableMemTable>>,
     /// VersionSet 管理所有 SSTable 元数据
-    pub version_set: Arc<Version>,
+    pub version: Arc<Version>,
 }
 
 impl LSMState {

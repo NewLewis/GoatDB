@@ -119,7 +119,7 @@ impl FlushWorker {
 
             // 创建 VersionEdit 记录新增的 SSTable
             let mut version_edit = VersionEdit::new();
-            version_edit.add_file(0, metadata.clone());
+            version_edit.add_file(0, metadata.into());
 
             // 应用 VersionEdit 到 VersionSet
             {

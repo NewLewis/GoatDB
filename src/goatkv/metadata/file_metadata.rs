@@ -1,5 +1,7 @@
 use std::sync::mpsc::Sender;
 
+use crate::goatkv::metadata::version_edit::NewFile;
+
 #[derive(Debug, Clone)]
 pub struct TableProperties {
     pub file_size: u64,
@@ -40,10 +42,18 @@ pub struct FileMetadata {
 }
 
 impl FileMetadata {
-    pub fn new(file_id: u64, props: TableProperties, obsolete_sender: Sender<u64>) -> Self {
+    pub fn from_props(file_id: u64, props: TableProperties, obsolete_sender: Sender<u64>) -> Self {
         FileMetadata {
             file_id,
             props,
+            obsolete_sender,
+        }
+    }
+
+    pub fn from_new_file(new_file: NewFile, obsolete_sender: Sender<u64>) -> Self {
+        FileMetadata {
+            file_id: new_file.file_id,
+            props: new_file.props,
             obsolete_sender,
         }
     }
@@ -68,5 +78,14 @@ impl FileMetadata {
 
     pub fn largest_key(&self) -> &[u8] {
         &self.props.largest_key
+    }
+}
+
+impl From<FileMetadata> for NewFile {
+    fn from(metadata: FileMetadata) -> Self {
+        NewFile {
+            file_id: metadata.file_id,
+            props: metadata.props,
+        }
     }
 }

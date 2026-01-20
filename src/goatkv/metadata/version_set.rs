@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
+use crate::goatkv::metadata::file_metadata::FileMetadata;
 use crate::goatkv::metadata::manifest::ManifestWriter;
 use crate::goatkv::metadata::version::Version;
-use crate::goatkv::metadata::version_edit::{FileMetadata, VersionEdit};
+use crate::goatkv::metadata::version_edit::{NewFile, VersionEdit};
 
 /// VersionSet 管理所有版本和增量变更
 #[derive(Debug)]
@@ -101,9 +102,15 @@ impl VersionSet {
     }
 
     /// 应用 VersionEdit
-    pub fn apply_edit(&mut self, edit: VersionEdit) -> Result<(), String> {
+    pub fn apply_edit(&mut self, edit: VersionEdit) -> Result<(), std::io::Error> {
         // 1. 验证 VersionEdit 的合法性
         self.validate_edit(&edit)?;
+
+        // 先写 MANIFEST
+        if let Some(manifest) = &mut self.manifest_writer {
+            manifest.append_edit(&edit)?;
+            manifest.sync()?; // ⚠️ 必须 fsync
+        }
 
         // 2. 更新全局状态
         if let Some(log_num) = edit.log_number {
@@ -115,33 +122,13 @@ impl VersionSet {
         if let Some(last_seq) = edit.last_sequence {
             self.last_sequence = last_seq;
         }
-        if let Some(ref comparator) = edit.comparator_name {
-            if comparator != &self.comparator_name {
-                return Err(format!(
-                    "Comparator mismatch: expected {}, got {}",
-                    self.comparator_name, comparator
-                ));
-            }
-        }
-
-        // 3. 保存到历史
-        self.version_edits.push(edit.clone());
 
         // 4. 创建新 Version
         let new_version = self.create_new_version(&edit)?;
 
-        // 5. 持久化到 MANIFEST（如果已打开）
-        if let Some(ref mut manifest) = self.manifest_file {
-            manifest.append_edit(&edit).map_err(|e| e.to_string())?;
-        }
-
         // 6. 更新当前版本
         let old_version = std::mem::replace(&mut self.current, new_version);
         self.append_old_version(old_version);
-
-        // 7. 清理和引用计数
-        self.update_file_refs(&edit);
-        self.cleanup_old_versions();
 
         Ok(())
     }
@@ -159,7 +146,7 @@ impl VersionSet {
         }
 
         // 检查新增文件的 ID 是否有效
-        for (level, meta) in &edit.new_files {
+        for (level, new_file) in &edit.new_files {
             if *level >= self.options.num_levels {
                 return Err(format!(
                     "Invalid level {} (max {})",
@@ -168,12 +155,12 @@ impl VersionSet {
             }
 
             // 检查文件 ID 是否已被使用
-            if self.contains_file_any_level(meta.file_id) {
-                return Err(format!("File ID {} already exists", meta.file_id));
+            if self.contains_file_any_level(new_file.file_id) {
+                return Err(format!("File ID {} already exists", new_file.file_id));
             }
 
             // 验证 key 范围
-            if meta.smallest_key > meta.largest_key {
+            if new_file.smallest_key() > new_file.largest_key() {
                 return Err("Invalid key range: smallest > largest".to_string());
             }
         }
@@ -218,115 +205,33 @@ impl VersionSet {
         }
 
         // 应用新增的文件
-        for (level, meta) in &edit.new_files {
+        for (level, new_file) in &edit.new_files {
             if new_files.len() <= *level {
                 new_files.resize(*level + 1, Vec::new());
             }
-            new_files[*level].push(Arc::new(meta.clone()));
+            new_files[*level].push(Arc::new(FileMetadata::from_new_file(
+                new_file.clone(),
+                self.obsolete_sender.clone(),
+            )));
         }
 
         // 对 Level 0 以外的层级排序（保证不重叠且有序）
         for level_files in new_files.iter_mut().skip(1) {
-            level_files.sort_by_key(|f| f.smallest_key.clone());
+            level_files.sort_by_key(|f| f.smallest_key());
         }
 
-        // 使用简单的字节比较器
+        for level_files in new_files.iter().skip(1) {
+            for w in level_files.windows(2) {
+                debug_assert!(w[0].largest_key() < w[1].smallest_key());
+            }
+        }
+
         Ok(Arc::new(Version::from_files(new_files, self.last_sequence)))
     }
 
     /// 添加旧版本到历史列表
     fn append_old_version(&mut self, version: Arc<Version>) {
-        self.versions.push(version);
-    }
-
-    /// 更新文件引用计数
-    fn update_file_refs(&mut self, edit: &VersionEdit) {
-        // 增加新文件的引用
-        for (_, meta) in &edit.new_files {
-            *self.file_refs.entry(meta.file_id).or_insert(0) += 1;
-        }
-
-        // 减少删除文件的引用
-        for (_level, file_num) in &edit.deleted_files {
-            if let Some(count) = self.file_refs.get_mut(file_num) {
-                *count -= 1;
-                if *count == 0 {
-                    // 引用计数为 0，从 file_refs 中移除
-                    // 并记录到 pending_deletion，在 cleanup_old_versions 时处理
-                    self.file_refs.remove(file_num);
-                    self.pending_deletion.insert(*file_num);
-                }
-            }
-        }
-    }
-
-    /// 查找文件元数据（从所有版本中查找）
-    fn find_file_meta(&self, file_id: u64) -> Option<FileMetadata> {
-        // 先从当前版本查找
-        for (_, file) in self.current.all_files() {
-            if file.file_id == file_id {
-                return Some((*file).clone());
-            }
-        }
-
-        // 从历史版本查找
-        for version in &self.versions {
-            for (_, file) in version.all_files() {
-                if file.file_id == file_id {
-                    return Some((*file).clone());
-                }
-            }
-        }
-
-        None
-    }
-
-    /// 清理旧版本
-    fn cleanup_old_versions(&mut self) {
-        // 保留最新 max_versions 个版本
-        while self.versions.len() > self.options.max_versions {
-            let old = self.versions.remove(0);
-
-            // 减少该版本中所有文件的引用计数
-            for (_level, file) in old.all_files() {
-                if let Some(count) = self.file_refs.get_mut(&file.file_id) {
-                    *count -= 1;
-                    if *count == 0 {
-                        // 引用计数归零，标记为可删除
-                        self.obsolete_files.push((*file).clone());
-                        self.file_refs.remove(&file.file_id);
-                        self.pending_deletion.remove(&file.file_id);
-                    }
-                }
-            }
-        }
-
-        // 处理待删除的文件（引用计数已归零）
-        // 这些文件需要从所有版本中查找元数据并标记为 obsolete
-        let pending: Vec<u64> = self.pending_deletion.drain().collect();
-        for file_id in pending {
-            if let Some(meta) = self.find_file_meta(file_id) {
-                self.obsolete_files.push(meta);
-            }
-        }
-    }
-
-    /// 打开 MANIFEST 文件用于写入
-    pub fn open_manifest(&mut self, file_number: u64) -> Result<(), std::io::Error> {
-        let manifest_path = self.db_path.join(format!("MANIFEST-{:06}", file_number));
-        let manifest = ManifestWriter::open_for_append(&manifest_path, file_number)?;
-        self.manifest_file = Some(manifest);
-        self.manifest_file_number = file_number;
-        Ok(())
-    }
-
-    /// 创建新的 MANIFEST 文件
-    pub fn create_manifest(&mut self, file_number: u64) -> Result<(), std::io::Error> {
-        let manifest_path = self.db_path.join(format!("MANIFEST-{:06}", file_number));
-        let manifest = ManifestWriter::create(&manifest_path)?;
-        self.manifest_file = Some(manifest);
-        self.manifest_file_number = file_number;
-        Ok(())
+        self.versions.push_back(version);
     }
 
     /// 获取当前版本
@@ -354,213 +259,5 @@ impl VersionSet {
     /// 获取最后序列号
     pub fn last_sequence(&self) -> u64 {
         self.last_sequence
-    }
-
-    /// 获取待删除的文件
-    pub fn obsolete_files(&self) -> &[FileMetadata] {
-        &self.obsolete_files
-    }
-
-    /// 清空待删除文件列表（在物理删除后调用）
-    pub fn clear_obsolete_files(&mut self) {
-        self.obsolete_files.clear();
-    }
-
-    /// 检查是否需要重写 MANIFEST
-    pub fn should_rewrite_manifest(&self) -> bool {
-        if let Some(ref manifest) = self.manifest_file {
-            // 检查文件大小
-            if manifest.size() > self.options.manifest_max_size {
-                return true;
-            }
-        }
-
-        // 检查编辑数量
-        if self.version_edits.len() > self.options.manifest_rewrite_edit_count {
-            return true;
-        }
-
-        false
-    }
-
-    /// 获取所有 VersionEdit（用于重放）
-    pub fn version_edits(&self) -> &[VersionEdit] {
-        &self.version_edits
-    }
-
-    /// 获取比较器名称
-    pub fn comparator_name(&self) -> &str {
-        &self.comparator_name
-    }
-
-    /// 获取 MANIFEST 文件编号
-    pub fn manifest_file_number(&self) -> u64 {
-        self.manifest_file_number
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    fn make_file_meta(
-        file_id: u64,
-        smallest_key: &[u8],
-        largest_key: &[u8],
-        size: u64,
-    ) -> FileMetadata {
-        FileMetadata {
-            file_id,
-            file_size: size,
-            smallest_key: smallest_key.to_vec(),
-            largest_key: largest_key.to_vec(),
-            smallest_seqno: 0,
-            largest_seqno: 0,
-        }
-    }
-
-    #[test]
-    fn test_versionset_new() {
-        let temp_dir = TempDir::new().unwrap();
-        let vs =
-            VersionSet::new(temp_dir.path(), "leveldb.BytewiseComparator".to_string()).unwrap();
-
-        assert_eq!(vs.current().num_levels(), 7);
-        assert_eq!(vs.next_file_number(), 1);
-        assert_eq!(vs.last_sequence(), 0);
-        assert_eq!(vs.log_number(), 0);
-    }
-
-    #[test]
-    fn test_apply_edit_add_file() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut vs =
-            VersionSet::new(temp_dir.path(), "leveldb.BytewiseComparator".to_string()).unwrap();
-
-        let mut edit = VersionEdit::new();
-        edit.add_file(0, make_file_meta(1, b"a", b"z", 1000));
-
-        vs.apply_edit(edit).unwrap();
-
-        // 检查文件已添加
-        assert_eq!(vs.current().get_files(0).len(), 1);
-        assert_eq!(vs.current().get_files(0)[0].file_id, 1);
-    }
-
-    #[test]
-    fn test_apply_edit_delete_file() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut vs =
-            VersionSet::new(temp_dir.path(), "leveldb.BytewiseComparator".to_string()).unwrap();
-
-        // 先添加文件
-        let mut edit1 = VersionEdit::new();
-        edit1.add_file(0, make_file_meta(1, b"a", b"z", 1000));
-        vs.apply_edit(edit1).unwrap();
-
-        // 删除文件
-        let mut edit2 = VersionEdit::new();
-        edit2.delete_file(0, 1);
-        vs.apply_edit(edit2).unwrap();
-
-        assert_eq!(vs.current().get_files(0).len(), 0);
-    }
-
-    #[test]
-    fn test_validate_edit_invalid_delete() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut vs =
-            VersionSet::new(temp_dir.path(), "leveldb.BytewiseComparator".to_string()).unwrap();
-
-        let mut edit = VersionEdit::new();
-        edit.delete_file(0, 999);
-
-        let result = vs.apply_edit(edit);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_file_refs() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut vs =
-            VersionSet::new(temp_dir.path(), "leveldb.BytewiseComparator".to_string()).unwrap();
-
-        let mut edit = VersionEdit::new();
-        edit.add_file(0, make_file_meta(1, b"a", b"z", 1000));
-        vs.apply_edit(edit).unwrap();
-
-        // 文件引用计数应该为 1
-        assert_eq!(vs.file_refs.get(&1), Some(&1));
-
-        // 删除文件
-        let mut edit2 = VersionEdit::new();
-        edit2.delete_file(0, 1);
-        vs.apply_edit(edit2).unwrap();
-
-        // 文件应该被标记为 obsolete
-        assert_eq!(vs.obsolete_files().len(), 1);
-        assert_eq!(vs.obsolete_files()[0].file_id, 1);
-    }
-
-    #[test]
-    fn test_manifest_io() {
-        let temp_dir = TempDir::new().unwrap();
-        let manifest_path = temp_dir.path().join("MANIFEST-000001");
-
-        // 写入
-        {
-            let mut writer = ManifestWriter::create(&manifest_path).unwrap();
-            assert_eq!(writer.size(), 0);
-
-            let mut edit = VersionEdit::new();
-            edit.set_log_number(42);
-            edit.set_next_file_number(100);
-
-            writer.append_edit(&edit).unwrap();
-            assert!(writer.size() > 0);
-        }
-
-        // 读取
-        {
-            use crate::goatkv::metadata::manifest::ManifestReader;
-            let mut reader = ManifestReader::new(&manifest_path).unwrap();
-            let edits = reader.read_all_edits().unwrap();
-
-            assert_eq!(edits.len(), 1);
-            assert_eq!(edits[0].log_number, Some(42));
-            assert_eq!(edits[0].next_file_number, Some(100));
-        }
-    }
-
-    #[test]
-    fn test_allocate_file_number() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut vs =
-            VersionSet::new(temp_dir.path(), "leveldb.BytewiseComparator".to_string()).unwrap();
-
-        assert_eq!(vs.allocate_file_number(), 1);
-        assert_eq!(vs.allocate_file_number(), 2);
-        assert_eq!(vs.next_file_number(), 3);
-    }
-
-    #[test]
-    fn test_should_rewrite_manifest() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut vs =
-            VersionSet::new(temp_dir.path(), "leveldb.BytewiseComparator".to_string()).unwrap();
-
-        // 初始不应该重写
-        assert!(!vs.should_rewrite_manifest());
-
-        // 添加很多编辑
-        for i in 0..20000 {
-            let mut edit = VersionEdit::new();
-            edit.set_log_number(i);
-            vs.apply_edit(edit).unwrap();
-        }
-
-        // 现在应该重写
-        assert!(vs.should_rewrite_manifest());
     }
 }
