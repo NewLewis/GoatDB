@@ -237,11 +237,7 @@ impl VersionSet {
         }
 
         // 使用简单的字节比较器
-        Ok(Arc::new(Version::from_files(
-            new_files,
-            self.last_sequence,
-            |a, b| a.cmp(b),
-        )))
+        Ok(Arc::new(Version::from_files(new_files, self.last_sequence)))
     }
 
     /// 添加旧版本到历史列表

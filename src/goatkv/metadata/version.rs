@@ -1,7 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::goatkv::encoding::internal_key::InternalKey;
 use crate::goatkv::metadata::version_edit::FileMetaData;
 
 /// Version 代表某一时刻数据库的完整状态
@@ -11,12 +10,6 @@ pub struct Version {
     /// 每层包含的 SSTable 文件元数据
     /// files[level] = Vec<Arc<FileMetaData>>
     files: Vec<Vec<Arc<FileMetaData>>>,
-
-    /// 用于快速查找的索引（预留，未来实现）
-    /// key -> Vec<(level, file_id)> 映射，加速查找
-    /// 注意：一个 key 可能被多个文件包含（尤其是在 Level 0）
-    #[allow(dead_code)]
-    file_index: HashMap<Vec<u8>, Vec<(usize, u64)>>,
 
     /// 每层的总大小（用于触发压缩）
     level_size_bytes: Vec<u64>,
@@ -30,18 +23,13 @@ impl Version {
     pub fn new(num_levels: usize) -> Self {
         Self {
             files: vec![Vec::new(); num_levels],
-            file_index: HashMap::new(),
             level_size_bytes: vec![0; num_levels],
             creation_seqno: 0,
         }
     }
 
     /// 从文件列表构建 Version
-    pub fn from_files(
-        files: Vec<Vec<Arc<FileMetaData>>>,
-        creation_seqno: u64,
-        _comparator: impl Fn(&[u8], &[u8]) -> std::cmp::Ordering,
-    ) -> Self {
+    pub fn from_files(files: Vec<Vec<Arc<FileMetaData>>>, creation_seqno: u64) -> Self {
         // 计算层级大小
         let level_size_bytes: Vec<u64> = files
             .iter()
@@ -50,7 +38,6 @@ impl Version {
 
         Self {
             files,
-            file_index: HashMap::new(), // 暂时留空，按需构建
             level_size_bytes,
             creation_seqno,
         }
@@ -58,7 +45,7 @@ impl Version {
 
     /// 查找包含指定 key 的 SSTable
     /// 返回 (level, file_meta) 如果找到
-    pub fn get(&self, key: &[u8], _internal_key: &InternalKey) -> Option<(usize, Arc<FileMetaData>)> {
+    pub fn get(&self, key: &[u8]) -> Option<(usize, Arc<FileMetaData>)> {
         // 先检查 Level 0
         for file in &self.files[0] {
             // Level 0 的文件可能重叠，需要检查所有文件
@@ -136,9 +123,10 @@ impl Version {
 
     /// 获取所有文件（用于遍历）
     pub fn all_files(&self) -> impl Iterator<Item = (usize, Arc<FileMetaData>)> + '_ {
-        self.files.iter().enumerate().flat_map(|(level, files)| {
-            files.iter().map(move |file| (level, Arc::clone(file)))
-        })
+        self.files
+            .iter()
+            .enumerate()
+            .flat_map(|(level, files)| files.iter().map(move |file| (level, Arc::clone(file))))
     }
 
     /// 获取所有文件 ID（用于引用计数）
@@ -209,17 +197,6 @@ impl Version {
 
         overlapping
     }
-
-    /// 创建当前版本的一个副本（不常用，主要用于测试）
-    #[allow(dead_code)]
-    pub fn clone_version(&self) -> Self {
-        Self {
-            files: self.files.clone(),
-            file_index: HashMap::new(), // 重建索引比较复杂，这里先留空
-            level_size_bytes: self.level_size_bytes.clone(),
-            creation_seqno: self.creation_seqno,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -254,10 +231,13 @@ mod tests {
     fn test_version_from_files() {
         let files = vec![
             vec![make_file_meta(1, b"a", b"z", 1000)],
-            vec![make_file_meta(2, b"a", b"m", 500), make_file_meta(3, b"n", b"z", 500)],
+            vec![
+                make_file_meta(2, b"a", b"m", 500),
+                make_file_meta(3, b"n", b"z", 500),
+            ],
         ];
 
-        let version = Version::from_files(files, 100, |a, b| a.cmp(b));
+        let version = Version::from_files(files, 100);
 
         assert_eq!(version.num_levels(), 2);
         assert_eq!(version.get_files(0).len(), 1);
@@ -278,7 +258,7 @@ mod tests {
             ],
         ];
 
-        let version = Version::from_files(files, 0, |a, b| a.cmp(b));
+        let version = Version::from_files(files, 0);
 
         // 查找存在的 key
         assert!(version.search_level(1, b"b").is_some());
@@ -308,7 +288,7 @@ mod tests {
             ],
         ];
 
-        let version = Version::from_files(files, 0, |a, b| a.cmp(b));
+        let version = Version::from_files(files, 0);
 
         // Level 0: 多个文件重叠
         let overlapping = version.get_overlapping_files(0, b"b", b"c");
@@ -328,7 +308,7 @@ mod tests {
             files[0].push(make_file_meta(i, b"a", b"z", 100));
         }
 
-        let version = Version::from_files(files.clone(), 0, |a, b| a.cmp(b));
+        let version = Version::from_files(files.clone(), 0);
 
         let level_targets = [0, 64 * 1024 * 1024, 512 * 1024 * 1024, 0, 0, 0, 0];
         assert!(version.needs_compaction(&level_targets));
@@ -338,10 +318,13 @@ mod tests {
     fn test_all_file_ids() {
         let files = vec![
             vec![make_file_meta(1, b"a", b"z", 100)],
-            vec![make_file_meta(2, b"a", b"m", 100), make_file_meta(3, b"n", b"z", 100)],
+            vec![
+                make_file_meta(2, b"a", b"m", 100),
+                make_file_meta(3, b"n", b"z", 100),
+            ],
         ];
 
-        let version = Version::from_files(files, 0, |a, b| a.cmp(b));
+        let version = Version::from_files(files, 0);
 
         let ids = version.all_file_ids();
         assert_eq!(ids.len(), 3);
