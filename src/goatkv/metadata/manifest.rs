@@ -1,10 +1,8 @@
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::Path;
 
-use crate::goatkv::metadata::current;
 use crate::goatkv::metadata::version_edit::VersionEdit;
-use crate::goatkv::utils::db_path_manager::DbPathManager;
 
 pub const INIT_MANIFEST_FILE_NAME: &str = "MANIFEST-0";
 
@@ -17,7 +15,6 @@ pub struct ManifestWriter {
 }
 
 impl ManifestWriter {
-    /// 创建新的 MANIFEST 文件
     pub fn create(path: &Path) -> Result<Self, std::io::Error> {
         let file = OpenOptions::new()
             .create(true)
@@ -28,9 +25,6 @@ impl ManifestWriter {
         let writer = BufWriter::new(file);
         let current_size = 0u64;
 
-        // 写入 MANIFEST 头部（可选，未来可以添加魔数和版本号）
-        // 目前先保持简单，直接写 VersionEdit
-
         Ok(ManifestWriter {
             writer,
             file_number: 0,
@@ -38,11 +32,9 @@ impl ManifestWriter {
         })
     }
 
-    /// 从已有文件创建（用于恢复后追加）
     pub fn open_for_append(path: &Path, file_number: u64) -> Result<Self, std::io::Error> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
 
-        // 获取当前文件大小
         let metadata = file.metadata()?;
         let current_size = metadata.len();
 
@@ -55,87 +47,30 @@ impl ManifestWriter {
         })
     }
 
-    /// 追加一条 VersionEdit
     pub fn append_edit(&mut self, edit: &VersionEdit) -> Result<(), std::io::Error> {
         let encoded = edit.encode();
         let len = encoded.len() as u64;
 
-        // 写入长度前缀
         self.writer.write_all(&len.to_be_bytes())?;
-        // 写入编码后的数据
         self.writer.write_all(&encoded)?;
         self.writer.flush()?;
 
-        self.current_size += 8 + len; // 8 bytes for length
+        self.current_size += 8 + len;
 
         Ok(())
     }
 
-    /// 获取当前文件大小
     pub fn size(&self) -> u64 {
         self.current_size
     }
 
-    /// 获取文件编号
     pub fn file_number(&self) -> u64 {
         self.file_number
     }
 
-    /// 同步到磁盘
     pub fn sync(&mut self) -> Result<(), std::io::Error> {
         self.writer.flush()?;
         self.writer.get_ref().sync_all()?;
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
-pub struct ManifestHandler {
-    writer: Option<ManifestWriter>,
-    file_number: u64,
-    db_path: PathBuf,
-}
-
-impl ManifestHandler {
-    // 1. 恢复流程：读取 CURRENT，找到并重放 Manifest
-    pub fn recover(_db_path: &Path) -> Result<Vec<VersionEdit>, std::io::Error> {
-        // Step 1: Read CURRENT file content (e.g., "MANIFEST-00005\n")
-        match current::read_current() {
-            Ok(Some(file_name)) => {
-                // Step 2: Open that MANIFEST file
-                let manifest_path = DbPathManager::global().data_dir().join(&file_name);
-                let mut reader = ManifestReader::new(&manifest_path)?;
-                let edits = reader
-                    .read_all_edits()
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-                return Ok(edits);
-            }
-            Ok(None) => Ok(Vec::new()),
-            Err(e) => Err(e),
-        }
-    }
-
-    // 2. 写入新状态：LogAndApply 的核心部分
-    pub fn add_record(&mut self, edit: &VersionEdit) -> Result<(), std::io::Error> {
-        // Step 1: 将 edit 序列化并 append 到当前的 MANIFEST 文件
-        self.writer.as_mut().unwrap().append_edit(edit)?;
-
-        // Step 2 (Optional but recommended):
-        // 如果 Manifest 太大了，生成一个新的 MANIFEST 文件，
-        // 并原子更新 CURRENT 文件指向它。
-        // todo
-        Ok(())
-    }
-
-    // 3. 原子更新 CURRENT 文件 (关键!)
-    pub fn update_current_file(&self, manifest_file_number: u64) -> io::Result<()> {
-        // 技巧：先写到临时文件 CURRENT.tmp，然后 rename 为 CURRENT
-        // 保证 crash safe
-        let tmp_path = self.db_path.join("CURRENT.tmp");
-        let content = format!("MANIFEST-{:06}\n", manifest_file_number);
-        std::fs::write(&tmp_path, content)?;
-        std::fs::rename(&tmp_path, self.db_path.join("CURRENT"))?;
         Ok(())
     }
 }
