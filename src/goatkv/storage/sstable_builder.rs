@@ -1,5 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 use crate::goatkv::encoding::coding;
 use crate::goatkv::encoding::internal_key::InternalKey;
@@ -82,8 +83,8 @@ const FOOTER_SIZE: usize = 48;
 /// # use goat_db::goatkv::utils::db_path_manager::DbPathManager;
 /// # use goat_db::goatkv::storage::sstable_builder::SSTableBuilder;
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let path_manager = DbPathManager::new("./data")?;
-/// let mut builder = SSTableBuilder::new(1, &path_manager)?;
+/// DbPathManager::init("./data")?;
+/// let mut builder = SSTableBuilder::new(1)?;
 /// builder.write(b"apple", b"fruit");
 /// builder.write(b"banana", b"fruit");
 /// builder.finish();
@@ -93,7 +94,7 @@ const FOOTER_SIZE: usize = 48;
 pub struct SSTableBuilder {
     /// 带缓冲的文件写入器
     /// 使用BufWriter提高写入性能
-    writer: io::BufWriter<File>,
+    writer: Option<io::BufWriter<File>>,
 
     /// 当前正在构建的数据块构建器
     /// 当数据块达到4KB时，会被finish并写入文件
@@ -118,6 +119,11 @@ pub struct SSTableBuilder {
     smallest_key: Option<Vec<u8>>,
     /// 最大的键（最后一个写入的键）
     largest_key: Option<Vec<u8>>,
+
+    /// 临时文件路径（写入完成后重命名）
+    tmp_path: PathBuf,
+    /// 最终文件路径
+    final_path: PathBuf,
 }
 
 impl SSTableBuilder {
@@ -165,15 +171,16 @@ impl SSTableBuilder {
     /// 此方法主要用于测试，允许使用临时DbPathManager而不影响全局单例
     pub fn new_with_manager(id: u64, db_path_manager: &DbPathManager) -> io::Result<Self> {
         let sstable_path = db_path_manager.sstable_path_by_id(id);
+        let tmp_path = db_path_manager.tmp_path(format!("sstable_{:06}.tmp", id));
 
         let file = OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
-            .open(&sstable_path)?;
+            .open(&tmp_path)?;
 
         Ok(Self {
-            writer: io::BufWriter::new(file),
+            writer: Some(io::BufWriter::new(file)),
             data_block_builder: BlockBuilder::new(),
             index_block_builder: BlockBuilder::new(),
             bloom_builder: BloomBuilder::new(),
@@ -182,6 +189,8 @@ impl SSTableBuilder {
 
             smallest_key: None,
             largest_key: None,
+            tmp_path,
+            final_path: sstable_path,
         })
     }
 
@@ -283,7 +292,11 @@ impl SSTableBuilder {
             .add(&separator.serialize(), &separator_val);
 
         // 将数据块写入文件
-        self.writer.write_all(block_content).unwrap();
+        self.writer
+            .as_mut()
+            .expect("SSTable writer missing")
+            .write_all(block_content)
+            .unwrap();
         self.offset += block_content.len() as u64;
 
         // 重置数据块构建器，准备开始新的数据块
@@ -345,7 +358,11 @@ impl SSTableBuilder {
             self.index_block_builder.add(last_key, &separator_val);
 
             // 写入最后一个数据块
-            self.writer.write_all(block_content).unwrap();
+            self.writer
+                .as_mut()
+                .expect("SSTable writer missing")
+                .write_all(block_content)
+                .unwrap();
             self.offset += block_content.len() as u64;
 
             // 重置数据块构建器
@@ -354,14 +371,22 @@ impl SSTableBuilder {
 
         // 写入BloomFilter
         // BloomFilter用于快速过滤不存在的key
-        self.writer.write_all(self.bloom_builder.bitmap()).unwrap();
+        self.writer
+            .as_mut()
+            .expect("SSTable writer missing")
+            .write_all(self.bloom_builder.bitmap())
+            .unwrap();
         let bloom_offset = self.offset;
         self.offset += self.bloom_builder.bitmap().len() as u64;
 
         // 写入IndexBlock
         // IndexBlock包含所有数据块的位置和大小信息
         let (block_content, _) = self.index_block_builder.finish();
-        self.writer.write_all(block_content).unwrap();
+        self.writer
+            .as_mut()
+            .expect("SSTable writer missing")
+            .write_all(block_content)
+            .unwrap();
         let index_offset = self.offset;
         self.offset += block_content.len() as u64;
 
@@ -374,24 +399,49 @@ impl SSTableBuilder {
         let index_offset_len = index_offset_bytes.len();
 
         // 写入两个偏移量
-        self.writer.write_all(&bloom_offset_bytes).unwrap();
-        self.writer.write_all(&index_offset_bytes).unwrap();
+        self.writer
+            .as_mut()
+            .expect("SSTable writer missing")
+            .write_all(&bloom_offset_bytes)
+            .unwrap();
+        self.writer
+            .as_mut()
+            .expect("SSTable writer missing")
+            .write_all(&index_offset_bytes)
+            .unwrap();
 
         // 填充0字节，使Footer总大小为48字节
         // Padding = 48 - (bloom_offset_len + index_offset_len + magic_len)
         // magic_len固定为8字节
         let padding = vec![0; 40 - (bloom_offset_len + index_offset_len)];
-        self.writer.write_all(&padding).unwrap();
+        self.writer
+            .as_mut()
+            .expect("SSTable writer missing")
+            .write_all(&padding)
+            .unwrap();
 
         // 写入魔数（8字节），标识文件格式
-        self.writer.write_all(&MAGIC_NUMBER.to_le_bytes()).unwrap();
+        self.writer
+            .as_mut()
+            .expect("SSTable writer missing")
+            .write_all(&MAGIC_NUMBER.to_le_bytes())
+            .unwrap();
 
         // 更新 offset 以反映 Footer 的大小
         // Footer 总大小为 48 字节
         self.offset += 48;
 
         // 刷新缓冲区，确保所有数据写入磁盘
-        self.writer.flush()?;
+        let mut writer = self
+            .writer
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "SSTable writer missing"))?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        drop(writer);
+
+        std::fs::rename(&self.tmp_path, &self.final_path)?;
+        sync_dir(self.final_path.parent().unwrap_or_else(|| std::path::Path::new(".")))?;
 
         // 创建并返回 FileMetadata
         // 注意：smallest_key 和 largest_key 应该是 InternalKey，但为了简化，这里直接存储原始 key
@@ -473,4 +523,9 @@ impl SSTableBuilder {
         // 如果其中一个key是另一个的前缀，返回last_key
         last_key.to_vec()
     }
+}
+
+fn sync_dir(path: &Path) -> io::Result<()> {
+    let dir = File::open(path)?;
+    dir.sync_all()
 }

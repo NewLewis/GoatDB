@@ -11,9 +11,15 @@ pub struct LSMState {
     /// Mutable memtable
     pub mem_table: Arc<MemTable>,
     /// Immutable memtables waiting for flush
-    pub immutable_mem_tables: VecDeque<Arc<ImmutableMemTable>>,
+    pub immutable_mem_tables: VecDeque<ImmutableMemTableEntry>,
     /// VersionSet tracks SSTable metadata
     pub version_set: Arc<RwLock<VersionSet>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImmutableMemTableEntry {
+    pub table: Arc<ImmutableMemTable>,
+    pub wal_log_number: u64,
 }
 
 impl LSMState {

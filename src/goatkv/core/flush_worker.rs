@@ -11,6 +11,8 @@ use crate::goatkv::storage::sstable_builder::SSTableBuilder;
 pub struct FlushTask {
     pub(crate) immutable_mem_table: Arc<ImmutableMemTable>,
     pub(crate) id: usize,
+    pub(crate) wal_log_number: u64,
+    pub(crate) new_log_number: u64,
 }
 
 /// 后台刷盘 Worker
@@ -31,11 +33,15 @@ impl FlushWorker {
     ///
     /// # 返回
     /// 返回新创建的 FlushWorker 实例
-    pub fn new(lsm_state: Arc<RwLock<LSMState>>, obsolete_sender: mpsc::Sender<u64>) -> Self {
+    pub fn new(
+        lsm_state: Arc<RwLock<LSMState>>,
+        obsolete_sender: mpsc::Sender<u64>,
+        wal_refcounts: Arc<std::sync::Mutex<std::collections::HashMap<u64, usize>>>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
 
         let handle = thread::spawn(move || {
-            Self::run_loop(rx, lsm_state, obsolete_sender);
+            Self::run_loop(rx, lsm_state, obsolete_sender, wal_refcounts);
         });
 
         Self {
@@ -67,6 +73,7 @@ impl FlushWorker {
         rx: mpsc::Receiver<FlushTask>,
         lsm_state: Arc<RwLock<LSMState>>,
         _obsolete_sender: mpsc::Sender<u64>,
+        wal_refcounts: Arc<std::sync::Mutex<std::collections::HashMap<u64, usize>>>,
     ) {
         while let Ok(task) = rx.recv() {
             // 从任务中获取要刷盘的 immutable memtable
@@ -111,7 +118,7 @@ impl FlushWorker {
                 Ok(meta) => meta,
                 Err(e) => {
                     eprintln!("Failed to finish SSTable {}: {}", task.id, e);
-                    continue;
+                    continue; // 保持队列状态不变，稍后重试
                 }
             };
 
@@ -119,6 +126,10 @@ impl FlushWorker {
             let mut version_edit = VersionEdit::new();
             version_edit.add_file(0, NewFile::new_with_props(file_id, props));
             version_edit.set_next_file_number(next_file_number);
+            // 在 manifest 中记录新 WAL 号，表示此前的 WAL 已可被忽略
+            if task.new_log_number > 0 {
+                version_edit.set_log_number(task.new_log_number);
+            }
             let last_sequence = {
                 let vs = version_set.read().unwrap();
                 std::cmp::max(max_sequence, vs.last_sequence())
@@ -130,15 +141,41 @@ impl FlushWorker {
                 let mut vs = version_set.write().unwrap();
                 if let Err(e) = vs.apply_edit(version_edit) {
                     eprintln!("Failed to apply VersionEdit: {}", e);
-                    continue;
+                    continue; // 不 pop_front，等待后续重试
                 }
             }
 
             // 从 immutable_mem_tables 中移除已刷盘的 memtable
             // 注意：需要获取 lsm_state 写锁，并且需要找到对应的任务
-            let mut lsm_state_guard = lsm_state.write().unwrap();
-            // 从队列前端移除（因为我们使用 push_back 和 pop_front 实现 FIFO）
-            lsm_state_guard.immutable_mem_tables.pop_front();
+            {
+                let mut lsm_state_guard = lsm_state.write().unwrap();
+                lsm_state_guard.immutable_mem_tables.pop_front();
+            }
+
+            if task.wal_log_number > 0 {
+                let should_delete = {
+                    let mut refs = wal_refcounts.lock().unwrap();
+                    if let Some(count) = refs.get_mut(&task.wal_log_number) {
+                        if *count > 1 {
+                            *count -= 1;
+                            false
+                        } else {
+                            refs.remove(&task.wal_log_number);
+                            true
+                        }
+                    } else {
+                        true
+                    }
+                };
+                if should_delete {
+                    let wal_path =
+                        crate::goatkv::utils::db_path_manager::DbPathManager::global()
+                            .wal_path_by_id(task.wal_log_number);
+                    if let Err(e) = std::fs::remove_file(&wal_path) {
+                        eprintln!("Failed to remove WAL {:?}: {}", wal_path, e);
+                    }
+                }
+            }
         }
     }
 }

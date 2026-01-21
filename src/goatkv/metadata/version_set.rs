@@ -124,6 +124,7 @@ impl VersionSet {
     ) -> Result<Self, std::io::Error> {
         let mut version_set = Self::new_with_options(db_path, options, obsolete_sender)?;
         version_set.recover_manifest()?;
+        version_set.validate_recovery()?;
         Ok(version_set)
     }
 
@@ -182,6 +183,106 @@ impl VersionSet {
         self.manifest_writer =
             Some(ManifestWriter::open_for_append(&manifest_path, manifest_file_number)?);
         self.manifest_file_number = manifest_file_number;
+
+        Ok(())
+    }
+
+    fn validate_recovery(&self) -> Result<(), std::io::Error> {
+        let version = &self.current;
+        let mut seen_files = std::collections::HashSet::new();
+
+        for (level, file) in version.all_files() {
+            if !seen_files.insert(file.file_id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Duplicate file id detected: {}", file.file_id),
+                ));
+            }
+
+            if file.smallest_key() > file.largest_key() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Invalid key range in level {} file {}",
+                        level, file.file_id
+                    ),
+                ));
+            }
+
+            let path = DbPathManager::global().sstable_path_by_id(file.file_id);
+            let metadata = std::fs::metadata(&path).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("SSTable missing {:?}: {}", path, e),
+                )
+            })?;
+            if metadata.len() < file.file_size() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "SSTable size smaller than manifest (file {}, expected {}, got {})",
+                        file.file_id,
+                        file.file_size(),
+                        metadata.len()
+                    ),
+                ));
+            }
+
+            // 尝试打开 SSTable，验证 footer/index/bloom 结构
+            crate::goatkv::storage::sstable_reader::SSTableReader::open(&path).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid SSTable {:?}: {}", path, e),
+                )
+            })?;
+        }
+
+        // 检查 Level 1+ 的文件不重叠
+        for level in 1..version.num_levels() {
+            let files = version.get_files(level);
+            for window in files.windows(2) {
+                if window[0].largest_key() >= window[1].smallest_key() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Overlapping SSTables in level {}", level),
+                    ));
+                }
+            }
+        }
+
+        // last_sequence 必须单调非递减（基础检查）
+        if self.last_sequence < version.creation_seqno() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "last_sequence is behind current version",
+            ));
+        }
+
+        // 清理未被引用的 SSTable 文件
+        let data_dir = DbPathManager::global().data_dir();
+        if data_dir.exists() {
+            for entry in std::fs::read_dir(data_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                if path.extension().and_then(|ext| ext.to_str()) != Some("sst") {
+                    continue;
+                }
+                let file_id = match path.file_stem().and_then(|s| s.to_str()) {
+                    Some(stem) => stem.parse::<u64>().ok(),
+                    None => None,
+                };
+                if let Some(file_id) = file_id {
+                    if !seen_files.contains(&file_id) {
+                        if let Err(e) = std::fs::remove_file(&path) {
+                            eprintln!("Failed to remove orphan SSTable {:?}: {}", path, e);
+                        }
+                    }
+                }
+            }
+        }
 
         Ok(())
     }
@@ -383,6 +484,12 @@ impl VersionSet {
         let num = self.next_file_number;
         self.next_file_number += 1;
         num
+    }
+
+    /// 分配新的 WAL 日志编号
+    pub fn allocate_log_number(&mut self) -> u64 {
+        self.log_number += 1;
+        self.log_number
     }
 
     /// 获取最后序列号

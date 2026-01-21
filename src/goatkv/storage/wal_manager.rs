@@ -36,17 +36,24 @@ use crate::goatkv::encoding::internal_key::InternalKey;
 #[derive(Debug)]
 pub struct WalManager {
     writer: io::BufWriter<File>,
+    wal_sync: bool,
+    file_path: PathBuf,
 }
 
 impl WalManager {
     /// 创建新的 WAL 管理器，指定 WAL 文件路径
-    pub fn new(file_path: PathBuf) -> io::Result<Self> {
+    pub fn new(file_path: PathBuf, wal_sync: bool) -> io::Result<Self> {
+        let open_path = file_path.clone();
         let file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(file_path)?;
+            .open(open_path)?;
         let writer = io::BufWriter::new(file);
-        Ok(Self { writer })
+        Ok(Self {
+            writer,
+            wal_sync,
+            file_path,
+        })
     }
 
     /// 写入一个键值对到 WAL
@@ -87,7 +94,11 @@ impl WalManager {
         self.writer.write_all(value)?;
 
         // 立即刷新，确保数据持久化
-        self.writer.flush()
+        self.writer.flush()?;
+        if self.wal_sync {
+            self.writer.get_ref().sync_data()?;
+        }
+        Ok(())
     }
 
     /// 计算 WAL 条目的 CRC32 校验和
@@ -205,6 +216,155 @@ impl Iterator for WalIterator {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct WalReplayStats {
+    pub max_sequence: u64,
+    pub entries: u64,
+    pub truncated: bool,
+}
+
+pub fn replay_wal_file<F>(path: &PathBuf, mut on_entry: F) -> io::Result<WalReplayStats>
+where
+    F: FnMut(InternalKey, Vec<u8>),
+{
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    let mut reader = io::BufReader::new(file.try_clone()?);
+    let mut last_good_offset = 0u64;
+    let mut max_sequence = 0u64;
+    let mut entries = 0u64;
+    let mut truncated = false;
+
+    loop {
+        let record_start = last_good_offset;
+
+        let mut checksum_bytes = [0u8; 4];
+        match read_exact_or_eof(&mut reader, &mut checksum_bytes)? {
+            ReadOutcome::Eof => break,
+            ReadOutcome::Partial => {
+                file.set_len(record_start)?;
+                file.sync_data()?;
+                truncated = true;
+                break;
+            }
+            ReadOutcome::Complete => {
+                last_good_offset += checksum_bytes.len() as u64;
+            }
+        }
+        let checksum = u32::from_le_bytes(checksum_bytes);
+
+        let mut key_len_bytes = [0u8; 4];
+        if let Err(e) = reader.read_exact(&mut key_len_bytes) {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                file.set_len(record_start)?;
+                file.sync_data()?;
+                truncated = true;
+                break;
+            }
+            return Err(e);
+        }
+        last_good_offset += key_len_bytes.len() as u64;
+        let key_len = u32::from_le_bytes(key_len_bytes);
+        if key_len < 8 {
+            file.set_len(record_start)?;
+            file.sync_data()?;
+            truncated = true;
+            break;
+        }
+
+        let user_key_len = key_len as usize - 8;
+        let mut user_key = vec![0u8; user_key_len];
+        if let Err(e) = reader.read_exact(&mut user_key) {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                file.set_len(record_start)?;
+                file.sync_data()?;
+                truncated = true;
+                break;
+            }
+            return Err(e);
+        }
+        last_good_offset += user_key_len as u64;
+
+        let mut encoded_seq_bytes = [0u8; 8];
+        if let Err(e) = reader.read_exact(&mut encoded_seq_bytes) {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                file.set_len(record_start)?;
+                file.sync_data()?;
+                truncated = true;
+                break;
+            }
+            return Err(e);
+        }
+        last_good_offset += encoded_seq_bytes.len() as u64;
+        let encoded_seq = u64::from_le_bytes(encoded_seq_bytes);
+        let key = InternalKey::from_encoded(user_key, encoded_seq);
+
+        let mut value_len_bytes = [0u8; 4];
+        if let Err(e) = reader.read_exact(&mut value_len_bytes) {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                file.set_len(record_start)?;
+                file.sync_data()?;
+                truncated = true;
+                break;
+            }
+            return Err(e);
+        }
+        last_good_offset += value_len_bytes.len() as u64;
+        let value_len = u32::from_le_bytes(value_len_bytes);
+
+        let mut value = vec![0u8; value_len as usize];
+        if let Err(e) = reader.read_exact(&mut value) {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                file.set_len(record_start)?;
+                file.sync_data()?;
+                truncated = true;
+                break;
+            }
+            return Err(e);
+        }
+        last_good_offset += value_len as u64;
+
+        if WalManager::get_checksum(&key, key_len, &value, value_len) != checksum {
+            file.set_len(record_start)?;
+            file.sync_data()?;
+            truncated = true;
+            break;
+        }
+
+        max_sequence = max_sequence.max(key.sequence_number());
+        entries += 1;
+        on_entry(key, value);
+    }
+
+    Ok(WalReplayStats {
+        max_sequence,
+        entries,
+        truncated,
+    })
+}
+
+enum ReadOutcome {
+    Eof,
+    Partial,
+    Complete,
+}
+
+fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<ReadOutcome> {
+    let mut read = 0;
+    while read < buf.len() {
+        match reader.read(&mut buf[read..])? {
+            0 => break,
+            n => read += n,
+        }
+    }
+    if read == 0 {
+        Ok(ReadOutcome::Eof)
+    } else if read < buf.len() {
+        Ok(ReadOutcome::Partial)
+    } else {
+        Ok(ReadOutcome::Complete)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,7 +374,7 @@ mod tests {
     #[test]
     fn test_wal_manager_new() {
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
-        let wal_manager = WalManager::new(temp_file.path().to_path_buf());
+        let wal_manager = WalManager::new(temp_file.path().to_path_buf(), true);
         assert!(wal_manager.is_ok());
     }
 
@@ -222,7 +382,7 @@ mod tests {
     fn test_wal_manager_write_and_checksum() {
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
         let mut wal_manager =
-            WalManager::new(temp_file.path().to_path_buf()).expect("Failed to create WalManager");
+            WalManager::new(temp_file.path().to_path_buf(), false).expect("Failed to create WalManager");
 
         let key = InternalKey::new(
             b"test_key".to_vec(),
@@ -269,7 +429,7 @@ mod tests {
         // 写入数据
         {
             let mut wal_manager =
-                WalManager::new(path.clone()).expect("Failed to create WalManager");
+                WalManager::new(path.clone(), false).expect("Failed to create WalManager");
 
             let key1 = InternalKey::new(
                 b"key1".to_vec(),
@@ -325,7 +485,7 @@ mod tests {
         // 写入有效数据
         {
             let mut wal_manager =
-                WalManager::new(path.clone()).expect("Failed to create WalManager");
+                WalManager::new(path.clone(), false).expect("Failed to create WalManager");
 
             let key = InternalKey::new(
                 b"test".to_vec(),

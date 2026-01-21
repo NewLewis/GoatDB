@@ -150,16 +150,16 @@ impl DbPathManager {
     /// ```no_run
     /// # use goat_db::goatkv::utils::db_path_manager::DbPathManager;
     /// DbPathManager::init("./data").unwrap();
-    /// let manager = DbPathManager::take().unwrap(); // Reset
+    /// let manager = DbPathManager::reset_for_tests().unwrap(); // Reset
     /// ```
-    #[cfg(test)]
-    pub fn take() -> Option<DbPathManager> {
+    /// 测试用：重置全局 DbPathManager。仅在测试中调用。
+    pub fn reset_for_tests() -> Option<DbPathManager> {
         // Use OnceLock::take() to get the inner value
         // Note: OnceLock::take() requires mutable access, so we use an unsafe block
         // This is safe because:
         // 1. This method is only used in tests
-        // 2. Tests run sequentially (--test-threads=1)
-        // 3. We ensure no other references exist when calling take()
+        // 2. 调用方应在测试中自行序列化访问（见 tests 使用全局锁）
+        // 3. 我们尽量确保没有其他引用存在后再调用 take()
         unsafe {
             let ptr = &GLOBAL_PATH_MANAGER as *const OnceLock<DbPathManager>
                 as *mut OnceLock<DbPathManager>;
@@ -257,6 +257,20 @@ impl DbPathManager {
     /// 获取默认WAL日志文件路径（主WAL文件）
     pub fn main_wal_path(&self) -> PathBuf {
         self.wal_dir.join("goatdb.wal")
+    }
+
+    /// 根据 log_number 生成 WAL 文件路径
+    ///
+    /// # 文件命名规则
+    /// - 如果 log_number < 1,000,000：格式为 `{log_number:06}.wal`（如 000001.wal）
+    /// - 如果 log_number >= 1,000,000：格式为 `{log_number}.wal`（如 1234567.wal）
+    pub fn wal_path_by_id(&self, log_number: u64) -> PathBuf {
+        let filename = if log_number < 1_000_000 {
+            format!("{:06}.wal", log_number)
+        } else {
+            format!("{}.wal", log_number)
+        };
+        self.wal_dir.join(filename)
     }
 
     /// 获取指定名称的WAL日志文件路径
@@ -489,7 +503,7 @@ mod tests {
 
     #[test]
     fn test_singleton_init_and_global() {
-        let _ = DbPathManager::take(); // Reset any previous state
+        let _ = DbPathManager::reset_for_tests(); // Reset any previous state
         let temp_dir = tempdir().unwrap();
 
         // 第一次初始化应该成功
@@ -510,7 +524,7 @@ mod tests {
         // 使用独立的测试环境，避免与其他测试冲突
         std::env::set_var("GOATDB_TEST_MODE", "true");
 
-        let _ = DbPathManager::take(); // Reset any previous state
+        let _ = DbPathManager::reset_for_tests(); // Reset any previous state
         let temp_dir = tempdir().unwrap();
         let temp_dir2 = tempdir().unwrap();
 
@@ -527,7 +541,7 @@ mod tests {
         }
 
         // 清理：重置单例状态
-        let _ = DbPathManager::take();
+        let _ = DbPathManager::reset_for_tests();
         std::env::remove_var("GOATDB_TEST_MODE");
     }
 
@@ -537,7 +551,7 @@ mod tests {
         std::env::set_var("GOATDB_TEST_MODE", "true");
 
         // 彻底重置单例状态
-        let _ = DbPathManager::take();
+        let _ = DbPathManager::reset_for_tests();
 
         let temp_dir = tempdir().unwrap();
         let temp_dir2 = tempdir().unwrap();
@@ -555,7 +569,7 @@ mod tests {
         assert_eq!(manager.base_path(), temp_dir.path());
 
         // 清理：重置单例状态
-        let _ = DbPathManager::take();
+        let _ = DbPathManager::reset_for_tests();
         std::env::remove_var("GOATDB_TEST_MODE");
     }
 
@@ -565,7 +579,7 @@ mod tests {
         std::env::set_var("GOATDB_TEST_MODE", "true");
 
         // 彻底重置单例状态
-        let _ = DbPathManager::take();
+        let _ = DbPathManager::reset_for_tests();
 
         // 未初始化时应该返回 None
         assert!(
@@ -593,13 +607,13 @@ mod tests {
         assert_eq!(manager1.base_path(), manager2.base_path());
 
         // 清理：重置单例状态
-        let _ = DbPathManager::take();
+        let _ = DbPathManager::reset_for_tests();
         std::env::remove_var("GOATDB_TEST_MODE");
     }
 
     #[test]
     fn test_global_before_init_panics() {
-        let _ = DbPathManager::take(); // Reset any previous state
+        let _ = DbPathManager::reset_for_tests(); // Reset any previous state
                                        // 在未初始化的情况下调用 global 应该 panic
         let result = std::panic::catch_unwind(|| {
             DbPathManager::global();
@@ -616,7 +630,7 @@ mod tests {
         use std::thread;
 
         // 彻底重置单例状态
-        let _ = DbPathManager::take();
+        let _ = DbPathManager::reset_for_tests();
 
         let temp_dir = tempdir().unwrap();
 
@@ -649,7 +663,7 @@ mod tests {
         }
 
         // 清理：重置单例状态
-        let _ = DbPathManager::take();
+        let _ = DbPathManager::reset_for_tests();
         std::env::remove_var("GOATDB_TEST_MODE");
     }
 

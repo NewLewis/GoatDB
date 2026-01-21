@@ -1,13 +1,13 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::goatkv::core::cleanup_worker::CleanupWorker;
 use crate::goatkv::core::flush_worker::{FlushTask, FlushWorker};
-use crate::goatkv::core::lsm_state::LSMState;
+use crate::goatkv::core::lsm_state::{ImmutableMemTableEntry, LSMState};
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
 use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
-use crate::goatkv::storage::wal_manager::{WalIterator, WalManager};
+use crate::goatkv::storage::wal_manager::{replay_wal_file, WalManager, WalReplayStats};
 use crate::goatkv::utils::db_path_manager::DbPathManager;
 use crate::goatkv::utils::options::KvEngineOptions;
 use crate::goatkv::utils::sequence_number::SequenceNumber;
@@ -29,6 +29,10 @@ pub struct KvEngine {
     cleanup_worker: CleanupWorker,
     /// 当前正在执行的 FlushTask 的 ID
     flush_task_id: AtomicUsize,
+    /// 当前 WAL 日志编号
+    current_log_number: AtomicU64,
+    /// WAL 引用计数，用于延迟删除
+    wal_refcounts: Arc<Mutex<std::collections::HashMap<u64, usize>>>,
 }
 
 impl Default for KvEngine {
@@ -56,25 +60,12 @@ impl KvEngine {
         // 初始化全局路径管理器单例
         // 使用 try_init 以便在测试中可以重用已初始化的单例
         let _ = DbPathManager::try_init(&options.data_dir)?;
-
-        // 获取主 WAL 文件路径
-        let wal_path = DbPathManager::global().main_wal_path();
-
-        // 创建内存表
-        let mem_table = Arc::new(MemTable::new(options.mem_table_size));
-
-        // 如果启用 WAL 恢复，则尝试从 WAL 恢复
-        let mut wal_max_sequence = 0;
-        if options.recover_from_wal {
-            wal_max_sequence = Self::replay(&mem_table, &wal_path)?;
-        }
-
-        // 创建 WAL 管理器
-        let wal_manager = WalManager::new(wal_path)
-            .map_err(|e| std::io::Error::other(format!("Failed to open WAL file: {}", e)))?;
+        let _ = DbPathManager::global().cleanup_tmp_dir();
 
         let (cleanup_worker, obsolete_sender) =
             CleanupWorker::new(DbPathManager::global().data_dir().into());
+
+        let mem_table = Arc::new(MemTable::new(options.mem_table_size));
 
         // 创建 LSM 状态管理器（内部会创建 VersionSet）
         let lsm_state = Arc::new(RwLock::new(LSMState::new(
@@ -83,27 +74,93 @@ impl KvEngine {
             obsolete_sender.clone(),
         )?));
 
+        let (wal_stats, _wal_max_number) = if options.recover_from_wal {
+            let min_log_number = {
+                let guard = lsm_state.read().unwrap();
+                let vs_guard = guard.version_set.read().unwrap();
+                vs_guard.log_number()
+            };
+            Self::replay_into_state(&lsm_state, options.mem_table_size, min_log_number)?
+        } else {
+            (
+                WalReplayStats {
+                    max_sequence: 0,
+                    entries: 0,
+                    truncated: false,
+                },
+                0,
+            )
+        };
+
+        if wal_stats.truncated {
+            eprintln!("WAL replay truncated due to corruption or partial record.");
+        }
+
+        // 延后推进 log_number：只有当新的 WAL 真正写入并在 manifest 中记录后才前进。
+        // 这里仅保证存在一个可写 WAL，如果 manifest 中 log_number 为 0，则用 1。
+        let current_log_number = {
+            let guard = lsm_state.read().unwrap();
+            let mut vs_guard = guard.version_set.write().unwrap();
+            let mut log_number = vs_guard.log_number();
+            if log_number == 0 {
+                log_number = 1;
+                let mut edit = crate::goatkv::metadata::version_edit::VersionEdit::new();
+                edit.set_log_number(log_number);
+                vs_guard.apply_edit(edit)?;
+            }
+            log_number
+        };
+
+        let wal_path = DbPathManager::global().wal_path_by_id(current_log_number);
+        let wal_manager = WalManager::new(wal_path, options.wal_sync)
+            .map_err(|e| std::io::Error::other(format!("Failed to open WAL file: {}", e)))?;
+
         let last_sequence = {
             let lsm_guard = lsm_state.read().unwrap();
             let vs_guard = lsm_guard.version_set.read().unwrap();
-            std::cmp::max(wal_max_sequence, vs_guard.last_sequence())
+            std::cmp::max(wal_stats.max_sequence, vs_guard.last_sequence())
         };
 
         // 创建序列号生成器（从最后序列号继续）
         let sequence_number = Arc::new(SequenceNumber::with_start(last_sequence + 1));
 
-        // 创建后台刷盘 Worker
-        let flush_worker = FlushWorker::new(lsm_state.clone(), obsolete_sender);
+        let wal_refcounts = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
-        Ok(Self {
+        let engine = Self {
             wal_manager: Arc::new(Mutex::new(wal_manager)),
             sequence_number,
-            lsm_state,
+            lsm_state: lsm_state.clone(),
             options: Arc::new(options),
-            flush_worker,
+            flush_worker: FlushWorker::new(lsm_state.clone(), obsolete_sender, wal_refcounts.clone()),
             cleanup_worker,
             flush_task_id: AtomicUsize::new(0),
-        })
+            current_log_number: AtomicU64::new(current_log_number),
+            wal_refcounts,
+        };
+
+        // 提交恢复阶段遗留的 immutable memtables
+        {
+            let state = engine.lsm_state.read().unwrap();
+            for entry in state.immutable_mem_tables.iter() {
+                if entry.wal_log_number > 0 {
+                    *engine
+                        .wal_refcounts
+                        .lock()
+                        .unwrap()
+                        .entry(entry.wal_log_number)
+                        .or_insert(0) += 1;
+                }
+                let task_id = engine.flush_task_id.fetch_add(1, Ordering::SeqCst);
+                let _ = engine.flush_worker.submit_task(FlushTask {
+                    id: task_id,
+                    immutable_mem_table: entry.table.clone(),
+                    wal_log_number: entry.wal_log_number,
+                    new_log_number: 0,
+                });
+            }
+        }
+
+        Ok(engine)
     }
 
     /// 创建一个新的KvEngine，不尝试从WAL恢复
@@ -115,27 +172,93 @@ impl KvEngine {
     }
 
     /// 从 WAL 文件恢复数据到内存表
-    fn replay(mem_table: &MemTable, exec_path: &PathBuf) -> Result<u64, std::io::Error> {
-        let wal_iterator = match WalIterator::new(exec_path) {
-            Ok(iterator) => iterator,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(0);
-            }
-            Err(e) => return Err(e),
+    fn replay_into_state(
+        lsm_state: &Arc<RwLock<LSMState>>,
+        mem_table_size: usize,
+        min_log_number: u64,
+    ) -> Result<(WalReplayStats, u64), std::io::Error> {
+        let wal_files = Self::list_wal_files(min_log_number)?;
+        let mut stats = WalReplayStats {
+            max_sequence: 0,
+            entries: 0,
+            truncated: false,
         };
-        let mut max_seq = 0u64;
-        for entry in wal_iterator {
-            match entry {
-                Ok((key, value)) => {
-                    max_seq = max_seq.max(key.sequence_number());
-                    mem_table.put(key, value.into());
+        let mut max_log_number = 0u64;
+
+        for (log_number, wal_path) in wal_files {
+            if log_number > max_log_number {
+                max_log_number = log_number;
+            }
+            if !wal_path.exists() {
+                continue;
+            }
+            let file_stats = replay_wal_file(&wal_path, |key, value| {
+                let mut state = lsm_state.write().unwrap();
+                state.mem_table.put(key, value.into());
+                if state.mem_table.should_flush() {
+                    let imm = Arc::new(ImmutableMemTable::new(state.mem_table.inner()));
+                    state.immutable_mem_tables.push_back(ImmutableMemTableEntry {
+                        table: imm,
+                        wal_log_number: log_number,
+                    });
+                    state.mem_table = Arc::new(MemTable::new(mem_table_size));
                 }
-                Err(err) => {
-                    println!("Failed to replay WAL entry: {}, skipped", err);
+            })?;
+            stats.max_sequence = stats.max_sequence.max(file_stats.max_sequence);
+            stats.entries += file_stats.entries;
+            stats.truncated |= file_stats.truncated;
+            // 不因为截断停止，继续尝试后续 WAL，保证尽量多恢复
+
+            // 完成一个 WAL 文件后，封存当前 memtable，确保 WAL 边界清晰
+            {
+                let mut state = lsm_state.write().unwrap();
+                if !state.mem_table.is_empty() {
+                    let imm = Arc::new(ImmutableMemTable::new(state.mem_table.inner()));
+                    state.immutable_mem_tables.push_back(ImmutableMemTableEntry {
+                        table: imm,
+                        wal_log_number: log_number,
+                    });
+                    state.mem_table = Arc::new(MemTable::new(mem_table_size));
                 }
             }
         }
-        Ok(max_seq)
+
+        Ok((stats, max_log_number))
+    }
+
+    fn list_wal_files(min_log_number: u64) -> Result<Vec<(u64, PathBuf)>, std::io::Error> {
+        let path_manager = DbPathManager::global();
+        let wal_dir = path_manager.wal_dir();
+        let mut wal_files = Vec::new();
+
+        if wal_dir.exists() {
+            for entry in std::fs::read_dir(wal_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                if path.extension().and_then(|ext| ext.to_str()) != Some("wal") {
+                    continue;
+                }
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    if let Ok(number) = stem.parse::<u64>() {
+                        if number >= min_log_number {
+                            wal_files.push((number, path));
+                        }
+                    }
+                }
+            }
+        }
+
+        wal_files.sort_by_key(|(num, _)| *num);
+
+        let main_wal = path_manager.main_wal_path();
+        if min_log_number == 0 && main_wal.exists() {
+            wal_files.insert(0, (0, main_wal));
+        }
+
+        Ok(wal_files)
     }
 }
 
@@ -164,8 +287,8 @@ impl KvEngine {
         }
 
         // Then check immutable memtables in order (newer first)
-        for table in immutable_mem_tables.iter().rev() {
-            if let Some((internal_key, value)) = table.get(key) {
+        for entry in immutable_mem_tables.iter().rev() {
+            if let Some((internal_key, value)) = entry.table.get(key) {
                 if internal_key.kind() != InternalKeyKind::Delete {
                     return Some(value);
                 } else {
@@ -242,7 +365,8 @@ impl KvEngine {
     }
 
     pub fn flush(&self) {
-        let immutable_mem_table = {
+        let (immutable_mem_table, old_log_number, new_log_number, rotation_succeeded) = {
+            let mut wal_guard = self.wal_manager.lock().unwrap();
             let mut state = self.lsm_state.write().unwrap();
 
             // 克隆当前的 memtable
@@ -252,19 +376,56 @@ impl KvEngine {
             let immutable_mem_table = Arc::new(ImmutableMemTable::new(mem_table.inner()));
 
             // 将 immutable_mem_table 放入队列并创建新的 memtable
-            state
-                .immutable_mem_tables
-                .push_back(immutable_mem_table.clone());
+            state.immutable_mem_tables.push_back(ImmutableMemTableEntry {
+                table: immutable_mem_table.clone(),
+                wal_log_number: self.current_log_number.load(Ordering::SeqCst),
+            });
             state.mem_table = Arc::new(MemTable::new(self.options.mem_table_size));
 
-            immutable_mem_table
+            let old_log_number = self.current_log_number.load(Ordering::SeqCst);
+            let candidate_log_number = {
+                let vs = state.version_set.read().unwrap();
+                vs.log_number() + 1
+            };
+            let new_wal_path = DbPathManager::global().wal_path_by_id(candidate_log_number);
+            let (new_log_number, rotation_succeeded) =
+                match WalManager::new(new_wal_path, self.options.wal_sync) {
+                Ok(new_manager) => {
+                    *wal_guard = new_manager;
+                    let new_log_number = candidate_log_number;
+                    self.current_log_number
+                        .store(new_log_number, Ordering::SeqCst);
+                    (new_log_number, true)
+                }
+                Err(e) => {
+                    eprintln!("Failed to rotate WAL: {}", e);
+                    (old_log_number, false)
+                }
+            };
+
+            (
+                immutable_mem_table,
+                old_log_number,
+                new_log_number,
+                rotation_succeeded,
+            )
         };
 
         // 发送 flush 任务到后台线程
         let task_id = self.flush_task_id.fetch_add(1, Ordering::SeqCst);
+        if rotation_succeeded && old_log_number > 0 {
+            *self
+                .wal_refcounts
+                .lock()
+                .unwrap()
+                .entry(old_log_number)
+                .or_insert(0) += 1;
+        }
         if let Err(e) = self.flush_worker.submit_task(FlushTask {
             id: task_id,
             immutable_mem_table,
+            wal_log_number: if rotation_succeeded { old_log_number } else { 0 },
+            new_log_number: if rotation_succeeded { new_log_number } else { 0 },
         }) {
             eprintln!("Failed to send flush task: {}", e);
         }

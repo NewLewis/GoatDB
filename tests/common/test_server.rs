@@ -3,7 +3,6 @@ use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use rand::Rng;
 use tempfile::TempDir;
 use tokio::time::sleep;
 use tonic::transport::Channel;
@@ -244,16 +243,8 @@ impl Drop for TestServer {
 
 /// 查找空闲端口
 fn find_free_port() -> u16 {
-    let mut rng = rand::thread_rng();
-
-    for _ in 0..10 {
-        let port = 50000 + rng.gen_range(0..10000);
-
-        // 尝试绑定到端口来检查是否可用
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-
-    panic!("Could not find free port after 10 attempts");
+    // 让 OS 分配临时端口，避免随机碰撞
+    TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|listener| listener.local_addr().map(|addr| addr.port()))
+        .expect("Failed to allocate an ephemeral port")
 }
