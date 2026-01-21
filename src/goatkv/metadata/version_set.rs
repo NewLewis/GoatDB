@@ -44,6 +44,7 @@ pub struct VersionSet {
     obsolete_sender: Sender<u64>,
 
     // ---------------- 环境配置 ----------------
+    #[allow(dead_code)] // 预留给后续清理/路径相关逻辑
     db_path: PathBuf,
     options: Arc<VersionSetOptions>, // Options 通常只读，用 Arc 共享
 }

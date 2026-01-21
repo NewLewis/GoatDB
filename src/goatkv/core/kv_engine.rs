@@ -26,6 +26,7 @@ pub struct KvEngine {
     /// 后台刷盘 Worker
     flush_worker: FlushWorker,
     /// 后台清理 Worker
+    #[allow(dead_code)] // 持有以保持清理线程存活
     cleanup_worker: CleanupWorker,
     /// 当前正在执行的 FlushTask 的 ID
     flush_task_id: AtomicUsize,
@@ -74,7 +75,7 @@ impl KvEngine {
             obsolete_sender.clone(),
         )?));
 
-        let (wal_stats, _wal_max_number) = if options.recover_from_wal {
+        let (wal_stats, wal_max_number) = if options.recover_from_wal {
             let min_log_number = {
                 let guard = lsm_state.read().unwrap();
                 let vs_guard = guard.version_set.read().unwrap();
@@ -96,14 +97,18 @@ impl KvEngine {
             eprintln!("WAL replay truncated due to corruption or partial record.");
         }
 
-        // 延后推进 log_number：只有当新的 WAL 真正写入并在 manifest 中记录后才前进。
-        // 这里仅保证存在一个可写 WAL，如果 manifest 中 log_number 为 0，则用 1。
+        // 确保当前 WAL 号严格大于已存在的 WAL，避免恢复后复用导致误删活跃 WAL。
         let current_log_number = {
             let guard = lsm_state.read().unwrap();
             let mut vs_guard = guard.version_set.write().unwrap();
             let mut log_number = vs_guard.log_number();
             if log_number == 0 {
                 log_number = 1;
+            }
+            if wal_max_number >= log_number {
+                log_number = wal_max_number + 1;
+            }
+            if log_number != vs_guard.log_number() {
                 let mut edit = crate::goatkv::metadata::version_edit::VersionEdit::new();
                 edit.set_log_number(log_number);
                 vs_guard.apply_edit(edit)?;

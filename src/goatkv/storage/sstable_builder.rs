@@ -113,6 +113,7 @@ pub struct SSTableBuilder {
     offset: u64,
 
     /// SSTable ID
+    #[allow(dead_code)] // 保留用于调试/日志
     id: u64,
 
     /// 最小的键（第一个写入的键）

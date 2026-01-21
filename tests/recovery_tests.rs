@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use goat_db::goatkv::core::kv_engine::KvEngine;
+use goat_db::goatkv::metadata::current;
+use goat_db::goatkv::metadata::manifest::{ManifestWriter, INIT_MANIFEST_FILE_NAME};
+use goat_db::goatkv::metadata::version_edit::VersionEdit;
 use goat_db::goatkv::storage::wal_manager::WalManager;
 use goat_db::goatkv::utils::db_path_manager::DbPathManager;
 use goat_db::goatkv::utils::options::KvEngineOptions;
@@ -130,6 +133,140 @@ fn recovery_replays_multiple_wals_in_order() {
     }
 
     assert!(!wal_path(1, &pm).exists(), "WAL 1 should be cleaned after flush");
+
+    reset_db_path_manager();
+}
+
+#[test]
+fn recovery_advances_log_number_past_existing_wals() {
+    let _guard = lock_tests();
+    reset_db_path_manager();
+    let tmp = temp_dir();
+
+    DbPathManager::init(tmp.path()).unwrap();
+    let pm = DbPathManager::global().clone();
+
+    // 制造已存在的更大 WAL 编号
+    for num in [2u64, 4u64] {
+        fs::write(wal_path(num, &pm), &[]).unwrap();
+    }
+
+    let options = KvEngineOptions::default()
+        .with_data_dir(tmp.path())
+        .with_mem_table_size(64 * 1024)
+        .with_wal_sync(false)
+        .with_recover_from_wal(true);
+
+    let _engine = KvEngine::new_with_options(options).unwrap();
+
+    // 新的 WAL 编号应当是 max(existing)+1
+    let expected_new = wal_path(5, &pm);
+    assert!(
+        expected_new.exists(),
+        "expected new WAL {:?} to be created",
+        expected_new
+    );
+    assert!(wal_path(4, &pm).exists(), "existing WAL should remain");
+
+    reset_db_path_manager();
+}
+
+#[test]
+fn recovery_truncates_manifest_tail() {
+    let _guard = lock_tests();
+    reset_db_path_manager();
+    let tmp = temp_dir();
+
+    DbPathManager::init(tmp.path()).unwrap();
+    let pm = DbPathManager::global().clone();
+
+    let manifest_path = pm.data_dir().join(INIT_MANIFEST_FILE_NAME);
+    let mut edit = VersionEdit::new();
+    edit.set_log_number(1);
+    let encoded = edit.encode();
+
+    {
+        let mut writer = ManifestWriter::create(&manifest_path).unwrap();
+        writer.append_edit(&edit).unwrap();
+        writer.sync().unwrap();
+    }
+    current::write_current(INIT_MANIFEST_FILE_NAME).unwrap();
+
+    // 追加半条 edit，制造尾部截断
+    let mut partial_edit = VersionEdit::new();
+    partial_edit.set_log_number(2);
+    let partial_encoded = partial_edit.encode();
+    let partial_len = (partial_encoded.len() / 2).max(1);
+    {
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(&manifest_path)
+            .unwrap();
+        let len = partial_encoded.len() as u64;
+        f.write_all(&len.to_be_bytes()).unwrap();
+        f.write_all(&partial_encoded[..partial_len]).unwrap();
+        f.flush().unwrap();
+    }
+
+    let options = KvEngineOptions::default()
+        .with_data_dir(tmp.path())
+        .with_mem_table_size(64 * 1024)
+        .with_wal_sync(false)
+        .with_recover_from_wal(true);
+
+    let _engine = KvEngine::new_with_options(options).unwrap();
+
+    let expected_len = 8 + encoded.len() as u64;
+    let metadata = fs::metadata(&manifest_path).unwrap();
+    assert_eq!(
+        metadata.len(),
+        expected_len,
+        "manifest should be truncated to last good edit"
+    );
+
+    reset_db_path_manager();
+}
+
+#[test]
+fn recovery_errors_on_corrupted_manifest_edit() {
+    let _guard = lock_tests();
+    reset_db_path_manager();
+    let tmp = temp_dir();
+
+    DbPathManager::init(tmp.path()).unwrap();
+    let pm = DbPathManager::global().clone();
+
+    let manifest_path = pm.data_dir().join(INIT_MANIFEST_FILE_NAME);
+    {
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&manifest_path)
+            .unwrap();
+        // 写入一个完整但无法解码的 edit（未知 tag）
+        let payload = vec![0x63u8]; // tag = 99
+        let len = payload.len() as u64;
+        f.write_all(&len.to_be_bytes()).unwrap();
+        f.write_all(&payload).unwrap();
+        f.flush().unwrap();
+    }
+    current::write_current(INIT_MANIFEST_FILE_NAME).unwrap();
+
+    let options = KvEngineOptions::default()
+        .with_data_dir(tmp.path())
+        .with_mem_table_size(64 * 1024)
+        .with_wal_sync(false)
+        .with_recover_from_wal(true);
+
+    let result = KvEngine::new_with_options(options);
+    assert!(result.is_err(), "corrupted manifest should error");
+    let err = result.unwrap_err();
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::InvalidData,
+        "unexpected error kind for corrupted manifest: {err}"
+    );
 
     reset_db_path_manager();
 }

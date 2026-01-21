@@ -37,6 +37,7 @@ use crate::goatkv::encoding::internal_key::InternalKey;
 pub struct WalManager {
     writer: io::BufWriter<File>,
     wal_sync: bool,
+    #[allow(dead_code)] // 保留用于调试/日志
     file_path: PathBuf,
 }
 

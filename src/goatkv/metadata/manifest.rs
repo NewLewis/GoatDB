@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use crate::goatkv::metadata::version_edit::VersionEdit;
@@ -78,14 +78,16 @@ impl ManifestWriter {
 /// MANIFEST 文件读取器（用于恢复）
 pub struct ManifestReader {
     reader: BufReader<File>,
+    last_good_offset: u64,
 }
 
 impl ManifestReader {
     /// 打开 MANIFEST 文件读取
     pub fn new(path: &Path) -> Result<Self, std::io::Error> {
-        let file = File::open(path)?;
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
         Ok(ManifestReader {
             reader: BufReader::new(file),
+            last_good_offset: 0,
         })
     }
 
@@ -106,26 +108,64 @@ impl ManifestReader {
 
     /// 读取下一个 VersionEdit
     fn read_next_edit(&mut self) -> Result<Option<VersionEdit>, String> {
+        let record_start = self.last_good_offset;
+
         // 读取长度前缀
         let mut len_bytes = [0u8; 8];
-        match self.reader.read_exact(&mut len_bytes) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e.to_string()),
+        match read_exact_or_eof(&mut self.reader, &mut len_bytes).map_err(|e| e.to_string())? {
+            ReadOutcome::Eof => return Ok(None),
+            ReadOutcome::Partial => {
+                self.truncate_to(record_start)?;
+                return Ok(None);
+            }
+            ReadOutcome::Complete => {}
         }
 
         let len = u64::from_be_bytes(len_bytes) as usize;
 
         // 读取编码数据
         let mut buffer = vec![0u8; len];
-        match self.reader.read_exact(&mut buffer) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e.to_string()),
+        match read_exact_or_eof(&mut self.reader, &mut buffer).map_err(|e| e.to_string())? {
+            ReadOutcome::Eof | ReadOutcome::Partial => {
+                self.truncate_to(record_start)?;
+                return Ok(None);
+            }
+            ReadOutcome::Complete => {}
         }
 
         // 解码
         let edit = VersionEdit::decode(&buffer)?;
+        self.last_good_offset = record_start + 8 + len as u64;
         Ok(Some(edit))
+    }
+
+    fn truncate_to(&mut self, offset: u64) -> Result<(), String> {
+        let file = self.reader.get_ref();
+        file.set_len(offset).map_err(|e| e.to_string())?;
+        file.sync_data().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+enum ReadOutcome {
+    Eof,
+    Partial,
+    Complete,
+}
+
+fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<ReadOutcome> {
+    let mut read = 0;
+    while read < buf.len() {
+        match reader.read(&mut buf[read..])? {
+            0 => break,
+            n => read += n,
+        }
+    }
+    if read == 0 {
+        Ok(ReadOutcome::Eof)
+    } else if read < buf.len() {
+        Ok(ReadOutcome::Partial)
+    } else {
+        Ok(ReadOutcome::Complete)
     }
 }
