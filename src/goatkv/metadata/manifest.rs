@@ -1,9 +1,10 @@
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 
 use crate::goatkv::metadata::current;
 use crate::goatkv::metadata::version_edit::VersionEdit;
+use crate::goatkv::utils::db_path_manager::DbPathManager;
 
 pub const INIT_MANIFEST_FILE_NAME: &str = "MANIFEST-0";
 
@@ -92,29 +93,22 @@ impl ManifestWriter {
 pub struct ManifestHandler {
     writer: Option<ManifestWriter>,
     file_number: u64,
+    db_path: PathBuf,
 }
 
 impl ManifestHandler {
     // 1. 恢复流程：读取 CURRENT，找到并重放 Manifest
-    pub fn recover(db_path: &Path) -> Result<Vec<VersionEdit>, std::io::Error> {
+    pub fn recover(_db_path: &Path) -> Result<Vec<VersionEdit>, std::io::Error> {
         // Step 1: Read CURRENT file content (e.g., "MANIFEST-00005\n")
         match current::read_current() {
             Ok(Some(file_name)) => {
                 // Step 2: Open that MANIFEST file
-                let manifest_path = db_path.join(&file_name);
+                let manifest_path = DbPathManager::global().data_dir().join(&file_name);
                 let mut reader = ManifestReader::new(&manifest_path)?;
-                let mut edits = Vec::new();
+                let edits = reader
+                    .read_all_edits()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-                // Step 3: Replay all edits
-                loop {
-                    if let Ok(Some(edit)) = reader.read_next_edit() {
-                        edits.push(edit);
-                    } else {
-                        break;
-                    }
-                }
-
-                // Step 4: Return (last_sequence, edits)
                 return Ok(edits);
             }
             Ok(None) => Ok(Vec::new()),
@@ -135,7 +129,7 @@ impl ManifestHandler {
     }
 
     // 3. 原子更新 CURRENT 文件 (关键!)
-    pub fn update_current_file(&self, manifest_file_number: u64) -> Result<()> {
+    pub fn update_current_file(&self, manifest_file_number: u64) -> io::Result<()> {
         // 技巧：先写到临时文件 CURRENT.tmp，然后 rename 为 CURRENT
         // 保证 crash safe
         let tmp_path = self.db_path.join("CURRENT.tmp");
@@ -189,9 +183,11 @@ impl ManifestReader {
 
         // 读取编码数据
         let mut buffer = vec![0u8; len];
-        self.reader
-            .read_exact(&mut buffer)
-            .map_err(|e| e.to_string())?;
+        match self.reader.read_exact(&mut buffer) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.to_string()),
+        }
 
         // 解码
         let edit = VersionEdit::decode(&buffer)?;

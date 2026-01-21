@@ -2,11 +2,15 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::io;
 
+use crate::goatkv::metadata::current;
 use crate::goatkv::metadata::file_metadata::FileMetadata;
-use crate::goatkv::metadata::manifest::ManifestWriter;
+use crate::goatkv::metadata::manifest::{ManifestReader, ManifestWriter, INIT_MANIFEST_FILE_NAME};
 use crate::goatkv::metadata::version::Version;
-use crate::goatkv::metadata::version_edit::{NewFile, VersionEdit};
+use crate::goatkv::metadata::version_edit::VersionEdit;
+use crate::goatkv::utils::db_path_manager::DbPathManager;
+use crate::goatkv::utils::options::KvEngineOptions;
 
 /// VersionSet 管理所有版本和增量变更
 #[derive(Debug)]
@@ -71,6 +75,17 @@ impl Default for VersionSetOptions {
     }
 }
 
+impl From<&KvEngineOptions> for VersionSetOptions {
+    fn from(options: &KvEngineOptions) -> Self {
+        Self {
+            max_versions: options.max_versions,
+            manifest_max_size: options.manifest_max_size,
+            manifest_rewrite_edit_count: options.manifest_rewrite_edit_count,
+            num_levels: options.num_levels,
+        }
+    }
+}
+
 impl VersionSet {
     /// 创建一个新的空 VersionSet（用于新数据库）
     pub fn new(db_path: &Path, obsolete_sender: Sender<u64>) -> Result<Self, std::io::Error> {
@@ -101,13 +116,122 @@ impl VersionSet {
         })
     }
 
+    /// 打开已有数据库或创建新数据库（包含 MANIFEST 恢复）
+    pub fn open(
+        db_path: &Path,
+        options: VersionSetOptions,
+        obsolete_sender: Sender<u64>,
+    ) -> Result<Self, std::io::Error> {
+        let mut version_set = Self::new_with_options(db_path, options, obsolete_sender)?;
+        version_set.recover_manifest()?;
+        Ok(version_set)
+    }
+
+    fn recover_manifest(&mut self) -> Result<(), std::io::Error> {
+        let data_dir = DbPathManager::global().data_dir();
+
+        // CURRENT 不存在时：尝试找到最新 MANIFEST 或创建初始 MANIFEST
+        if !current::current_path().exists() {
+            if let Some(latest) = current::find_latest_manifest()? {
+                current::write_current(&latest)?;
+            } else {
+                let _ = self.create_initial_manifest()?;
+            }
+        }
+
+        // 读取 CURRENT 指向的 MANIFEST
+        let manifest_name = match current::read_current()? {
+            Some(name) => name,
+            None => self.create_initial_manifest()?,
+        };
+
+        let mut manifest_path = data_dir.join(&manifest_name);
+        if !manifest_path.exists() {
+            // CURRENT 指向的 MANIFEST 缺失，尝试回退到最新 MANIFEST
+            if let Some(latest) = current::find_latest_manifest()? {
+                current::write_current(&latest)?;
+                manifest_path = data_dir.join(&latest);
+            }
+        }
+
+        if !manifest_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("MANIFEST not found: {:?}", manifest_path),
+            ));
+        }
+
+        let mut reader = ManifestReader::new(&manifest_path)?;
+        let edits = reader
+            .read_all_edits()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        for edit in edits {
+            self.apply_edit_internal(edit, false)?;
+        }
+
+        self.ensure_next_file_number();
+
+        let manifest_file_number = Self::parse_manifest_number(
+            manifest_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("MANIFEST-0"),
+        )
+        .unwrap_or(0);
+        self.manifest_writer =
+            Some(ManifestWriter::open_for_append(&manifest_path, manifest_file_number)?);
+        self.manifest_file_number = manifest_file_number;
+
+        Ok(())
+    }
+
+    fn create_initial_manifest(&self) -> Result<String, std::io::Error> {
+        let manifest_name = INIT_MANIFEST_FILE_NAME.to_string();
+        let manifest_path = DbPathManager::global().data_dir().join(&manifest_name);
+        let _ = ManifestWriter::create(&manifest_path)?;
+        current::write_current(&manifest_name)?;
+        Ok(manifest_name)
+    }
+
+    fn ensure_next_file_number(&mut self) {
+        let max_file_id = self
+            .current
+            .all_file_ids()
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        if self.next_file_number <= max_file_id {
+            self.next_file_number = max_file_id + 1;
+        }
+    }
+
+    fn parse_manifest_number(manifest_name: &str) -> Option<u64> {
+        manifest_name
+            .strip_prefix("MANIFEST-")
+            .and_then(|s| s.parse::<u64>().ok())
+    }
+
     /// 应用 VersionEdit
     pub fn apply_edit(&mut self, edit: VersionEdit) -> Result<(), std::io::Error> {
+        self.apply_edit_internal(edit, true)
+    }
+
+    fn apply_edit_internal(
+        &mut self,
+        edit: VersionEdit,
+        write_manifest: bool,
+    ) -> Result<(), std::io::Error> {
         // 1. 验证 VersionEdit 的合法性
-        self.validate_edit(&edit)?;
+        self.validate_edit(&edit)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // 先写 MANIFEST
-        if let Some(manifest) = &mut self.manifest_writer {
+        if write_manifest {
+            let manifest = self.manifest_writer.as_mut().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "manifest writer not initialized")
+            })?;
             manifest.append_edit(&edit)?;
             manifest.sync()?; // ⚠️ 必须 fsync
         }
@@ -124,7 +248,9 @@ impl VersionSet {
         }
 
         // 4. 创建新 Version
-        let new_version = self.create_new_version(&edit)?;
+        let new_version = self
+            .create_new_version(&edit)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // 6. 更新当前版本
         let old_version = std::mem::replace(&mut self.current, new_version);
@@ -217,7 +343,7 @@ impl VersionSet {
 
         // 对 Level 0 以外的层级排序（保证不重叠且有序）
         for level_files in new_files.iter_mut().skip(1) {
-            level_files.sort_by_key(|f| f.smallest_key());
+            level_files.sort_by(|a, b| a.smallest_key().cmp(b.smallest_key()));
         }
 
         for level_files in new_files.iter().skip(1) {
@@ -232,6 +358,9 @@ impl VersionSet {
     /// 添加旧版本到历史列表
     fn append_old_version(&mut self, version: Arc<Version>) {
         self.versions.push_back(version);
+        if self.versions.len() > self.options.max_versions {
+            self.versions.pop_front();
+        }
     }
 
     /// 获取当前版本

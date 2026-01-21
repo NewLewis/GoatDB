@@ -3,8 +3,7 @@ use std::thread;
 
 use crate::goatkv::core::lsm_state::LSMState;
 use crate::goatkv::core::mem_table::ImmutableMemTable;
-use crate::goatkv::metadata::file_metadata::FileMetadata;
-use crate::goatkv::metadata::version_edit::VersionEdit;
+use crate::goatkv::metadata::version_edit::{NewFile, VersionEdit};
 use crate::goatkv::storage::sstable_builder::SSTableBuilder;
 
 /// 刷盘任务
@@ -67,22 +66,24 @@ impl FlushWorker {
     fn run_loop(
         rx: mpsc::Receiver<FlushTask>,
         lsm_state: Arc<RwLock<LSMState>>,
-        obsolete_sender: mpsc::Sender<u64>,
+        _obsolete_sender: mpsc::Sender<u64>,
     ) {
         while let Ok(task) = rx.recv() {
             // 从任务中获取要刷盘的 immutable memtable
             let imm_table = task.immutable_mem_table.clone();
 
             // 获取 version_set 引用和分配文件 ID
-            let (file_id, version_set) = {
+            let (file_id, next_file_number, version_set) = {
                 let version_set = lsm_state.read().unwrap().version_set.clone();
 
-                let file_id = {
+                let (file_id, next_file_number) = {
                     let mut vs = version_set.write().unwrap();
-                    vs.allocate_file_number()
+                    let file_id = vs.allocate_file_number();
+                    let next_file_number = vs.next_file_number();
+                    (file_id, next_file_number)
                 };
 
-                (file_id, version_set)
+                (file_id, next_file_number, version_set)
             };
 
             let mut sst_builder = match SSTableBuilder::new(file_id) {
@@ -94,10 +95,12 @@ impl FlushWorker {
             };
 
             // 在不持有锁的情况下处理数据
-            let entries: Vec<(Vec<u8>, Vec<u8>)> = imm_table
-                .iter()
-                .map(|(key, value)| (key.serialize(), value.to_vec()))
-                .collect();
+            let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let mut max_sequence = 0u64;
+            for (key, value) in imm_table.iter() {
+                max_sequence = max_sequence.max(key.sequence_number());
+                entries.push((key.serialize(), value.to_vec()));
+            }
 
             // 在不持有锁的情况下写入 SSTable
             for (key, value) in entries {
@@ -111,15 +114,16 @@ impl FlushWorker {
                     continue;
                 }
             };
-            let metadata = Arc::new(FileMetadata {
-                file_id,
-                props,
-                obsolete_sender,
-            });
 
             // 创建 VersionEdit 记录新增的 SSTable
             let mut version_edit = VersionEdit::new();
-            version_edit.add_file(0, metadata.into());
+            version_edit.add_file(0, NewFile::new_with_props(file_id, props));
+            version_edit.set_next_file_number(next_file_number);
+            let last_sequence = {
+                let vs = version_set.read().unwrap();
+                std::cmp::max(max_sequence, vs.last_sequence())
+            };
+            version_edit.set_last_sequence(last_sequence);
 
             // 应用 VersionEdit 到 VersionSet
             {

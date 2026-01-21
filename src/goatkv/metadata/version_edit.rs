@@ -102,6 +102,11 @@ impl VersionEdit {
         self.next_file_number = Some(num);
     }
 
+    // 设置 Last Sequence
+    pub fn set_last_sequence(&mut self, seq: u64) {
+        self.last_sequence = Some(seq);
+    }
+
     // 设置 Comparator
     pub fn set_comparator_name(&mut self, name: String) {
         self.comparator_name = Some(name);

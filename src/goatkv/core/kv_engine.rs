@@ -7,10 +7,8 @@ use crate::goatkv::core::flush_worker::{FlushTask, FlushWorker};
 use crate::goatkv::core::lsm_state::LSMState;
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
 use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
-use crate::goatkv::metadata::current;
-use crate::goatkv::metadata::manifest::{ManifestWriter, INIT_MANIFEST_FILE_NAME};
 use crate::goatkv::storage::wal_manager::{WalIterator, WalManager};
-use crate::goatkv::utils::db_path_manager::{self, DbPathManager};
+use crate::goatkv::utils::db_path_manager::DbPathManager;
 use crate::goatkv::utils::options::KvEngineOptions;
 use crate::goatkv::utils::sequence_number::SequenceNumber;
 
@@ -62,49 +60,44 @@ impl KvEngine {
         // 获取主 WAL 文件路径
         let wal_path = DbPathManager::global().main_wal_path();
 
-        // 如果 CURRENT文件不存在，则创建它
-        if !current::current_path().exists() {
-            match current::find_latest_manifest() {
-                Ok(Some(manifest_name)) => {
-                    current::write_current(&manifest_name).expect("Failed to write current file");
-                }
-                Ok(None) | Err(_) => {
-                    // 创建初始 MANIFEST 文件
-                    let db_path_manager = DbPathManager::global();
-                    let manifest_path = db_path_manager.data_dir().join(INIT_MANIFEST_FILE_NAME);
-                    let _ = ManifestWriter::create(&manifest_path)?;
-                    // 创建current文件，并写入当前 MANIFEST 文件名到 CURRENT 文件
-                    current::write_current(INIT_MANIFEST_FILE_NAME)
-                        .expect("Failed to write current file");
-                }
-            }
-        } else {
-        }
-
         // 创建内存表
-        let mut mem_table = MemTable::new(options.mem_table_size);
+        let mem_table = Arc::new(MemTable::new(options.mem_table_size));
 
         // 如果启用 WAL 恢复，则尝试从 WAL 恢复
+        let mut wal_max_sequence = 0;
         if options.recover_from_wal {
-            let _ = Self::replay(&mut mem_table, &wal_path);
+            wal_max_sequence = Self::replay(&mem_table, &wal_path)?;
         }
 
         // 创建 WAL 管理器
         let wal_manager = WalManager::new(wal_path)
             .map_err(|e| std::io::Error::other(format!("Failed to open WAL file: {}", e)))?;
 
-        // 创建 LSM 状态管理器（内部会创建 VersionSet）
-        let lsm_state = Arc::new(RwLock::new(LSMState::new(&options)));
-
         let (cleanup_worker, obsolete_sender) =
             CleanupWorker::new(DbPathManager::global().data_dir().into());
+
+        // 创建 LSM 状态管理器（内部会创建 VersionSet）
+        let lsm_state = Arc::new(RwLock::new(LSMState::new(
+            &options,
+            mem_table.clone(),
+            obsolete_sender.clone(),
+        )?));
+
+        let last_sequence = {
+            let lsm_guard = lsm_state.read().unwrap();
+            let vs_guard = lsm_guard.version_set.read().unwrap();
+            std::cmp::max(wal_max_sequence, vs_guard.last_sequence())
+        };
+
+        // 创建序列号生成器（从最后序列号继续）
+        let sequence_number = Arc::new(SequenceNumber::with_start(last_sequence + 1));
 
         // 创建后台刷盘 Worker
         let flush_worker = FlushWorker::new(lsm_state.clone(), obsolete_sender);
 
         Ok(Self {
             wal_manager: Arc::new(Mutex::new(wal_manager)),
-            sequence_number: Arc::new(SequenceNumber::new()),
+            sequence_number,
             lsm_state,
             options: Arc::new(options),
             flush_worker,
@@ -122,11 +115,19 @@ impl KvEngine {
     }
 
     /// 从 WAL 文件恢复数据到内存表
-    fn replay(mem_table: &mut MemTable, exec_path: &PathBuf) -> Result<(), std::io::Error> {
-        let wal_iterator = WalIterator::new(exec_path)?;
+    fn replay(mem_table: &MemTable, exec_path: &PathBuf) -> Result<u64, std::io::Error> {
+        let wal_iterator = match WalIterator::new(exec_path) {
+            Ok(iterator) => iterator,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(0);
+            }
+            Err(e) => return Err(e),
+        };
+        let mut max_seq = 0u64;
         for entry in wal_iterator {
             match entry {
                 Ok((key, value)) => {
+                    max_seq = max_seq.max(key.sequence_number());
                     mem_table.put(key, value.into());
                 }
                 Err(err) => {
@@ -134,7 +135,7 @@ impl KvEngine {
                 }
             }
         }
-        Ok(())
+        Ok(max_seq)
     }
 }
 
@@ -145,12 +146,12 @@ impl KvEngine {
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let (mem_table, immutable_mem_tables, _) = {
+        let (mem_table, immutable_mem_tables, version_set) = {
             let lsm_state = self.lsm_state.read().unwrap();
             let mem_table = lsm_state.mem_table.clone();
             let immutable_mem_tables = lsm_state.immutable_mem_tables.clone();
-            let version = lsm_state.version.clone();
-            (mem_table, immutable_mem_tables, version)
+            let version_set = lsm_state.version_set.clone();
+            (mem_table, immutable_mem_tables, version_set)
         };
 
         // First check memtable
@@ -173,7 +174,17 @@ impl KvEngine {
             }
         }
 
-        // todo
+        // Then check SSTables via VersionSet
+        if let Ok(vs) = version_set.read() {
+            let version = vs.current();
+            if let Some((internal_key, value)) = version.get(key) {
+                if internal_key.kind() != InternalKeyKind::Delete {
+                    return Some(value);
+                } else {
+                    return None;
+                }
+            }
+        }
 
         // Key not found
         None
