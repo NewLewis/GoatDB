@@ -14,16 +14,6 @@ use crate::goatkv::utils::db_path_manager::DbPathManager;
 /// 对应的ASCII字符串为 "pjr_goat"（反向）
 const MAGIC_NUMBER: u64 = 0x706A725F676F6174;
 
-/// SSTable的固定Footer大小
-/// Footer包含两个varint偏移量（最多20字节）+ padding + magic number（8字节）
-/// Footer的总大小固定为48字节，确保可以从文件末尾读取Footer
-#[cfg(test)]
-const FOOTER_SIZE: usize = 48;
-
-// SSTable文件的最大索引条目分隔符长度
-// 用于限制索引块中的分隔符大小，防止内存过度使用
-// const MAX_SEPARATOR_LENGTH: usize = 256; // 暂未使用，注释掉避免警告
-
 /// SSTableBuilder用于构建SSTable文件
 ///
 /// # SSTable文件结构
@@ -442,7 +432,11 @@ impl SSTableBuilder {
         drop(writer);
 
         std::fs::rename(&self.tmp_path, &self.final_path)?;
-        sync_dir(self.final_path.parent().unwrap_or_else(|| std::path::Path::new(".")))?;
+        sync_dir(
+            self.final_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+        )?;
 
         // 创建并返回 FileMetadata
         // 注意：smallest_key 和 largest_key 应该是 InternalKey，但为了简化，这里直接存储原始 key

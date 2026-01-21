@@ -97,21 +97,17 @@ impl KvEngine {
             eprintln!("WAL replay truncated due to corruption or partial record.");
         }
 
-        // 确保当前 WAL 号严格大于已存在的 WAL，避免恢复后复用导致误删活跃 WAL。
+        // 选择一个新的 WAL 编号，但不在恢复时推进 manifest 的 log_number。
+        // 这样可以避免“恢复后尚未 flush 又崩溃”导致跳过旧 WAL。
         let current_log_number = {
             let guard = lsm_state.read().unwrap();
-            let mut vs_guard = guard.version_set.write().unwrap();
+            let vs_guard = guard.version_set.read().unwrap();
             let mut log_number = vs_guard.log_number();
             if log_number == 0 {
                 log_number = 1;
             }
             if wal_max_number >= log_number {
                 log_number = wal_max_number + 1;
-            }
-            if log_number != vs_guard.log_number() {
-                let mut edit = crate::goatkv::metadata::version_edit::VersionEdit::new();
-                edit.set_log_number(log_number);
-                vs_guard.apply_edit(edit)?;
             }
             log_number
         };
@@ -390,7 +386,9 @@ impl KvEngine {
             let old_log_number = self.current_log_number.load(Ordering::SeqCst);
             let candidate_log_number = {
                 let vs = state.version_set.read().unwrap();
-                vs.log_number() + 1
+                let vs_next = vs.log_number().saturating_add(1);
+                let current_next = self.current_log_number.load(Ordering::SeqCst).saturating_add(1);
+                std::cmp::max(vs_next, current_next)
             };
             let new_wal_path = DbPathManager::global().wal_path_by_id(candidate_log_number);
             let (new_log_number, rotation_succeeded) =

@@ -22,7 +22,7 @@ pub struct FlushTask {
 #[derive(Debug)]
 pub struct FlushWorker {
     sender: mpsc::Sender<FlushTask>,
-    _handle: thread::JoinHandle<()>,
+    handle: Option<thread::JoinHandle<()>>,
 }
 
 impl FlushWorker {
@@ -46,7 +46,7 @@ impl FlushWorker {
 
         Self {
             sender: tx,
-            _handle: handle,
+            handle: Some(handle),
         }
     }
 
@@ -176,6 +176,19 @@ impl FlushWorker {
                     }
                 }
             }
+        }
+    }
+}
+
+impl Drop for FlushWorker {
+    fn drop(&mut self) {
+        // Close channel before joining so the worker can exit.
+        let (tx, _rx) = mpsc::channel();
+        let old_sender = std::mem::replace(&mut self.sender, tx);
+        drop(old_sender);
+
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
         }
     }
 }

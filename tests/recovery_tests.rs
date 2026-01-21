@@ -72,6 +72,7 @@ fn recovery_handles_truncated_wal_tail() {
     // 截断应已发生：文件现在能被重新打开且尾部无多余无效记录（无法精确比对长度，但能重新打开 WalManager）
     WalManager::new(wal_path(0, &pm), false).expect("truncated WAL should be openable");
 
+    drop(engine);
     reset_db_path_manager();
 }
 
@@ -134,6 +135,7 @@ fn recovery_replays_multiple_wals_in_order() {
 
     assert!(!wal_path(1, &pm).exists(), "WAL 1 should be cleaned after flush");
 
+    drop(engine);
     reset_db_path_manager();
 }
 
@@ -157,7 +159,7 @@ fn recovery_advances_log_number_past_existing_wals() {
         .with_wal_sync(false)
         .with_recover_from_wal(true);
 
-    let _engine = KvEngine::new_with_options(options).unwrap();
+    let engine = KvEngine::new_with_options(options).unwrap();
 
     // 新的 WAL 编号应当是 max(existing)+1
     let expected_new = wal_path(5, &pm);
@@ -168,6 +170,7 @@ fn recovery_advances_log_number_past_existing_wals() {
     );
     assert!(wal_path(4, &pm).exists(), "existing WAL should remain");
 
+    drop(engine);
     reset_db_path_manager();
 }
 
@@ -214,7 +217,7 @@ fn recovery_truncates_manifest_tail() {
         .with_wal_sync(false)
         .with_recover_from_wal(true);
 
-    let _engine = KvEngine::new_with_options(options).unwrap();
+    let engine = KvEngine::new_with_options(options).unwrap();
 
     let expected_len = 8 + encoded.len() as u64;
     let metadata = fs::metadata(&manifest_path).unwrap();
@@ -224,6 +227,7 @@ fn recovery_truncates_manifest_tail() {
         "manifest should be truncated to last good edit"
     );
 
+    drop(engine);
     reset_db_path_manager();
 }
 
@@ -268,5 +272,68 @@ fn recovery_errors_on_corrupted_manifest_edit() {
         "unexpected error kind for corrupted manifest: {err}"
     );
 
+    reset_db_path_manager();
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_replays_wal_if_flush_never_completed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = lock_tests();
+    reset_db_path_manager();
+    let tmp = temp_dir();
+
+    DbPathManager::init(tmp.path()).unwrap();
+    let pm = DbPathManager::global().clone();
+
+    // WAL 1 写入一条记录
+    {
+        let mut wal = WalManager::new(wal_path(1, &pm), false).unwrap();
+        let key = goat_db::goatkv::encoding::internal_key::InternalKey::new(
+            b"k".to_vec(),
+            1,
+            goat_db::goatkv::encoding::internal_key::InternalKeyKind::Put,
+        );
+        wal.write(&key, b"v").unwrap();
+    }
+
+    // 让 tmp dir 只读，触发恢复后 flush 失败，模拟“恢复后立即崩溃未落盘”
+    {
+        let tmp_dir = pm.tmp_dir();
+        let mut perms = fs::metadata(tmp_dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(tmp_dir, perms).unwrap();
+    }
+
+    let options = KvEngineOptions::default()
+        .with_data_dir(tmp.path())
+        .with_mem_table_size(64 * 1024)
+        .with_wal_sync(false)
+        .with_recover_from_wal(true);
+    let engine = KvEngine::new_with_options(options).unwrap();
+    drop(engine);
+
+    // 恢复权限，便于后续启动与清理临时目录
+    {
+        let tmp_dir = pm.tmp_dir();
+        let mut perms = fs::metadata(tmp_dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(tmp_dir, perms).unwrap();
+    }
+
+    assert!(wal_path(1, &pm).exists(), "WAL 1 should still exist");
+
+    // 再次启动：如果没有不安全的 log_number 推进，应当能 replay WAL 1
+    let options = KvEngineOptions::default()
+        .with_data_dir(tmp.path())
+        .with_mem_table_size(64 * 1024)
+        .with_wal_sync(false)
+        .with_recover_from_wal(true);
+    let engine = KvEngine::new_with_options(options).unwrap();
+
+    assert_eq!(engine.get(b"k"), Some(b"v".to_vec()));
+
+    drop(engine);
     reset_db_path_manager();
 }
