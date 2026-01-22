@@ -190,10 +190,11 @@ impl VersionSet {
             .read_all_edits()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        // 按顺序应用 edit，重建 current 版本
-        for edit in edits {
-            self.apply_edit_internal(edit, false)?;
-        }
+        // 按顺序应用 edit，重建 current 版本（恢复快路径）
+        // 设计理由：
+        // - 恢复时 edit 数量可能很大，逐条创建 Version 会导致 O(E * F) 开销；
+        // - 使用原地更新文件列表，最后一次性构建 Version，降低恢复成本。
+        self.apply_edits_for_recovery(edits)?;
 
         // 确保 next_file_number 大于现有最大文件编号
         //
@@ -402,6 +403,21 @@ impl VersionSet {
         Ok(manifest_path)
     }
 
+    fn apply_edits_for_recovery(&mut self, edits: Vec<VersionEdit>) -> Result<(), std::io::Error> {
+        let mut files = self.current.clone_files();
+        self.versions.clear();
+
+        for edit in edits {
+            self.apply_edit_in_place(edit, &mut files)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        }
+
+        Self::sort_level_files(&mut files);
+        self.current = Arc::new(Version::from_files(files, self.last_sequence));
+
+        Ok(())
+    }
+
     /// 应用 VersionEdit
     pub fn apply_edit(&mut self, edit: VersionEdit) -> Result<(), std::io::Error> {
         self.apply_edit_internal(edit, true)
@@ -503,6 +519,40 @@ impl VersionSet {
         Ok(())
     }
 
+    fn validate_edit_for_files(
+        &self,
+        edit: &VersionEdit,
+        files: &[Vec<Arc<FileMetadata>>],
+    ) -> Result<(), String> {
+        for (level, file_num) in &edit.deleted_files {
+            if !Self::contains_file_in_files(files, *level, *file_num) {
+                return Err(format!(
+                    "Trying to delete non-existent file {} at level {}",
+                    file_num, level
+                ));
+            }
+        }
+
+        for (level, new_file) in &edit.new_files {
+            if *level >= self.options.num_levels {
+                return Err(format!(
+                    "Invalid level {} (max {})",
+                    level, self.options.num_levels
+                ));
+            }
+
+            if Self::contains_file_any_level_in_files(files, new_file.file_id) {
+                return Err(format!("File ID {} already exists", new_file.file_id));
+            }
+
+            if new_file.smallest_key() > new_file.largest_key() {
+                return Err("Invalid key range: smallest > largest".to_string());
+            }
+        }
+
+        Ok(())
+    }
+
     /// 检查文件是否存在于指定层级
     fn contains_file(&self, level: usize, file_id: u64) -> bool {
         self.current
@@ -519,6 +569,23 @@ impl VersionSet {
             }
         }
         false
+    }
+
+    fn contains_file_in_files(
+        files: &[Vec<Arc<FileMetadata>>],
+        level: usize,
+        file_id: u64,
+    ) -> bool {
+        files
+            .get(level)
+            .map(|level_files| level_files.iter().any(|f| f.file_id == file_id))
+            .unwrap_or(false)
+    }
+
+    fn contains_file_any_level_in_files(files: &[Vec<Arc<FileMetadata>>], file_id: u64) -> bool {
+        files
+            .iter()
+            .any(|level_files| level_files.iter().any(|f| f.file_id == file_id))
     }
 
     /// 创建新 Version
@@ -556,20 +623,7 @@ impl VersionSet {
             )));
         }
 
-        // 对 Level 0 以外的层级排序（保证不重叠且有序）
-        //
-        // 设计理由：
-        // - Level 1+ 需要有序且不重叠，便于二分查找；
-        // - 排序确保元数据符合读路径假设。
-        for level_files in new_files.iter_mut().skip(1) {
-            level_files.sort_by(|a, b| a.smallest_key().cmp(b.smallest_key()));
-        }
-
-        for level_files in new_files.iter().skip(1) {
-            for w in level_files.windows(2) {
-                debug_assert!(w[0].largest_key() < w[1].smallest_key());
-            }
-        }
+        Self::sort_level_files(&mut new_files);
 
         // 使用最新的 last_sequence 创建 Version 快照
         //
@@ -588,6 +642,56 @@ impl VersionSet {
         self.versions.push_back(version);
         if self.versions.len() > self.options.max_versions {
             self.versions.pop_front();
+        }
+    }
+
+    fn apply_edit_in_place(
+        &mut self,
+        edit: VersionEdit,
+        files: &mut Vec<Vec<Arc<FileMetadata>>>,
+    ) -> Result<(), String> {
+        self.validate_edit_for_files(&edit, files)?;
+
+        if let Some(log_num) = edit.log_number {
+            self.log_number = log_num;
+        }
+        if let Some(next_file) = edit.next_file_number {
+            self.next_file_number = next_file;
+        }
+        if let Some(last_seq) = edit.last_sequence {
+            self.last_sequence = last_seq;
+        }
+
+        for (level, file_num) in edit.deleted_files {
+            if level < files.len() {
+                files[level].retain(|f| f.file_id != file_num);
+            }
+        }
+
+        for (level, new_file) in edit.new_files {
+            if files.len() <= level {
+                files.resize(level + 1, Vec::new());
+            }
+            files[level].push(Arc::new(FileMetadata::from_new_file(
+                new_file,
+                self.obsolete_sender.clone(),
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn sort_level_files(files: &mut [Vec<Arc<FileMetadata>>]) {
+        // 对 Level 0 以外的层级排序（保证不重叠且有序）
+        //
+        // 设计理由：
+        // - Level 1+ 需要有序且不重叠，便于二分查找；
+        // - 排序确保元数据符合读路径假设。
+        for level_files in files.iter_mut().skip(1) {
+            level_files.sort_by(|a, b| a.smallest_key().cmp(b.smallest_key()));
+            for w in level_files.windows(2) {
+                debug_assert!(w[0].largest_key() < w[1].smallest_key());
+            }
         }
     }
 
