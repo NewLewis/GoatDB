@@ -168,9 +168,8 @@ impl FlushWorker {
                     }
                 };
                 if should_delete {
-                    let wal_path =
-                        crate::goatkv::utils::db_path_manager::DbPathManager::global()
-                            .wal_path_by_id(task.wal_log_number);
+                    let wal_path = crate::goatkv::utils::db_path_manager::DbPathManager::global()
+                        .wal_path_by_id(task.wal_log_number);
                     if let Err(e) = std::fs::remove_file(&wal_path) {
                         eprintln!("Failed to remove WAL {:?}: {}", wal_path, e);
                     }

@@ -168,6 +168,11 @@ impl Version {
             .flat_map(|(level, files)| files.iter().map(move |file| (level, Arc::clone(file))))
     }
 
+    /// 复制所有层级的文件列表（仅克隆 Arc，不复制实际数据）
+    pub fn clone_files(&self) -> Vec<Vec<Arc<FileMetadata>>> {
+        self.files.clone()
+    }
+
     /// 获取所有文件 ID（用于引用计数）
     pub fn all_file_ids(&self) -> HashSet<u64> {
         self.files

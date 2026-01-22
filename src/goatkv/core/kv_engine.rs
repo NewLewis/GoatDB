@@ -132,7 +132,11 @@ impl KvEngine {
             sequence_number,
             lsm_state: lsm_state.clone(),
             options: Arc::new(options),
-            flush_worker: FlushWorker::new(lsm_state.clone(), obsolete_sender, wal_refcounts.clone()),
+            flush_worker: FlushWorker::new(
+                lsm_state.clone(),
+                obsolete_sender,
+                wal_refcounts.clone(),
+            ),
             cleanup_worker,
             flush_task_id: AtomicUsize::new(0),
             current_log_number: AtomicU64::new(current_log_number),
@@ -198,10 +202,12 @@ impl KvEngine {
                 state.mem_table.put(key, value.into());
                 if state.mem_table.should_flush() {
                     let imm = Arc::new(ImmutableMemTable::new(state.mem_table.inner()));
-                    state.immutable_mem_tables.push_back(ImmutableMemTableEntry {
-                        table: imm,
-                        wal_log_number: log_number,
-                    });
+                    state
+                        .immutable_mem_tables
+                        .push_back(ImmutableMemTableEntry {
+                            table: imm,
+                            wal_log_number: log_number,
+                        });
                     state.mem_table = Arc::new(MemTable::new(mem_table_size));
                 }
             })?;
@@ -215,10 +221,12 @@ impl KvEngine {
                 let mut state = lsm_state.write().unwrap();
                 if !state.mem_table.is_empty() {
                     let imm = Arc::new(ImmutableMemTable::new(state.mem_table.inner()));
-                    state.immutable_mem_tables.push_back(ImmutableMemTableEntry {
-                        table: imm,
-                        wal_log_number: log_number,
-                    });
+                    state
+                        .immutable_mem_tables
+                        .push_back(ImmutableMemTableEntry {
+                            table: imm,
+                            wal_log_number: log_number,
+                        });
                     state.mem_table = Arc::new(MemTable::new(mem_table_size));
                 }
             }
@@ -377,34 +385,39 @@ impl KvEngine {
             let immutable_mem_table = Arc::new(ImmutableMemTable::new(mem_table.inner()));
 
             // 将 immutable_mem_table 放入队列并创建新的 memtable
-            state.immutable_mem_tables.push_back(ImmutableMemTableEntry {
-                table: immutable_mem_table.clone(),
-                wal_log_number: self.current_log_number.load(Ordering::SeqCst),
-            });
+            state
+                .immutable_mem_tables
+                .push_back(ImmutableMemTableEntry {
+                    table: immutable_mem_table.clone(),
+                    wal_log_number: self.current_log_number.load(Ordering::SeqCst),
+                });
             state.mem_table = Arc::new(MemTable::new(self.options.mem_table_size));
 
             let old_log_number = self.current_log_number.load(Ordering::SeqCst);
             let candidate_log_number = {
                 let vs = state.version_set.read().unwrap();
                 let vs_next = vs.log_number().saturating_add(1);
-                let current_next = self.current_log_number.load(Ordering::SeqCst).saturating_add(1);
+                let current_next = self
+                    .current_log_number
+                    .load(Ordering::SeqCst)
+                    .saturating_add(1);
                 std::cmp::max(vs_next, current_next)
             };
             let new_wal_path = DbPathManager::global().wal_path_by_id(candidate_log_number);
             let (new_log_number, rotation_succeeded) =
                 match WalManager::new(new_wal_path, self.options.wal_sync) {
-                Ok(new_manager) => {
-                    *wal_guard = new_manager;
-                    let new_log_number = candidate_log_number;
-                    self.current_log_number
-                        .store(new_log_number, Ordering::SeqCst);
-                    (new_log_number, true)
-                }
-                Err(e) => {
-                    eprintln!("Failed to rotate WAL: {}", e);
-                    (old_log_number, false)
-                }
-            };
+                    Ok(new_manager) => {
+                        *wal_guard = new_manager;
+                        let new_log_number = candidate_log_number;
+                        self.current_log_number
+                            .store(new_log_number, Ordering::SeqCst);
+                        (new_log_number, true)
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to rotate WAL: {}", e);
+                        (old_log_number, false)
+                    }
+                };
 
             (
                 immutable_mem_table,
@@ -427,8 +440,16 @@ impl KvEngine {
         if let Err(e) = self.flush_worker.submit_task(FlushTask {
             id: task_id,
             immutable_mem_table,
-            wal_log_number: if rotation_succeeded { old_log_number } else { 0 },
-            new_log_number: if rotation_succeeded { new_log_number } else { 0 },
+            wal_log_number: if rotation_succeeded {
+                old_log_number
+            } else {
+                0
+            },
+            new_log_number: if rotation_succeeded {
+                new_log_number
+            } else {
+                0
+            },
         }) {
             eprintln!("Failed to send flush task: {}", e);
         }
