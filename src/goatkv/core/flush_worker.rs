@@ -4,6 +4,7 @@ use std::thread;
 use crate::goatkv::core::lsm_state::LSMState;
 use crate::goatkv::core::mem_table::ImmutableMemTable;
 use crate::goatkv::metadata::version_edit::{NewFile, VersionEdit};
+use crate::goatkv::metadata::version_set::VersionSet;
 use crate::goatkv::storage::sstable_builder::SSTableBuilder;
 
 /// 刷盘任务
@@ -28,19 +29,21 @@ impl FlushWorker {
     /// 创建新的 FlushWorker 并启动后台线程
     ///
     /// # 参数
-    /// - `lsm_state`: LSM 状态管理器，用于访问 immutable memtables 和 version_set
+    /// - `lsm_state`: LSM 状态管理器，用于访问 immutable memtables 和 version snapshot
+    /// - `version_set`: VersionSet 管理 manifest 与版本演进
     ///
     /// # 返回
     /// 返回新创建的 FlushWorker 实例
     pub fn new(
         lsm_state: Arc<RwLock<LSMState>>,
+        version_set: Arc<RwLock<VersionSet>>,
         obsolete_sender: mpsc::Sender<u64>,
         wal_refcounts: Arc<std::sync::Mutex<std::collections::HashMap<u64, usize>>>,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
 
         let handle = thread::spawn(move || {
-            Self::run_loop(rx, lsm_state, obsolete_sender, wal_refcounts);
+            Self::run_loop(rx, lsm_state, version_set, obsolete_sender, wal_refcounts);
         });
 
         Self {
@@ -71,6 +74,7 @@ impl FlushWorker {
     fn run_loop(
         rx: mpsc::Receiver<FlushTask>,
         lsm_state: Arc<RwLock<LSMState>>,
+        version_set: Arc<RwLock<VersionSet>>,
         _obsolete_sender: mpsc::Sender<u64>,
         wal_refcounts: Arc<std::sync::Mutex<std::collections::HashMap<u64, usize>>>,
     ) {
@@ -78,18 +82,12 @@ impl FlushWorker {
             // 从任务中获取要刷盘的 immutable memtable
             let imm_table = task.immutable_mem_table.clone();
 
-            // 获取 version_set 引用和分配文件 ID
-            let (file_id, next_file_number, version_set) = {
-                let version_set = lsm_state.read().unwrap().version_set.clone();
-
-                let (file_id, next_file_number) = {
-                    let mut vs = version_set.write().unwrap();
-                    let file_id = vs.allocate_file_number();
-                    let next_file_number = vs.next_file_number();
-                    (file_id, next_file_number)
-                };
-
-                (file_id, next_file_number, version_set)
+            // 分配文件 ID
+            let (file_id, next_file_number) = {
+                let mut vs = version_set.write().unwrap();
+                let file_id = vs.allocate_file_number();
+                let next_file_number = vs.next_file_number();
+                (file_id, next_file_number)
             };
 
             let mut sst_builder = match SSTableBuilder::new(file_id) {
@@ -135,19 +133,20 @@ impl FlushWorker {
             };
             version_edit.set_last_sequence(last_sequence);
 
-            // 应用 VersionEdit 到 VersionSet
-            {
+            let current_version = {
                 let mut vs = version_set.write().unwrap();
                 if let Err(e) = vs.apply_edit(version_edit) {
                     eprintln!("Failed to apply VersionEdit: {}", e);
                     continue; // 不 pop_front，等待后续重试
                 }
-            }
+                vs.current()
+            };
 
             // 从 immutable_mem_tables 中移除已刷盘的 memtable
             // 注意：需要获取 lsm_state 写锁，并且需要找到对应的任务
             {
                 let mut lsm_state_guard = lsm_state.write().unwrap();
+                lsm_state_guard.version = current_version;
                 lsm_state_guard.immutable_mem_tables.pop_front();
             }
 

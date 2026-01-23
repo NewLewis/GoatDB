@@ -1,10 +1,8 @@
 use std::collections::VecDeque;
-use std::sync::mpsc::Sender;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
-use crate::goatkv::metadata::version_set::{VersionSet, VersionSetOptions};
-use crate::goatkv::utils::options::KvEngineOptions;
+use crate::goatkv::metadata::version::Version;
 
 #[derive(Debug)]
 pub struct LSMState {
@@ -12,8 +10,8 @@ pub struct LSMState {
     pub mem_table: Arc<MemTable>,
     /// Immutable memtables waiting for flush
     pub immutable_mem_tables: VecDeque<ImmutableMemTableEntry>,
-    /// VersionSet tracks SSTable metadata
-    pub version_set: Arc<RwLock<VersionSet>>,
+    /// Current version snapshot for SSTable reads
+    pub version: Arc<Version>,
 }
 
 #[derive(Debug, Clone)]
@@ -23,18 +21,11 @@ pub struct ImmutableMemTableEntry {
 }
 
 impl LSMState {
-    pub fn new(
-        options: &KvEngineOptions,
-        mem_table: Arc<MemTable>,
-        obsolete_sender: Sender<u64>,
-    ) -> Result<Self, std::io::Error> {
-        let vs_options = VersionSetOptions::from(options);
-        let version_set = VersionSet::open(&options.data_dir, vs_options, obsolete_sender)?;
-
-        Ok(LSMState {
+    pub fn new(mem_table: Arc<MemTable>, version: Arc<Version>) -> Self {
+        LSMState {
             mem_table,
             immutable_mem_tables: VecDeque::new(),
-            version_set: Arc::new(RwLock::new(version_set)),
-        })
+            version,
+        }
     }
 }

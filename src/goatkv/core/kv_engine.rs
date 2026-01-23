@@ -7,6 +7,7 @@ use crate::goatkv::core::flush_worker::{FlushTask, FlushWorker};
 use crate::goatkv::core::lsm_state::{ImmutableMemTableEntry, LSMState};
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
 use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
+use crate::goatkv::metadata::version_set::{VersionSet, VersionSetOptions};
 use crate::goatkv::storage::wal::{replay_wal_file, WalReplayStats, WalWriter};
 use crate::goatkv::utils::db_path_manager::DbPathManager;
 use crate::goatkv::utils::options::KvEngineOptions;
@@ -19,8 +20,10 @@ pub struct KvEngine {
     wal_writer: Arc<Mutex<WalWriter>>,
     /// 序列号生成器
     sequence_number: Arc<SequenceNumber>,
-    /// LSM 状态管理器（包含 VersionSet）
+    /// LSM 状态管理器（memtables + current version）
     lsm_state: Arc<RwLock<LSMState>>,
+    /// VersionSet 管理 manifest 与版本演进
+    version_set: Arc<RwLock<VersionSet>>,
     /// 配置选项
     options: Arc<KvEngineOptions>,
     /// 后台刷盘 Worker
@@ -66,17 +69,24 @@ impl KvEngine {
 
         let mem_table = Arc::new(MemTable::new(options.mem_table_size));
 
-        // 创建 LSM 状态管理器（内部会创建 VersionSet）
+        // 创建 VersionSet 并获取当前版本快照
+        let vs_options = VersionSetOptions::from(&options);
+        let version_set = VersionSet::open(&options.data_dir, vs_options, obsolete_sender.clone())?;
+        let version_set = Arc::new(RwLock::new(version_set));
+        let current_version = {
+            let vs_guard = version_set.read().unwrap();
+            vs_guard.current()
+        };
+
+        // 创建 LSM 状态管理器（仅保存 memtables + version）
         let lsm_state = Arc::new(RwLock::new(LSMState::new(
-            &options,
             mem_table.clone(),
-            obsolete_sender.clone(),
-        )?));
+            current_version,
+        )));
 
         let (wal_stats, wal_max_number) = if options.recover_from_wal {
             let min_log_number = {
-                let guard = lsm_state.read().unwrap();
-                let vs_guard = guard.version_set.read().unwrap();
+                let vs_guard = version_set.read().unwrap();
                 vs_guard.log_number()
             };
             Self::replay_into_state(&lsm_state, options.mem_table_size, min_log_number)?
@@ -98,8 +108,7 @@ impl KvEngine {
         // 选择一个新的 WAL 编号，但不在恢复时推进 manifest 的 log_number。
         // 这样可以避免“恢复后尚未 flush 又崩溃”导致跳过旧 WAL。
         let current_log_number = {
-            let guard = lsm_state.read().unwrap();
-            let vs_guard = guard.version_set.read().unwrap();
+            let vs_guard = version_set.read().unwrap();
             let mut log_number = vs_guard.log_number();
             if log_number == 0 {
                 log_number = 1;
@@ -115,8 +124,7 @@ impl KvEngine {
             .map_err(|e| std::io::Error::other(format!("Failed to open WAL file: {}", e)))?;
 
         let last_sequence = {
-            let lsm_guard = lsm_state.read().unwrap();
-            let vs_guard = lsm_guard.version_set.read().unwrap();
+            let vs_guard = version_set.read().unwrap();
             std::cmp::max(wal_stats.max_sequence, vs_guard.last_sequence())
         };
 
@@ -129,9 +137,11 @@ impl KvEngine {
             wal_writer: Arc::new(Mutex::new(wal_writer)),
             sequence_number,
             lsm_state: lsm_state.clone(),
+            version_set: version_set.clone(),
             options: Arc::new(options),
             flush_worker: FlushWorker::new(
                 lsm_state.clone(),
+                version_set.clone(),
                 obsolete_sender,
                 wal_refcounts.clone(),
             ),
@@ -273,12 +283,12 @@ impl KvEngine {
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let (mem_table, immutable_mem_tables, version_set) = {
+        let (mem_table, immutable_mem_tables, version) = {
             let lsm_state = self.lsm_state.read().unwrap();
             let mem_table = lsm_state.mem_table.clone();
             let immutable_mem_tables = lsm_state.immutable_mem_tables.clone();
-            let version_set = lsm_state.version_set.clone();
-            (mem_table, immutable_mem_tables, version_set)
+            let version = lsm_state.version.clone();
+            (mem_table, immutable_mem_tables, version)
         };
 
         // First check memtable
@@ -301,15 +311,12 @@ impl KvEngine {
             }
         }
 
-        // Then check SSTables via VersionSet
-        if let Ok(vs) = version_set.read() {
-            let version = vs.current();
-            if let Some((internal_key, value)) = version.get(key) {
-                if internal_key.kind() != InternalKeyKind::Delete {
-                    return Some(value);
-                } else {
-                    return None;
-                }
+        // Then check SSTables via version snapshot
+        if let Some((internal_key, value)) = version.get(key) {
+            if internal_key.kind() != InternalKeyKind::Delete {
+                return Some(value);
+            } else {
+                return None;
             }
         }
 
@@ -371,6 +378,15 @@ impl KvEngine {
     pub fn flush(&self) {
         let (immutable_mem_table, old_log_number, new_log_number, rotation_succeeded) = {
             let mut wal_guard = self.wal_writer.lock().unwrap();
+            let candidate_log_number = {
+                let vs = self.version_set.read().unwrap();
+                let vs_next = vs.log_number().saturating_add(1);
+                let current_next = self
+                    .current_log_number
+                    .load(Ordering::SeqCst)
+                    .saturating_add(1);
+                std::cmp::max(vs_next, current_next)
+            };
             let mut state = self.lsm_state.write().unwrap();
 
             // 克隆当前的 memtable
@@ -389,15 +405,6 @@ impl KvEngine {
             state.mem_table = Arc::new(MemTable::new(self.options.mem_table_size));
 
             let old_log_number = self.current_log_number.load(Ordering::SeqCst);
-            let candidate_log_number = {
-                let vs = state.version_set.read().unwrap();
-                let vs_next = vs.log_number().saturating_add(1);
-                let current_next = self
-                    .current_log_number
-                    .load(Ordering::SeqCst)
-                    .saturating_add(1);
-                std::cmp::max(vs_next, current_next)
-            };
             let new_wal_path = DbPathManager::global().wal_path_by_id(candidate_log_number);
             let (new_log_number, rotation_succeeded) =
                 match WalWriter::new(new_wal_path, self.options.wal_sync) {

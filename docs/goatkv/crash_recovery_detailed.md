@@ -113,13 +113,13 @@ pub fn new_with_options(options: KvEngineOptions) -> Result<Self, std::io::Error
     // 1. 初始化路径管理器
     let _ = DbPathManager::try_init(&options.data_dir)?;
     
-    // 2. 创建LSMState（内部调用VersionSet::open()恢复MANIFEST）
-    let lsm_state = Arc::new(RwLock::new(LSMState::new(...)?));
+    // 2. 创建VersionSet（恢复MANIFEST），并用 current 初始化 LSMState
+    let version_set = Arc::new(RwLock::new(VersionSet::open(...)?));
+    let lsm_state = Arc::new(RwLock::new(LSMState::new(...)));
     
     // 3. 获取min_log_number（已持久化的WAL边界）
     let min_log_number = {
-        let guard = lsm_state.read().unwrap();
-        let vs_guard = guard.version_set.read().unwrap();
+        let vs_guard = version_set.read().unwrap();
         vs_guard.log_number()
     };
     
@@ -130,8 +130,7 @@ pub fn new_with_options(options: KvEngineOptions) -> Result<Self, std::io::Error
     
     // 5. 选择新的WAL编号（不推进MANIFEST log_number）
     let current_log_number = {
-        let guard = lsm_state.read().unwrap();
-        let vs_guard = guard.version_set.read().unwrap();
+        let vs_guard = version_set.read().unwrap();
         let mut log_number = vs_guard.log_number();
         if log_number == 0 { log_number = 1; }
         if wal_max_number >= log_number { log_number = wal_max_number + 1; }
