@@ -25,7 +25,7 @@ struct Cli {
     threads: usize,
 
     /// WAL sync
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = false)]
     wal_sync: bool,
 
     /// Engine to run

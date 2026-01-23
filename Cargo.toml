@@ -79,3 +79,6 @@ tonic-prost-build = "0.14.2"
 [profile.release]
 debug = true  # 开启调试符号，这不会影响性能，只会增加二进制文件大小
 strip = false # 确保不剔除符号表
+
+[profile.dev]
+debug = true
