@@ -7,7 +7,7 @@ use crate::goatkv::core::flush_worker::{FlushTask, FlushWorker};
 use crate::goatkv::core::lsm_state::{ImmutableMemTableEntry, LSMState};
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
 use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
-use crate::goatkv::storage::wal_manager::{replay_wal_file, WalManager, WalReplayStats};
+use crate::goatkv::storage::wal::{replay_wal_file, WalReplayStats, WalWriter};
 use crate::goatkv::utils::db_path_manager::DbPathManager;
 use crate::goatkv::utils::options::KvEngineOptions;
 use crate::goatkv::utils::sequence_number::SequenceNumber;
@@ -15,8 +15,8 @@ use crate::goatkv::utils::sequence_number::SequenceNumber;
 /// LSM-Tree 键值存储引擎
 #[derive(Debug)]
 pub struct KvEngine {
-    /// WAL 管理器，负责写前日志
-    wal_manager: Arc<Mutex<WalManager>>,
+    /// WAL 写入器，负责写前日志
+    wal_writer: Arc<Mutex<WalWriter>>,
     /// 序列号生成器
     sequence_number: Arc<SequenceNumber>,
     /// LSM 状态管理器（包含 VersionSet）
@@ -113,7 +113,7 @@ impl KvEngine {
         };
 
         let wal_path = DbPathManager::global().wal_path_by_id(current_log_number);
-        let wal_manager = WalManager::new(wal_path, options.wal_sync)
+        let wal_writer = WalWriter::new(wal_path, options.wal_sync)
             .map_err(|e| std::io::Error::other(format!("Failed to open WAL file: {}", e)))?;
 
         let last_sequence = {
@@ -128,7 +128,7 @@ impl KvEngine {
         let wal_refcounts = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
         let engine = Self {
-            wal_manager: Arc::new(Mutex::new(wal_manager)),
+            wal_writer: Arc::new(Mutex::new(wal_writer)),
             sequence_number,
             lsm_state: lsm_state.clone(),
             options: Arc::new(options),
@@ -327,7 +327,7 @@ impl KvEngine {
         let internal_key = InternalKey::new(key, self.sequence_number.next(), InternalKeyKind::Put);
 
         // 先写入wal
-        self.wal_manager
+        self.wal_writer
             .lock()
             .unwrap()
             .write(&internal_key, &value)
@@ -353,7 +353,7 @@ impl KvEngine {
             InternalKey::new(key, self.sequence_number.next(), InternalKeyKind::Delete);
 
         // 先写入wal
-        self.wal_manager
+        self.wal_writer
             .lock()
             .unwrap()
             .write(&internal_key, &[][..])
@@ -375,7 +375,7 @@ impl KvEngine {
 
     pub fn flush(&self) {
         let (immutable_mem_table, old_log_number, new_log_number, rotation_succeeded) = {
-            let mut wal_guard = self.wal_manager.lock().unwrap();
+            let mut wal_guard = self.wal_writer.lock().unwrap();
             let mut state = self.lsm_state.write().unwrap();
 
             // 克隆当前的 memtable
@@ -405,7 +405,7 @@ impl KvEngine {
             };
             let new_wal_path = DbPathManager::global().wal_path_by_id(candidate_log_number);
             let (new_log_number, rotation_succeeded) =
-                match WalManager::new(new_wal_path, self.options.wal_sync) {
+                match WalWriter::new(new_wal_path, self.options.wal_sync) {
                     Ok(new_manager) => {
                         *wal_guard = new_manager;
                         let new_log_number = candidate_log_number;

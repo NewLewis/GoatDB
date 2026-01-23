@@ -5,4 +5,4 @@ pub mod block_reader;
 pub mod bloom_builder;
 pub mod sstable_builder;
 pub mod sstable_reader;
-pub mod wal_manager;
+pub mod wal;

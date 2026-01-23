@@ -7,7 +7,7 @@ use goat_db::goatkv::core::kv_engine::KvEngine;
 use goat_db::goatkv::metadata::current;
 use goat_db::goatkv::metadata::manifest::{ManifestWriter, INIT_MANIFEST_FILE_NAME};
 use goat_db::goatkv::metadata::version_edit::VersionEdit;
-use goat_db::goatkv::storage::wal_manager::WalManager;
+use goat_db::goatkv::storage::wal::WalWriter;
 use goat_db::goatkv::utils::db_path_manager::DbPathManager;
 use goat_db::goatkv::utils::options::KvEngineOptions;
 
@@ -15,7 +15,10 @@ use goat_db::goatkv::utils::options::KvEngineOptions;
 static TEST_MUTEX: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
 
 fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
-    TEST_MUTEX.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap()
+    TEST_MUTEX
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap()
 }
 
 fn reset_db_path_manager() {
@@ -41,7 +44,7 @@ fn recovery_handles_truncated_wal_tail() {
 
     // 写入一个完整记录
     {
-        let mut wal = WalManager::new(wal_path(0, &pm), false).unwrap();
+        let mut wal = WalWriter::new(wal_path(0, &pm), false).unwrap();
         let key = goat_db::goatkv::encoding::internal_key::InternalKey::new(
             b"ok".to_vec(),
             1,
@@ -69,8 +72,8 @@ fn recovery_handles_truncated_wal_tail() {
 
     assert_eq!(engine.get(b"ok"), Some(b"v1".to_vec()));
 
-    // 截断应已发生：文件现在能被重新打开且尾部无多余无效记录（无法精确比对长度，但能重新打开 WalManager）
-    WalManager::new(wal_path(0, &pm), false).expect("truncated WAL should be openable");
+    // 截断应已发生：文件现在能被重新打开且尾部无多余无效记录（无法精确比对长度，但能重新打开 WalWriter）
+    WalWriter::new(wal_path(0, &pm), false).expect("truncated WAL should be openable");
 
     drop(engine);
     reset_db_path_manager();
@@ -87,7 +90,7 @@ fn recovery_replays_multiple_wals_in_order() {
 
     // WAL 0
     {
-        let mut wal = WalManager::new(wal_path(0, &pm), false).unwrap();
+        let mut wal = WalWriter::new(wal_path(0, &pm), false).unwrap();
         let key = goat_db::goatkv::encoding::internal_key::InternalKey::new(
             b"a".to_vec(),
             1,
@@ -98,7 +101,7 @@ fn recovery_replays_multiple_wals_in_order() {
 
     // WAL 1
     {
-        let mut wal = WalManager::new(wal_path(1, &pm), false).unwrap();
+        let mut wal = WalWriter::new(wal_path(1, &pm), false).unwrap();
         let key = goat_db::goatkv::encoding::internal_key::InternalKey::new(
             b"b".to_vec(),
             2,
@@ -133,7 +136,10 @@ fn recovery_replays_multiple_wals_in_order() {
         let _ = wal0;
     }
 
-    assert!(!wal_path(1, &pm).exists(), "WAL 1 should be cleaned after flush");
+    assert!(
+        !wal_path(1, &pm).exists(),
+        "WAL 1 should be cleaned after flush"
+    );
 
     drop(engine);
     reset_db_path_manager();
@@ -289,7 +295,7 @@ fn recovery_replays_wal_if_flush_never_completed() {
 
     // WAL 1 写入一条记录
     {
-        let mut wal = WalManager::new(wal_path(1, &pm), false).unwrap();
+        let mut wal = WalWriter::new(wal_path(1, &pm), false).unwrap();
         let key = goat_db::goatkv::encoding::internal_key::InternalKey::new(
             b"k".to_vec(),
             1,

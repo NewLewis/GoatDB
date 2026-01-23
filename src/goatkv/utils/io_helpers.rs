@@ -8,6 +8,9 @@ pub enum ReadOutcome {
 }
 
 pub fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<ReadOutcome> {
+    if buf.is_empty() {
+        return Ok(ReadOutcome::Complete);
+    }
     let mut read = 0;
     while read < buf.len() {
         match reader.read(&mut buf[read..])? {
