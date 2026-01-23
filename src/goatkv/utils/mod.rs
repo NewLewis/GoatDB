@@ -1,4 +1,5 @@
 // 辅助工具组件
+pub mod cleanup_task;
 pub mod db_path_manager;
 pub mod io_helpers;
 pub mod options;

@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
+use crate::goatkv::core::wal_handle::WalHandle;
 use crate::goatkv::metadata::version::Version;
 
 #[derive(Debug)]
@@ -17,7 +18,7 @@ pub struct LSMState {
 #[derive(Debug, Clone)]
 pub struct ImmutableMemTableEntry {
     pub table: Arc<ImmutableMemTable>,
-    pub wal_log_number: u64,
+    pub wal_handle: Option<Arc<WalHandle>>,
 }
 
 impl LSMState {

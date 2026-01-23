@@ -9,6 +9,7 @@ use crate::goatkv::metadata::file_metadata::FileMetadata;
 use crate::goatkv::metadata::manifest::{ManifestReader, ManifestWriter, INIT_MANIFEST_FILE_NAME};
 use crate::goatkv::metadata::version::Version;
 use crate::goatkv::metadata::version_edit::VersionEdit;
+use crate::goatkv::utils::cleanup_task::CleanupTask;
 use crate::goatkv::utils::db_path_manager::DbPathManager;
 use crate::goatkv::utils::options::KvEngineOptions;
 
@@ -81,7 +82,7 @@ pub struct VersionSet {
     /// 设计理由：
     /// - 删除由后台异步执行，避免阻塞写路径；
     /// - 读路径可能仍持有旧版本，延迟删除避免读到缺失文件。
-    obsolete_sender: Sender<u64>,
+    obsolete_sender: Sender<CleanupTask>,
 
     // ---------------- 环境配置 ----------------
     #[allow(dead_code)] // 预留给后续清理/路径相关逻辑
@@ -129,7 +130,10 @@ impl From<&KvEngineOptions> for VersionSetOptions {
 
 impl VersionSet {
     /// 创建一个新的空 VersionSet（用于新数据库）
-    pub fn new(db_path: &Path, obsolete_sender: Sender<u64>) -> Result<Self, std::io::Error> {
+    pub fn new(
+        db_path: &Path,
+        obsolete_sender: Sender<CleanupTask>,
+    ) -> Result<Self, std::io::Error> {
         let options = VersionSetOptions::default();
         Self::new_with_options(db_path, options, obsolete_sender)
     }
@@ -138,7 +142,7 @@ impl VersionSet {
     pub fn new_with_options(
         db_path: &Path,
         options: VersionSetOptions,
-        obsolete_sender: Sender<u64>,
+        obsolete_sender: Sender<CleanupTask>,
     ) -> Result<Self, std::io::Error> {
         // 创建空的当前版本：没有任何 SSTable
         let current = Arc::new(Version::new(options.num_levels));
@@ -161,7 +165,7 @@ impl VersionSet {
     pub fn open(
         db_path: &Path,
         options: VersionSetOptions,
-        obsolete_sender: Sender<u64>,
+        obsolete_sender: Sender<CleanupTask>,
     ) -> Result<Self, std::io::Error> {
         // 先创建空 VersionSet，再通过 MANIFEST 恢复到最新状态
         //

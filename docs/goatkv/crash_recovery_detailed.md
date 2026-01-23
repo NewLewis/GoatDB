@@ -299,7 +299,7 @@ let current_log_number = {
 };
 ```
 
-## 9. WAL 引用计数与清理机制
+## 9. WAL 句柄与清理机制
 
 ```mermaid
 stateDiagram-v2
@@ -307,11 +307,11 @@ stateDiagram-v2
     
     state WAL文件存在 {
         state 有引用 {
-            [*] --> 引用计数增加 : MemTable依赖
-            引用计数增加 --> 引用计数减少 : MemTable flush完成
-            引用计数减少 --> 检查清零 : 计数更新
-            检查清零 --> 引用计数增加 : 计数>0
-            检查清零 --> 无引用 : 计数=0
+            [*] --> 引用增加 : MemTable依赖
+            引用增加 --> 引用减少 : MemTable flush完成
+            引用减少 --> 检查清零 : 引用更新
+            检查清零 --> 引用增加 : 引用>0
+            检查清零 --> 无引用 : 引用=0
         }
         
         state 无引用 {
@@ -324,10 +324,10 @@ stateDiagram-v2
 ```
 
 **实现机制：**
-1. **引用计数表**：`wal_refcounts: Arc<Mutex<HashMap<u64, usize>>>`
-2. **增加引用**：恢复时为每个 immutable MemTable 增加对应 WAL 的引用计数
-3. **减少引用**：FlushWorker 完成时减少引用计数
-4. **清理条件**：当某个 WAL 的引用计数归零时，安全删除该文件
+1. **共享句柄**：`Arc<WalHandle>` 绑定一个 WAL 编号，挂在 `ImmutableMemTableEntry` 上
+2. **复用 CleanupWorker**：`WalHandle::drop` 发送 `CleanupTask::Wal(log_number)` 给清理线程
+3. **延迟删除**：同一 WAL 的多个 immutable 共享同一 `Arc`，最后一个释放时才触发删除
+4. **删除条件**：只在 flush 成功、版本落盘后对应 immutable 被移除时触发
 
 ## 10. 覆盖的崩溃场景
 

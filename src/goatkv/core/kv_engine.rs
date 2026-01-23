@@ -1,14 +1,16 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 
 use crate::goatkv::core::cleanup_worker::CleanupWorker;
 use crate::goatkv::core::flush_worker::{FlushTask, FlushWorker};
 use crate::goatkv::core::lsm_state::{ImmutableMemTableEntry, LSMState};
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
+use crate::goatkv::core::wal_handle::WalHandle;
 use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
 use crate::goatkv::metadata::version_set::{VersionSet, VersionSetOptions};
 use crate::goatkv::storage::wal::{replay_wal_file, WalReplayStats, WalWriter};
+use crate::goatkv::utils::cleanup_task::CleanupTask;
 use crate::goatkv::utils::db_path_manager::DbPathManager;
 use crate::goatkv::utils::options::KvEngineOptions;
 use crate::goatkv::utils::sequence_number::SequenceNumber;
@@ -24,6 +26,8 @@ pub struct KvEngine {
     lsm_state: Arc<RwLock<LSMState>>,
     /// VersionSet 管理 manifest 与版本演进
     version_set: Arc<RwLock<VersionSet>>,
+    /// 清理任务发送端
+    cleanup_sender: mpsc::Sender<CleanupTask>,
     /// 配置选项
     options: Arc<KvEngineOptions>,
     /// 后台刷盘 Worker
@@ -33,8 +37,6 @@ pub struct KvEngine {
     cleanup_worker: CleanupWorker,
     /// 当前 WAL 日志编号
     current_log_number: AtomicU64,
-    /// WAL 引用计数，用于延迟删除
-    wal_refcounts: Arc<Mutex<std::collections::HashMap<u64, usize>>>,
 }
 
 impl Default for KvEngine {
@@ -64,13 +66,13 @@ impl KvEngine {
         let _ = DbPathManager::try_init(&options.data_dir)?;
         let _ = DbPathManager::global().cleanup_tmp_dir();
 
-        let (cleanup_worker, obsolete_sender) = CleanupWorker::new();
+        let (cleanup_worker, cleanup_sender) = CleanupWorker::new();
 
         let mem_table = Arc::new(MemTable::new(options.mem_table_size));
 
         // 创建 VersionSet 并获取当前版本快照
         let vs_options = VersionSetOptions::from(&options);
-        let version_set = VersionSet::open(&options.data_dir, vs_options, obsolete_sender.clone())?;
+        let version_set = VersionSet::open(&options.data_dir, vs_options, cleanup_sender.clone())?;
         let version_set = Arc::new(RwLock::new(version_set));
         let current_version = {
             let vs_guard = version_set.read().unwrap();
@@ -88,7 +90,12 @@ impl KvEngine {
                 let vs_guard = version_set.read().unwrap();
                 vs_guard.log_number()
             };
-            Self::replay_into_state(&lsm_state, options.mem_table_size, min_log_number)?
+            Self::replay_into_state(
+                &lsm_state,
+                options.mem_table_size,
+                min_log_number,
+                &cleanup_sender,
+            )?
         } else {
             (
                 WalReplayStats {
@@ -130,40 +137,24 @@ impl KvEngine {
         // 创建序列号生成器（从最后序列号继续）
         let sequence_number = Arc::new(SequenceNumber::with_start(last_sequence + 1));
 
-        let wal_refcounts = Arc::new(Mutex::new(std::collections::HashMap::new()));
-
         let engine = Self {
             wal_writer: Arc::new(Mutex::new(wal_writer)),
             sequence_number,
             lsm_state: lsm_state.clone(),
             version_set: version_set.clone(),
+            cleanup_sender: cleanup_sender.clone(),
             options: Arc::new(options),
-            flush_worker: FlushWorker::new(
-                lsm_state.clone(),
-                version_set.clone(),
-                obsolete_sender,
-                wal_refcounts.clone(),
-            ),
+            flush_worker: FlushWorker::new(lsm_state.clone(), version_set.clone()),
             cleanup_worker,
             current_log_number: AtomicU64::new(current_log_number),
-            wal_refcounts,
         };
 
         // 提交恢复阶段遗留的 immutable memtables
         {
             let state = engine.lsm_state.read().unwrap();
             for entry in state.immutable_mem_tables.iter() {
-                if entry.wal_log_number > 0 {
-                    *engine
-                        .wal_refcounts
-                        .lock()
-                        .unwrap()
-                        .entry(entry.wal_log_number)
-                        .or_insert(0) += 1;
-                }
                 let _ = engine.flush_worker.submit_task(FlushTask {
                     immutable_mem_table: entry.table.clone(),
-                    wal_log_number: entry.wal_log_number,
                     new_log_number: 0,
                 });
             }
@@ -185,6 +176,7 @@ impl KvEngine {
         lsm_state: &Arc<RwLock<LSMState>>,
         mem_table_size: usize,
         min_log_number: u64,
+        cleanup_sender: &mpsc::Sender<CleanupTask>,
     ) -> Result<(WalReplayStats, u64), std::io::Error> {
         let wal_files = Self::list_wal_files(min_log_number)?;
         let mut stats = WalReplayStats {
@@ -201,16 +193,25 @@ impl KvEngine {
             if !wal_path.exists() {
                 continue;
             }
+            let mut wal_handle: Option<Arc<WalHandle>> = None;
             let file_stats = replay_wal_file(&wal_path, |key, value| {
                 let mut state = lsm_state.write().unwrap();
                 state.mem_table.put(key, value.into());
                 if state.mem_table.should_flush() {
+                    let wal_handle = if log_number > 0 {
+                        let handle = wal_handle.get_or_insert_with(|| {
+                            Arc::new(WalHandle::new(log_number, cleanup_sender.clone()))
+                        });
+                        Some(handle.clone())
+                    } else {
+                        None
+                    };
                     let imm = Arc::new(ImmutableMemTable::new(state.mem_table.inner()));
                     state
                         .immutable_mem_tables
                         .push_back(ImmutableMemTableEntry {
                             table: imm,
-                            wal_log_number: log_number,
+                            wal_handle: wal_handle.clone(),
                         });
                     state.mem_table = Arc::new(MemTable::new(mem_table_size));
                 }
@@ -224,12 +225,20 @@ impl KvEngine {
             {
                 let mut state = lsm_state.write().unwrap();
                 if !state.mem_table.is_empty() {
+                    let wal_handle = if log_number > 0 {
+                        let handle = wal_handle.get_or_insert_with(|| {
+                            Arc::new(WalHandle::new(log_number, cleanup_sender.clone()))
+                        });
+                        Some(handle.clone())
+                    } else {
+                        None
+                    };
                     let imm = Arc::new(ImmutableMemTable::new(state.mem_table.inner()));
                     state
                         .immutable_mem_tables
                         .push_back(ImmutableMemTableEntry {
                             table: imm,
-                            wal_log_number: log_number,
+                            wal_handle: wal_handle.clone(),
                         });
                     state.mem_table = Arc::new(MemTable::new(mem_table_size));
                 }
@@ -375,7 +384,7 @@ impl KvEngine {
     }
 
     pub fn flush(&self) {
-        let (immutable_mem_table, old_log_number, new_log_number, rotation_succeeded) = {
+        let (immutable_mem_table, new_log_number, rotation_succeeded) = {
             let mut wal_guard = self.wal_writer.lock().unwrap();
             let candidate_log_number = {
                 let vs = self.version_set.read().unwrap();
@@ -386,23 +395,6 @@ impl KvEngine {
                     .saturating_add(1);
                 std::cmp::max(vs_next, current_next)
             };
-            let mut state = self.lsm_state.write().unwrap();
-
-            // 克隆当前的 memtable
-            let mem_table = state.mem_table.clone();
-
-            // 创建 immutable_mem_table
-            let immutable_mem_table = Arc::new(ImmutableMemTable::new(mem_table.inner()));
-
-            // 将 immutable_mem_table 放入队列并创建新的 memtable
-            state
-                .immutable_mem_tables
-                .push_back(ImmutableMemTableEntry {
-                    table: immutable_mem_table.clone(),
-                    wal_log_number: self.current_log_number.load(Ordering::SeqCst),
-                });
-            state.mem_table = Arc::new(MemTable::new(self.options.mem_table_size));
-
             let old_log_number = self.current_log_number.load(Ordering::SeqCst);
             let new_wal_path = DbPathManager::global().wal_path_by_id(candidate_log_number);
             let (new_log_number, rotation_succeeded) =
@@ -419,31 +411,37 @@ impl KvEngine {
                         (old_log_number, false)
                     }
                 };
+            let wal_handle = if rotation_succeeded && old_log_number > 0 {
+                Some(Arc::new(WalHandle::new(
+                    old_log_number,
+                    self.cleanup_sender.clone(),
+                )))
+            } else {
+                None
+            };
+            let mut state = self.lsm_state.write().unwrap();
 
-            (
-                immutable_mem_table,
-                old_log_number,
-                new_log_number,
-                rotation_succeeded,
-            )
+            // 克隆当前的 memtable
+            let mem_table = state.mem_table.clone();
+
+            // 创建 immutable_mem_table
+            let immutable_mem_table = Arc::new(ImmutableMemTable::new(mem_table.inner()));
+
+            // 将 immutable_mem_table 放入队列并创建新的 memtable
+            state
+                .immutable_mem_tables
+                .push_back(ImmutableMemTableEntry {
+                    table: immutable_mem_table.clone(),
+                    wal_handle,
+                });
+            state.mem_table = Arc::new(MemTable::new(self.options.mem_table_size));
+
+            (immutable_mem_table, new_log_number, rotation_succeeded)
         };
 
         // 发送 flush 任务到后台线程
-        if rotation_succeeded && old_log_number > 0 {
-            *self
-                .wal_refcounts
-                .lock()
-                .unwrap()
-                .entry(old_log_number)
-                .or_insert(0) += 1;
-        }
         if let Err(e) = self.flush_worker.submit_task(FlushTask {
             immutable_mem_table,
-            wal_log_number: if rotation_succeeded {
-                old_log_number
-            } else {
-                0
-            },
             new_log_number: if rotation_succeeded {
                 new_log_number
             } else {

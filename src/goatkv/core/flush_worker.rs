@@ -11,7 +11,6 @@ use crate::goatkv::storage::sstable_builder::SSTableBuilder;
 #[derive(Debug)]
 pub struct FlushTask {
     pub(crate) immutable_mem_table: Arc<ImmutableMemTable>,
-    pub(crate) wal_log_number: u64,
     pub(crate) new_log_number: u64,
 }
 
@@ -34,16 +33,11 @@ impl FlushWorker {
     ///
     /// # 返回
     /// 返回新创建的 FlushWorker 实例
-    pub fn new(
-        lsm_state: Arc<RwLock<LSMState>>,
-        version_set: Arc<RwLock<VersionSet>>,
-        obsolete_sender: mpsc::Sender<u64>,
-        wal_refcounts: Arc<std::sync::Mutex<std::collections::HashMap<u64, usize>>>,
-    ) -> Self {
+    pub fn new(lsm_state: Arc<RwLock<LSMState>>, version_set: Arc<RwLock<VersionSet>>) -> Self {
         let (tx, rx) = mpsc::channel();
 
         let handle = thread::spawn(move || {
-            Self::run_loop(rx, lsm_state, version_set, obsolete_sender, wal_refcounts);
+            Self::run_loop(rx, lsm_state, version_set);
         });
 
         Self {
@@ -75,8 +69,6 @@ impl FlushWorker {
         rx: mpsc::Receiver<FlushTask>,
         lsm_state: Arc<RwLock<LSMState>>,
         version_set: Arc<RwLock<VersionSet>>,
-        _obsolete_sender: mpsc::Sender<u64>,
-        wal_refcounts: Arc<std::sync::Mutex<std::collections::HashMap<u64, usize>>>,
     ) {
         while let Ok(task) = rx.recv() {
             // 从任务中获取要刷盘的 immutable memtable
@@ -148,30 +140,6 @@ impl FlushWorker {
                 let mut lsm_state_guard = lsm_state.write().unwrap();
                 lsm_state_guard.version = current_version;
                 lsm_state_guard.immutable_mem_tables.pop_front();
-            }
-
-            if task.wal_log_number > 0 {
-                let should_delete = {
-                    let mut refs = wal_refcounts.lock().unwrap();
-                    if let Some(count) = refs.get_mut(&task.wal_log_number) {
-                        if *count > 1 {
-                            *count -= 1;
-                            false
-                        } else {
-                            refs.remove(&task.wal_log_number);
-                            true
-                        }
-                    } else {
-                        true
-                    }
-                };
-                if should_delete {
-                    let wal_path = crate::goatkv::utils::db_path_manager::DbPathManager::global()
-                        .wal_path_by_id(task.wal_log_number);
-                    if let Err(e) = std::fs::remove_file(&wal_path) {
-                        eprintln!("Failed to remove WAL {:?}: {}", wal_path, e);
-                    }
-                }
             }
         }
     }
