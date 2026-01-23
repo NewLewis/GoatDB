@@ -17,6 +17,7 @@ pub struct WalWriter {
 
 impl WalWriter {
     pub fn new(file_path: PathBuf, wal_sync: bool) -> io::Result<Self> {
+        println!("new WalWriter, wal_sync: {}", wal_sync);
         let open_path = file_path.clone();
         let file = OpenOptions::new()
             .create(true)

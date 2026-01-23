@@ -46,7 +46,6 @@ pub struct KvEngineOptions {
     pub wal_sync: bool,
 
     // ===== VersionSet Options =====
-
     /// 保留的历史版本数量
     /// Default: 10
     pub max_versions: usize,
@@ -73,7 +72,7 @@ impl Default for KvEngineOptions {
             data_dir: default_data_dir,
             mem_table_size: 1024 * 1024, // 1MB
             recover_from_wal: true,
-            wal_sync: true,
+            wal_sync: false,
             // VersionSet defaults
             max_versions: 10,
             manifest_max_size: 32 * 1024 * 1024, // 32MB
