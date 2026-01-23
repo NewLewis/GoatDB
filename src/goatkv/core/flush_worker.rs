@@ -10,7 +10,6 @@ use crate::goatkv::storage::sstable_builder::SSTableBuilder;
 #[derive(Debug)]
 pub struct FlushTask {
     pub(crate) immutable_mem_table: Arc<ImmutableMemTable>,
-    pub(crate) id: usize,
     pub(crate) wal_log_number: u64,
     pub(crate) new_log_number: u64,
 }
@@ -117,7 +116,7 @@ impl FlushWorker {
             let props = match sst_builder.finish() {
                 Ok(meta) => meta,
                 Err(e) => {
-                    eprintln!("Failed to finish SSTable {}: {}", task.id, e);
+                    eprintln!("Failed to finish SSTable {}: {}", file_id, e);
                     continue; // 保持队列状态不变，稍后重试
                 }
             };

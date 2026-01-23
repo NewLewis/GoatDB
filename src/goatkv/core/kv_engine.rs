@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::goatkv::core::cleanup_worker::CleanupWorker;
@@ -28,8 +28,6 @@ pub struct KvEngine {
     /// 后台清理 Worker
     #[allow(dead_code)] // 持有以保持清理线程存活
     cleanup_worker: CleanupWorker,
-    /// 当前正在执行的 FlushTask 的 ID
-    flush_task_id: AtomicUsize,
     /// 当前 WAL 日志编号
     current_log_number: AtomicU64,
     /// WAL 引用计数，用于延迟删除
@@ -138,7 +136,6 @@ impl KvEngine {
                 wal_refcounts.clone(),
             ),
             cleanup_worker,
-            flush_task_id: AtomicUsize::new(0),
             current_log_number: AtomicU64::new(current_log_number),
             wal_refcounts,
         };
@@ -155,9 +152,7 @@ impl KvEngine {
                         .entry(entry.wal_log_number)
                         .or_insert(0) += 1;
                 }
-                let task_id = engine.flush_task_id.fetch_add(1, Ordering::SeqCst);
                 let _ = engine.flush_worker.submit_task(FlushTask {
-                    id: task_id,
                     immutable_mem_table: entry.table.clone(),
                     wal_log_number: entry.wal_log_number,
                     new_log_number: 0,
@@ -428,7 +423,6 @@ impl KvEngine {
         };
 
         // 发送 flush 任务到后台线程
-        let task_id = self.flush_task_id.fetch_add(1, Ordering::SeqCst);
         if rotation_succeeded && old_log_number > 0 {
             *self
                 .wal_refcounts
@@ -438,7 +432,6 @@ impl KvEngine {
                 .or_insert(0) += 1;
         }
         if let Err(e) = self.flush_worker.submit_task(FlushTask {
-            id: task_id,
             immutable_mem_table,
             wal_log_number: if rotation_succeeded {
                 old_log_number
