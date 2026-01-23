@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use crc32fast::Hasher;
 
 use crate::goatkv::encoding::internal_key::InternalKey;
+use crate::goatkv::utils::io_helpers::{read_exact_or_eof, ReadOutcome};
 
 /// Write-Ahead Log (WAL) 管理器
 ///
@@ -149,71 +150,31 @@ impl Iterator for WalIterator {
     type Item = io::Result<(InternalKey, Vec<u8>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // 读取校验和
-        let mut checksum_bytes = [0u8; 4];
-        match self.reader.read_exact(&mut checksum_bytes) {
-            Ok(_) => {}
-            Err(e) => {
-                if e.kind() == io::ErrorKind::UnexpectedEof {
-                    // 正常文件结束
-                    return None;
-                } else {
-                    // 其他读取错误
-                    return Some(Err(e));
-                }
-            }
-        }
-        let checksum = u32::from_le_bytes(checksum_bytes);
-
-        // 读取 InternalKey 总长度
-        let mut key_len_bytes = [0u8; 4];
-        if let Err(e) = self.reader.read_exact(&mut key_len_bytes) {
-            return Some(Err(e));
-        }
-        let key_len = u32::from_le_bytes(key_len_bytes);
-
-        // 读取用户键
-        let user_key_len = key_len as usize - 8; // 减去 encoded_sequence_number 的 8 字节
-        let mut user_key = vec![0u8; user_key_len];
-        if let Err(e) = self.reader.read_exact(&mut user_key) {
-            return Some(Err(e));
-        }
-
-        // 读取编码后的序列号
-        let mut encoded_seq_bytes = [0u8; 8];
-        if let Err(e) = self.reader.read_exact(&mut encoded_seq_bytes) {
-            return Some(Err(e));
-        }
-        let encoded_seq = u64::from_le_bytes(encoded_seq_bytes);
-
-        // 构造 InternalKey
-        let key = InternalKey::from_encoded(user_key, encoded_seq);
-
-        // 读取值长度
-        let mut value_len_bytes = [0u8; 4];
-        if let Err(e) = self.reader.read_exact(&mut value_len_bytes) {
-            return Some(Err(e));
-        }
-        let value_len = u32::from_le_bytes(value_len_bytes);
-
-        // 读取值
-        let mut value = vec![0u8; value_len as usize];
-        if let Err(e) = self.reader.read_exact(&mut value) {
-            return Some(Err(e));
-        }
-
-        // 验证校验和
-        if WalManager::get_checksum(&key, key_len, &value, value_len) != checksum {
-            return Some(Err(io::Error::new(
+        match read_wal_record(&mut self.reader) {
+            Ok(RecordRead::Eof) => None,
+            Ok(RecordRead::Partial(PartialStage::Checksum)) => None,
+            Ok(RecordRead::Partial(PartialStage::Body)) => Some(Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Unexpected EOF while reading WAL record",
+            ))),
+            Ok(RecordRead::InvalidKeyLen) => Some(Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "Checksum mismatch for key: {}",
-                    String::from_utf8_lossy(key.user_key())
-                ),
-            )));
+                "Invalid InternalKey length",
+            ))),
+            Ok(RecordRead::Record(record)) => {
+                if !record.checksum_matches() {
+                    return Some(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Checksum mismatch for key: {}",
+                            String::from_utf8_lossy(record.key.user_key())
+                        ),
+                    )));
+                }
+                Some(Ok((record.key, record.value)))
+            }
+            Err(e) => Some(Err(e)),
         }
-
-        Some(Ok((key, value)))
     }
 }
 
@@ -237,103 +198,28 @@ where
 
     loop {
         let record_start = last_good_offset;
-
-        let mut checksum_bytes = [0u8; 4];
-        match read_exact_or_eof(&mut reader, &mut checksum_bytes)? {
-            ReadOutcome::Eof => break,
-            ReadOutcome::Partial => {
+        let record = match read_wal_record(&mut reader)? {
+            RecordRead::Eof => break,
+            RecordRead::Partial(_) | RecordRead::InvalidKeyLen => {
                 file.set_len(record_start)?;
                 file.sync_data()?;
                 truncated = true;
                 break;
             }
-            ReadOutcome::Complete => {
-                last_good_offset += checksum_bytes.len() as u64;
-            }
-        }
-        let checksum = u32::from_le_bytes(checksum_bytes);
+            RecordRead::Record(record) => record,
+        };
 
-        let mut key_len_bytes = [0u8; 4];
-        if let Err(e) = reader.read_exact(&mut key_len_bytes) {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                file.set_len(record_start)?;
-                file.sync_data()?;
-                truncated = true;
-                break;
-            }
-            return Err(e);
-        }
-        last_good_offset += key_len_bytes.len() as u64;
-        let key_len = u32::from_le_bytes(key_len_bytes);
-        if key_len < 8 {
+        if !record.checksum_matches() {
             file.set_len(record_start)?;
             file.sync_data()?;
             truncated = true;
             break;
         }
 
-        let user_key_len = key_len as usize - 8;
-        let mut user_key = vec![0u8; user_key_len];
-        if let Err(e) = reader.read_exact(&mut user_key) {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                file.set_len(record_start)?;
-                file.sync_data()?;
-                truncated = true;
-                break;
-            }
-            return Err(e);
-        }
-        last_good_offset += user_key_len as u64;
-
-        let mut encoded_seq_bytes = [0u8; 8];
-        if let Err(e) = reader.read_exact(&mut encoded_seq_bytes) {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                file.set_len(record_start)?;
-                file.sync_data()?;
-                truncated = true;
-                break;
-            }
-            return Err(e);
-        }
-        last_good_offset += encoded_seq_bytes.len() as u64;
-        let encoded_seq = u64::from_le_bytes(encoded_seq_bytes);
-        let key = InternalKey::from_encoded(user_key, encoded_seq);
-
-        let mut value_len_bytes = [0u8; 4];
-        if let Err(e) = reader.read_exact(&mut value_len_bytes) {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                file.set_len(record_start)?;
-                file.sync_data()?;
-                truncated = true;
-                break;
-            }
-            return Err(e);
-        }
-        last_good_offset += value_len_bytes.len() as u64;
-        let value_len = u32::from_le_bytes(value_len_bytes);
-
-        let mut value = vec![0u8; value_len as usize];
-        if let Err(e) = reader.read_exact(&mut value) {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                file.set_len(record_start)?;
-                file.sync_data()?;
-                truncated = true;
-                break;
-            }
-            return Err(e);
-        }
-        last_good_offset += value_len as u64;
-
-        if WalManager::get_checksum(&key, key_len, &value, value_len) != checksum {
-            file.set_len(record_start)?;
-            file.sync_data()?;
-            truncated = true;
-            break;
-        }
-
-        max_sequence = max_sequence.max(key.sequence_number());
+        last_good_offset = record_start + record.total_len();
+        max_sequence = max_sequence.max(record.key.sequence_number());
         entries += 1;
-        on_entry(key, value);
+        on_entry(record.key, record.value);
     }
 
     Ok(WalReplayStats {
@@ -343,27 +229,94 @@ where
     })
 }
 
-enum ReadOutcome {
-    Eof,
-    Partial,
-    Complete,
+enum PartialStage {
+    Checksum,
+    Body,
 }
 
-fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<ReadOutcome> {
-    let mut read = 0;
-    while read < buf.len() {
-        match reader.read(&mut buf[read..])? {
-            0 => break,
-            n => read += n,
-        }
+enum RecordRead {
+    Eof,
+    Partial(PartialStage),
+    InvalidKeyLen,
+    Record(WalRecord),
+}
+
+struct WalRecord {
+    checksum: u32,
+    key_len: u32,
+    key: InternalKey,
+    value_len: u32,
+    value: Vec<u8>,
+}
+
+impl WalRecord {
+    fn checksum_matches(&self) -> bool {
+        WalManager::get_checksum(&self.key, self.key_len, &self.value, self.value_len)
+            == self.checksum
     }
-    if read == 0 {
-        Ok(ReadOutcome::Eof)
-    } else if read < buf.len() {
-        Ok(ReadOutcome::Partial)
-    } else {
-        Ok(ReadOutcome::Complete)
+
+    fn total_len(&self) -> u64 {
+        4 + 4 + self.key_len as u64 + 4 + self.value_len as u64
     }
+}
+
+fn read_exact_or_partial<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<bool> {
+    match reader.read_exact(buf) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn read_wal_record<R: Read>(reader: &mut R) -> io::Result<RecordRead> {
+    let mut checksum_bytes = [0u8; 4];
+    match read_exact_or_eof(reader, &mut checksum_bytes)? {
+        ReadOutcome::Eof => return Ok(RecordRead::Eof),
+        ReadOutcome::Partial => return Ok(RecordRead::Partial(PartialStage::Checksum)),
+        ReadOutcome::Complete => {}
+    }
+    let checksum = u32::from_le_bytes(checksum_bytes);
+
+    let mut key_len_bytes = [0u8; 4];
+    if !read_exact_or_partial(reader, &mut key_len_bytes)? {
+        return Ok(RecordRead::Partial(PartialStage::Body));
+    }
+    let key_len = u32::from_le_bytes(key_len_bytes);
+    if key_len < 8 {
+        return Ok(RecordRead::InvalidKeyLen);
+    }
+
+    let user_key_len = key_len as usize - 8;
+    let mut user_key = vec![0u8; user_key_len];
+    if !read_exact_or_partial(reader, &mut user_key)? {
+        return Ok(RecordRead::Partial(PartialStage::Body));
+    }
+
+    let mut encoded_seq_bytes = [0u8; 8];
+    if !read_exact_or_partial(reader, &mut encoded_seq_bytes)? {
+        return Ok(RecordRead::Partial(PartialStage::Body));
+    }
+    let encoded_seq = u64::from_le_bytes(encoded_seq_bytes);
+    let key = InternalKey::from_encoded(user_key, encoded_seq);
+
+    let mut value_len_bytes = [0u8; 4];
+    if !read_exact_or_partial(reader, &mut value_len_bytes)? {
+        return Ok(RecordRead::Partial(PartialStage::Body));
+    }
+    let value_len = u32::from_le_bytes(value_len_bytes);
+
+    let mut value = vec![0u8; value_len as usize];
+    if !read_exact_or_partial(reader, &mut value)? {
+        return Ok(RecordRead::Partial(PartialStage::Body));
+    }
+
+    Ok(RecordRead::Record(WalRecord {
+        checksum,
+        key_len,
+        key,
+        value_len,
+        value,
+    }))
 }
 
 #[cfg(test)]

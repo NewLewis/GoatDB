@@ -1,8 +1,9 @@
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 
 use crate::goatkv::metadata::version_edit::VersionEdit;
+use crate::goatkv::utils::io_helpers::{read_exact_or_eof, ReadOutcome};
 
 pub const INIT_MANIFEST_FILE_NAME: &str = "MANIFEST-0";
 
@@ -144,28 +145,5 @@ impl ManifestReader {
         file.set_len(offset).map_err(|e| e.to_string())?;
         file.sync_data().map_err(|e| e.to_string())?;
         Ok(())
-    }
-}
-
-enum ReadOutcome {
-    Eof,
-    Partial,
-    Complete,
-}
-
-fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<ReadOutcome> {
-    let mut read = 0;
-    while read < buf.len() {
-        match reader.read(&mut buf[read..])? {
-            0 => break,
-            n => read += n,
-        }
-    }
-    if read == 0 {
-        Ok(ReadOutcome::Eof)
-    } else if read < buf.len() {
-        Ok(ReadOutcome::Partial)
-    } else {
-        Ok(ReadOutcome::Complete)
     }
 }
