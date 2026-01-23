@@ -1,7 +1,8 @@
 use std::fs;
-use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+
+use crate::goatkv::utils::db_path_manager::DbPathManager;
 
 #[derive(Debug)]
 pub struct CleanupWorker {
@@ -15,14 +16,14 @@ impl CleanupWorker {
     /// # Returns
     /// - `Self`: Worker 实例（持有线程句柄）
     /// - `Sender<u64>`: 删除信号发送端，你需要把这个传给 VersionSet/FlushWorker
-    pub fn new(db_path: PathBuf) -> (Self, Sender<u64>) {
+    pub fn new() -> (Self, Sender<u64>) {
         // 1. 在内部创建通道
         let (tx, rx) = mpsc::channel();
 
         // 2. 在内部启动线程
         // 注意：这里把 path 和 rx move 进去了，不需要 self 参与
         let handle = thread::spawn(move || {
-            Self::run_loop(db_path, rx);
+            Self::run_loop(rx);
         });
 
         // 3. 返回 Worker 实例和 Sender
@@ -33,12 +34,10 @@ impl CleanupWorker {
     }
 
     /// 后台主循环
-    fn run_loop(db_path: PathBuf, rx: Receiver<u64>) {
+    fn run_loop(rx: Receiver<u64>) {
         // 只要 tx 还有人持有，recv 就会阻塞等待；tx 全部销毁，recv 返回 Err，循环退出
         while let Ok(file_number) = rx.recv() {
-            // todo 名字拼接
-            let filename = format!("{:06}.sst", file_number);
-            let file_path = db_path.join(&filename);
+            let file_path = DbPathManager::global().sstable_path_by_id(file_number);
 
             match fs::remove_file(&file_path) {
                 Ok(_) => {

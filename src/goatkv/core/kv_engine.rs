@@ -64,8 +64,7 @@ impl KvEngine {
         let _ = DbPathManager::try_init(&options.data_dir)?;
         let _ = DbPathManager::global().cleanup_tmp_dir();
 
-        let (cleanup_worker, obsolete_sender) =
-            CleanupWorker::new(DbPathManager::global().data_dir().into());
+        let (cleanup_worker, obsolete_sender) = CleanupWorker::new();
 
         let mem_table = Arc::new(MemTable::new(options.mem_table_size));
 
