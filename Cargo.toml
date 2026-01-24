@@ -24,7 +24,6 @@ tracing-appender = "0.2"
 [features]
 default = []
 rocksdb = ["dep:rocksdb"]
-bench = []
 
 [dev-dependencies]
 tempfile = "3.10"
@@ -44,9 +43,10 @@ rand = "0.8"
 # explicitly configured here.
 #
 # Organization:
-# - tests/common/     - Shared test utilities and fixtures
-# - tests/e2e/        - End-to-end integration tests
-# - tests/integration/ - Integration tests for specific components
+# - tests/common/       - Shared test utilities and fixtures
+# - tests/e2e/          - End-to-end integration tests
+# - tests/integration/  - Integration tests for specific components
+# - benches/            - Bench targets (cargo bench)
 #
 # Running tests:
 # - cargo test              - Run all tests
@@ -73,8 +73,8 @@ path = "tests/e2e/edge_cases_test.rs"
 harness = true
 
 [[test]]
-name = "e2e_recovery"
-path = "tests/e2e/recovery_test.rs"
+name = "integration_recovery"
+path = "tests/integration/recovery_test.rs"
 harness = true
 
 # ========== Integration Tests ==========
@@ -86,14 +86,13 @@ harness = true
 # path = "tests/integration/storage_test.rs"
 # harness = true
 
-# ========== Bench Tests ==========
-# Bench-style test binaries (no test harness)
+# ========== Bench Targets ==========
+# Bench-style binaries (no test harness)
 
-[[test]]
+[[bench]]
 name = "goatkv_bench"
-path = "tests/bench/goatkv_bench.rs"
+path = "benches/goatkv_bench.rs"
 harness = false
-required-features = ["bench"]
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"

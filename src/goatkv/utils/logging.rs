@@ -8,9 +8,9 @@ pub struct LogGuards {
     _file_guard: WorkerGuard,
 }
 
-pub fn init_logging(app_name: &str, base_dir: impl AsRef<Path>) -> LogGuards {
+pub fn init_logging(app_name: &str, base_dir: impl AsRef<Path>, default_filter: &str) -> LogGuards {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
 
     let log_dir = std::env::var("GOATDB_LOG_DIR")
         .ok()

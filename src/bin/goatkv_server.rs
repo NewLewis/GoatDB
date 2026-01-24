@@ -197,7 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref dir) = args.data_dir {
         options = options.with_data_dir(dir);
     }
-    let _log_guards = init_logging("goatkv_server", &options.data_dir);
+    let _log_guards = init_logging("goatkv_server", &options.data_dir, "info");
 
     if let Some(dir) = args.data_dir {
         info!("Using data directory: {}", dir);

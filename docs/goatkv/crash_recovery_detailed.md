@@ -417,7 +417,7 @@ flowchart TD
 
 ## 13. 测试覆盖
 
-基于 `tests/e2e/recovery_test.rs`，当前测试覆盖以下边界情况：
+基于 `tests/integration/recovery_test.rs`，当前测试覆盖以下边界情况：
 
 | 测试用例 | 验证内容 |
 |----------|----------|

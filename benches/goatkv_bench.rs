@@ -6,7 +6,6 @@ use std::time::Instant;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use tracing::info;
 
 use goat_db::goatkv::utils::init_logging;
 use goat_db::goatkv::{KvEngine, KvEngineOptions};
@@ -18,6 +17,10 @@ use rocksdb::{DBCompressionType, Options, WriteBatch, DB};
 #[command(about = "Benchmark for GoatKV")]
 #[command(version = "0.1.0")]
 struct Cli {
+    /// Cargo bench passes --bench to the binary; accept and ignore it.
+    #[arg(long, hide = true, global = true)]
+    bench: bool,
+
     /// Database directory
     #[arg(long)]
     directory: PathBuf,
@@ -317,7 +320,7 @@ fn ms_per_iter(total_ms: u128, iters: u64) -> f64 {
 }
 
 fn print_result(result: &BenchResult) {
-    info!(
+    println!(
         "engine={} workload={} total_ms={} iters={} ms_per_iter={:.3}",
         result.engine, result.workload, result.total_ms, result.iters, result.ms_per_iter
     );
@@ -339,7 +342,7 @@ fn main() {
     }
 
     let cli = Cli::parse();
-    let _log_guards = init_logging("goatkv_bench", &cli.directory);
+    let _log_guards = init_logging("goatkv_bench", &cli.directory, "warn");
 
     if cli.threads == 0 {
         tracing::error!("threads must be >= 1");
