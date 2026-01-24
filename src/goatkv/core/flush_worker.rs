@@ -7,6 +7,7 @@ use crate::goatkv::metadata::version_edit::{NewFile, VersionEdit};
 use crate::goatkv::metadata::version_set::VersionSet;
 use crate::goatkv::storage::sstable::SSTableBuilder;
 use crate::goatkv::utils::paths::SstablePaths;
+use tracing::error;
 
 /// 刷盘任务
 #[derive(Debug)]
@@ -92,7 +93,7 @@ impl FlushWorker {
             let mut sst_builder = match SSTableBuilder::new(file_id, &sstable_paths) {
                 Ok(builder) => builder,
                 Err(e) => {
-                    eprintln!("Failed to create SSTableBuilder: {}", e);
+                    error!("Failed to create SSTableBuilder: {}", e);
                     continue;
                 }
             };
@@ -113,7 +114,7 @@ impl FlushWorker {
             let props = match sst_builder.finish() {
                 Ok(meta) => meta,
                 Err(e) => {
-                    eprintln!("Failed to finish SSTable {}: {}", file_id, e);
+                    error!("Failed to finish SSTable {}: {}", file_id, e);
                     continue; // 保持队列状态不变，稍后重试
                 }
             };
@@ -135,7 +136,7 @@ impl FlushWorker {
             let current_version = {
                 let mut vs = version_set.write().unwrap();
                 if let Err(e) = vs.apply_edit(version_edit) {
-                    eprintln!("Failed to apply VersionEdit: {}", e);
+                    error!("Failed to apply VersionEdit: {}", e);
                     continue; // 不 pop_front，等待后续重试
                 }
                 vs.current()

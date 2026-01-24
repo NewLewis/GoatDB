@@ -12,6 +12,7 @@ use crate::goatkv::metadata::version_edit::VersionEdit;
 use crate::goatkv::utils::cleanup_task::CleanupTask;
 use crate::goatkv::utils::options::KvEngineOptions;
 use crate::goatkv::utils::paths::{ManifestPaths, SstablePaths};
+use tracing::warn;
 
 /// VersionSet 管理所有版本和增量变更。
 ///
@@ -329,7 +330,7 @@ impl VersionSet {
                 if let Some(file_id) = file_id {
                     if !seen_files.contains(&file_id) {
                         if let Err(e) = std::fs::remove_file(&path) {
-                            eprintln!("Failed to remove orphan SSTable {:?}: {}", path, e);
+                            warn!("Failed to remove orphan SSTable {:?}: {}", path, e);
                         }
                     }
                 }

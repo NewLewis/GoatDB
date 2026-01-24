@@ -16,6 +16,7 @@ use crate::goatkv::utils::cleanup_task::CleanupTask;
 use crate::goatkv::utils::options::KvEngineOptions;
 use crate::goatkv::utils::paths::{ManifestPaths, SstablePaths};
 use crate::goatkv::utils::sequence_number::SequenceNumber;
+use tracing::{error, warn};
 
 type DbPaths = (Arc<WalPaths>, Arc<SstablePaths>, Arc<ManifestPaths>);
 
@@ -148,7 +149,7 @@ impl KvEngine {
         };
 
         if wal_stats.truncated {
-            eprintln!("WAL replay truncated due to corruption or partial record.");
+            warn!("WAL replay truncated due to corruption or partial record.");
         }
 
         // 选择一个新的 WAL 编号，但不在恢复时推进 manifest 的 log_number。
@@ -484,7 +485,7 @@ impl KvEngine {
                         (new_log_number, true)
                     }
                     Err(e) => {
-                        eprintln!("Failed to rotate WAL: {}", e);
+                        error!("Failed to rotate WAL: {}", e);
                         (old_log_number, false)
                     }
                 };
@@ -526,7 +527,7 @@ impl KvEngine {
                 0
             },
         }) {
-            eprintln!("Failed to send flush task: {}", e);
+            error!("Failed to send flush task: {}", e);
         }
     }
 }

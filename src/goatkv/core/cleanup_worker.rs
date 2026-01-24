@@ -6,6 +6,7 @@ use std::thread;
 use crate::goatkv::storage::wal::WalPaths;
 use crate::goatkv::utils::cleanup_task::CleanupTask;
 use crate::goatkv::utils::paths::SstablePaths;
+use tracing::{info, warn};
 
 #[derive(Debug)]
 pub struct CleanupWorker {
@@ -60,17 +61,16 @@ impl CleanupWorker {
 
             match fs::remove_file(&file_path) {
                 Ok(_) => {
-                    // TODO: 替换为实际的日志宏
-                    println!("[CleanUp] Deleted {}: {:?}", label, file_path);
+                    info!("[CleanUp] Deleted {}: {:?}", label, file_path);
                 }
                 Err(e) => {
                     // 忽略文件不存在的错误，可能是重复删除
                     if e.kind() != std::io::ErrorKind::NotFound {
-                        eprintln!("[CleanUp] Failed to delete {:?}: {}", file_path, e);
+                        warn!("[CleanUp] Failed to delete {:?}: {}", file_path, e);
                     }
                 }
             }
         }
-        println!("[CleanUp] Worker thread stopped.");
+        info!("[CleanUp] Worker thread stopped.");
     }
 }

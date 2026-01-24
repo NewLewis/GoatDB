@@ -394,6 +394,7 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use tempfile::TempDir;
+    use tracing::{info, warn};
 
     /// 创建测试用的 SSTable 文件
     /// 返回 (TempDir, SSTable路径)
@@ -464,14 +465,14 @@ mod tests {
         let mut seen_keys = std::collections::HashSet::new();
         for (key, _) in &test_data {
             if seen_keys.contains(key) {
-                println!(
+                warn!(
                     "WARNING: Duplicate key in test data: {:?}",
                     String::from_utf8_lossy(key)
                 );
             }
             seen_keys.insert(key.clone());
         }
-        println!("Unique keys in test data: {}", seen_keys.len());
+        info!("Unique keys in test data: {}", seen_keys.len());
 
         // 读取所有block并遍历
         let mut all_entries = Vec::new();
@@ -498,8 +499,8 @@ mod tests {
             }
         }
 
-        println!("Total entries read: {}", all_entries.len());
-        println!("Total entries expected: {}", test_data.len());
+        info!("Total entries read: {}", all_entries.len());
+        info!("Total entries expected: {}", test_data.len());
 
         // 检查是否读取了所有条目
         assert_eq!(all_entries.len(), test_data.len());
@@ -516,7 +517,7 @@ mod tests {
 
         // 如果失败，打印错误信息
         if let Err(ref e) = reader {
-            println!("Error opening SSTable: {}", e);
+            warn!("Error opening SSTable: {}", e);
         }
 
         assert!(reader.is_ok());
@@ -525,7 +526,7 @@ mod tests {
         // 验证基本属性
         assert!(reader.index_entry_count() > 0);
         assert!(reader.min_key().is_some());
-        println!(
+        info!(
             "Reader created successfully with {} index entries",
             reader.index_entry_count()
         );

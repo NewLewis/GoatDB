@@ -5,6 +5,7 @@ use crate::goatkv::encoding::internal_key::InternalKey;
 use crate::goatkv::metadata::file_metadata::FileMetadata;
 use crate::goatkv::storage::sstable::SSTableReader;
 use crate::goatkv::utils::paths::SstablePaths;
+use tracing::warn;
 
 /// Version 代表某一时刻数据库的完整状态
 /// 一旦创建后不可修改，支持并发无锁读取
@@ -72,13 +73,13 @@ impl Version {
                             Ok(Some(result)) => return Some(result),
                             Ok(None) => continue, // Not found in this sstable, check next
                             Err(e) => {
-                                println!("Failed to read from sstable {:?}: {}", sstable_path, e);
+                                warn!("Failed to read from sstable {:?}: {}", sstable_path, e);
                                 return None;
                             }
                         }
                     }
                     Err(e) => {
-                        println!("Failed to open sstable {:?}: {}", sstable_path, e);
+                        warn!("Failed to open sstable {:?}: {}", sstable_path, e);
                         return None;
                     }
                 }
@@ -95,13 +96,13 @@ impl Version {
                             Ok(Some(result)) => return Some(result),
                             Ok(None) => return None, // Not found in this sstable, check next
                             Err(e) => {
-                                println!("Failed to read from sstable {:?}: {}", sstable_path, e);
+                                warn!("Failed to read from sstable {:?}: {}", sstable_path, e);
                                 return None;
                             }
                         }
                     }
                     Err(e) => {
-                        println!("Failed to open sstable {:?}: {}", sstable_path, e);
+                        warn!("Failed to open sstable {:?}: {}", sstable_path, e);
                         return None;
                     }
                 }

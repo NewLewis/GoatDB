@@ -6,7 +6,9 @@ use std::time::Instant;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use tracing::info;
 
+use goat_db::goatkv::utils::init_logging;
 use goat_db::goatkv::{KvEngine, KvEngineOptions};
 #[cfg(feature = "rocksdb")]
 use rocksdb::{DBCompressionType, Options, WriteBatch, DB};
@@ -94,7 +96,7 @@ struct BenchResult {
 
 #[cfg(not(feature = "rocksdb"))]
 fn ensure_rocksdb_available() -> ! {
-    eprintln!("rocksdb support is disabled; rebuild with --features rocksdb");
+    tracing::error!("rocksdb support is disabled; rebuild with --features rocksdb");
     std::process::exit(2);
 }
 
@@ -315,7 +317,7 @@ fn ms_per_iter(total_ms: u128, iters: u64) -> f64 {
 }
 
 fn print_result(result: &BenchResult) {
-    println!(
+    info!(
         "engine={} workload={} total_ms={} iters={} ms_per_iter={:.3}",
         result.engine, result.workload, result.total_ms, result.iters, result.ms_per_iter
     );
@@ -333,14 +335,14 @@ fn main() {
     if std::env::args_os().len() == 1 {
         let mut cmd = Cli::command();
         let _ = cmd.print_help();
-        println!();
         return;
     }
 
     let cli = Cli::parse();
+    let _log_guards = init_logging("goatkv_bench", &cli.directory);
 
     if cli.threads == 0 {
-        eprintln!("threads must be >= 1");
+        tracing::error!("threads must be >= 1");
         return;
     }
 

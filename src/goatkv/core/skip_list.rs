@@ -610,6 +610,6 @@ mod tests {
             prev_key = Some(k.user_key().to_vec());
         }
 
-        println!("Memory usage: {} bytes", sl.memory_usage());
+        tracing::info!("Memory usage: {} bytes", sl.memory_usage());
     }
 }

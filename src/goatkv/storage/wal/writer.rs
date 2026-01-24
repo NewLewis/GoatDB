@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use crate::goatkv::encoding::internal_key::InternalKey;
+use tracing::debug;
 
 use super::format::checksum_for;
 
@@ -17,7 +18,7 @@ pub struct WalWriter {
 
 impl WalWriter {
     pub fn new(file_path: PathBuf, wal_sync: bool) -> io::Result<Self> {
-        println!("new WalWriter, wal_sync: {}", wal_sync);
+        debug!("new WalWriter, wal_sync: {}", wal_sync);
         let open_path = file_path.clone();
         let file = OpenOptions::new()
             .create(true)
