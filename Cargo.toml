@@ -66,6 +66,11 @@ path = "tests/e2e/multi_client_test.rs"
 harness = true
 
 [[test]]
+name = "e2e_edge_cases"
+path = "tests/e2e/edge_cases_test.rs"
+harness = true
+
+[[test]]
 name = "e2e_recovery"
 path = "tests/e2e/recovery_test.rs"
 harness = true
