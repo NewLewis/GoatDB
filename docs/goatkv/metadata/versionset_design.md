@@ -446,7 +446,7 @@ MANIFEST-00123
 impl VersionSet {
     pub fn recover(options: &KvEngineOptions) -> Result<Self> {
         let (_wal_paths, _sstable_paths, manifest_paths) =
-            init_db_paths(&options.data_dir)?;
+            KvEngine::init_db_paths(&options.data_dir)?;
 
         // 1. 读取 CURRENT 文件，获取最新的 MANIFEST
         let manifest_num = self.read_current_file(&manifest_paths)?;

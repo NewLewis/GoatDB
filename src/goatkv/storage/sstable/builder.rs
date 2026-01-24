@@ -2,11 +2,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use super::block_builder::BlockBuilder;
+use super::bloom::BloomBuilder;
 use crate::goatkv::encoding::coding;
 use crate::goatkv::encoding::internal_key::InternalKey;
 use crate::goatkv::metadata::file_metadata::TableProperties;
-use crate::goatkv::storage::block_builder::BlockBuilder;
-use crate::goatkv::storage::bloom_builder::BloomBuilder;
 use crate::goatkv::utils::paths::SstablePaths;
 
 /// SSTable文件的魔数（Magic Number）
@@ -70,10 +70,10 @@ const MAGIC_NUMBER: u64 = 0x706A725F676F6174;
 ///
 /// # 示例
 /// ```no_run
-/// # use goat_db::goatkv::utils::init_db_paths;
-/// # use goat_db::goatkv::storage::sstable_builder::SSTableBuilder;
+/// # use goat_db::goatkv::core::KvEngine;
+/// # use goat_db::goatkv::storage::sstable::SSTableBuilder;
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let (_wal_paths, sstable_paths, _manifest_paths) = init_db_paths("./data")?;
+/// let (_wal_paths, sstable_paths, _manifest_paths) = KvEngine::init_db_paths("./data")?;
 /// let mut builder = SSTableBuilder::new(1, &sstable_paths)?;
 /// builder.write(b"apple", b"fruit");
 /// builder.write(b"banana", b"fruit");
@@ -135,11 +135,11 @@ impl SSTableBuilder {
     ///
     /// # 示例
     /// ```no_run
-    /// # use goat_db::goatkv::storage::sstable_builder::SSTableBuilder;
-    /// # use goat_db::goatkv::utils::init_db_paths;
+    /// # use goat_db::goatkv::storage::sstable::SSTableBuilder;
+    /// # use goat_db::goatkv::core::KvEngine;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let (_wal_paths, sstable_paths, _manifest_paths) =
-    ///     goat_db::goatkv::utils::init_db_paths("./data")?;
+    ///     goat_db::goatkv::core::KvEngine::init_db_paths("./data")?;
     /// let builder = SSTableBuilder::new(1, &sstable_paths)?;
     /// // 创建文件 ./data/000001.sst
     /// # Ok(())
@@ -208,10 +208,10 @@ impl SSTableBuilder {
     ///
     /// # 示例
     /// ```no_run
-    /// # use goat_db::goatkv::utils::init_db_paths;
-    /// # use goat_db::goatkv::storage::sstable_builder::SSTableBuilder;
+    /// # use goat_db::goatkv::core::KvEngine;
+    /// # use goat_db::goatkv::storage::sstable::SSTableBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let (_wal_paths, sstable_paths, _manifest_paths) = init_db_paths("./data")?;
+    /// let (_wal_paths, sstable_paths, _manifest_paths) = KvEngine::init_db_paths("./data")?;
     /// let mut builder = SSTableBuilder::new(1, &sstable_paths)?;
     /// builder.write(b"apple", b"fruit");
     /// builder.write(b"banana", b"fruit");
@@ -325,10 +325,10 @@ impl SSTableBuilder {
     ///
     /// # 示例
     /// ```no_run
-    /// # use goat_db::goatkv::utils::init_db_paths;
-    /// # use goat_db::goatkv::storage::sstable_builder::SSTableBuilder;
+    /// # use goat_db::goatkv::core::KvEngine;
+    /// # use goat_db::goatkv::storage::sstable::SSTableBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let (_wal_paths, sstable_paths, _manifest_paths) = init_db_paths("./data")?;
+    /// let (_wal_paths, sstable_paths, _manifest_paths) = KvEngine::init_db_paths("./data")?;
     /// let mut builder = SSTableBuilder::new(1, &sstable_paths)?;
     /// builder.write(b"key1", b"value1");
     /// builder.write(b"key2", b"value2");
@@ -426,7 +426,7 @@ impl SSTableBuilder {
         let mut writer = self
             .writer
             .take()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "SSTable writer missing"))?;
+            .ok_or_else(|| io::Error::other("SSTable writer missing"))?;
         writer.flush()?;
         writer.get_ref().sync_all()?;
         drop(writer);

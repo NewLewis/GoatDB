@@ -1,9 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
@@ -321,15 +321,22 @@ fn print_result(result: &BenchResult) {
     );
 }
 
-fn prepare_engine_dir(base: &PathBuf, engine: EngineKind, both: bool) -> PathBuf {
+fn prepare_engine_dir(base: &Path, engine: EngineKind, both: bool) -> PathBuf {
     if both {
         base.join(engine.label())
     } else {
-        base.clone()
+        base.to_path_buf()
     }
 }
 
 fn main() {
+    if std::env::args_os().len() == 1 {
+        let mut cmd = Cli::command();
+        let _ = cmd.print_help();
+        println!();
+        return;
+    }
+
     let cli = Cli::parse();
 
     if cli.threads == 0 {
@@ -357,7 +364,7 @@ fn main() {
                 let iters = if batch_size == 0 {
                     0
                 } else {
-                    (key_nums + batch_size - 1) / batch_size
+                    key_nums.div_ceil(batch_size)
                 };
                 match engine_kind {
                     EngineKind::Goatkv => {

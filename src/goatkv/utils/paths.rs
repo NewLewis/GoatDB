@@ -1,9 +1,44 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::goatkv::storage::wal::WalPaths;
-use crate::goatkv::utils::path_helpers;
+#[derive(Debug, Clone)]
+pub struct WalPaths {
+    wal_dir: PathBuf,
+}
+
+impl WalPaths {
+    pub fn new(wal_dir: PathBuf) -> Self {
+        Self { wal_dir }
+    }
+
+    pub fn wal_dir(&self) -> &Path {
+        &self.wal_dir
+    }
+
+    pub fn main_wal_path(&self) -> PathBuf {
+        self.wal_dir.join("goatdb.wal")
+    }
+
+    pub fn wal_path_by_id(&self, log_number: u64) -> PathBuf {
+        self.wal_dir.join(Self::format_wal_filename(log_number))
+    }
+
+    pub fn wal_path<S: AsRef<str>>(&self, name: S) -> PathBuf {
+        self.wal_dir.join(name.as_ref())
+    }
+
+    /// WAL 文件名规则
+    /// - 如果 log_number < 1,000,000：格式为 `{log_number:06}.wal`（如 000001.wal）
+    /// - 如果 log_number >= 1,000,000：格式为 `{log_number}.wal`（如 1234567.wal）
+    pub fn format_wal_filename(log_number: u64) -> String {
+        if log_number < 1_000_000 {
+            format!("{:06}.wal", log_number)
+        } else {
+            format!("{}.wal", log_number)
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SstablePaths {
@@ -29,13 +64,11 @@ impl SstablePaths {
     }
 
     pub fn sstable_path_by_id(&self, file_id: u64) -> PathBuf {
-        self.data_dir
-            .join(path_helpers::format_sstable_filename(file_id))
+        self.data_dir.join(Self::format_sstable_filename(file_id))
     }
 
     pub fn timestamped_sstable_path(&self) -> PathBuf {
-        self.data_dir
-            .join(path_helpers::timestamped_sstable_filename())
+        self.data_dir.join(Self::timestamped_sstable_filename())
     }
 
     pub fn tmp_path<S: AsRef<str>>(&self, name: S) -> PathBuf {
@@ -59,6 +92,26 @@ impl SstablePaths {
 
         Ok(())
     }
+
+    /// SSTable 文件名规则
+    /// - 如果 file_id < 1,000,000：格式为 `{file_id:06}.sst`（如 000001.sst）
+    /// - 如果 file_id >= 1,000,000：格式为 `{file_id}.sst`（如 1234567.sst）
+    pub fn format_sstable_filename(file_id: u64) -> String {
+        if file_id < 1_000_000 {
+            format!("{:06}.sst", file_id)
+        } else {
+            format!("{}.sst", file_id)
+        }
+    }
+
+    /// 基于当前时间戳生成 SSTable 文件名（用于 flush 操作）
+    pub fn timestamped_sstable_filename() -> String {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        format!("sstable_{}.db", timestamp)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -79,27 +132,4 @@ impl ManifestPaths {
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
-}
-
-pub fn init_db_paths<P: AsRef<Path>>(
-    base_dir: P,
-) -> Result<(Arc<WalPaths>, Arc<SstablePaths>, Arc<ManifestPaths>), std::io::Error> {
-    let base_dir = base_dir.as_ref().to_path_buf();
-    let data_dir = base_dir.join("data");
-    let wal_dir = base_dir.join("wal");
-    let log_dir = base_dir.join("log");
-    let tmp_dir = base_dir.join("tmp");
-
-    let dirs = [&base_dir, &data_dir, &wal_dir, &log_dir, &tmp_dir];
-    for dir in dirs {
-        if !dir.exists() {
-            fs::create_dir_all(dir)?;
-        }
-    }
-
-    let wal_paths = Arc::new(WalPaths::new(wal_dir));
-    let sstable_paths = Arc::new(SstablePaths::new(data_dir.clone(), tmp_dir));
-    let manifest_paths = Arc::new(ManifestPaths::new(base_dir, data_dir));
-
-    Ok((wal_paths, sstable_paths, manifest_paths))
 }

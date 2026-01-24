@@ -660,7 +660,7 @@ Magic: 0x706A725F676F6174
 ## 实现注意事项
 
 ### 1. 共享长度边界检查
-在 `block_reader.rs` 中，`linear_search_from_start` 和 `linear_search_from_restart` 函数需要添加共享长度边界检查，防止因数据损坏导致的索引越界 panic：
+在 `sstable/block_reader.rs` 中，`linear_search_from_start` 和 `linear_search_from_restart` 函数需要添加共享长度边界检查，防止因数据损坏导致的索引越界 panic：
 
 ```rust
 // 修复前（危险）：
@@ -673,7 +673,7 @@ if shared as usize <= prev_key.len() {
 ```
 
 ### 2. 索引条目错误处理
-在 `sstable_reader.rs` 的索引块解析中，应改进错误处理策略。当前实现静默跳过损坏的索引条目，建议改为：
+在 `sstable/reader.rs` 的索引块解析中，应改进错误处理策略。当前实现静默跳过损坏的索引条目，建议改为：
 
 ```rust
 // 当前（宽松）：

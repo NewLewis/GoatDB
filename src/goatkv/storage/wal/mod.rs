@@ -1,12 +1,12 @@
 mod error;
 mod format;
-mod paths;
+// WalPaths moved to utils/paths.rs
 mod reader;
 mod recovery;
 mod writer;
 
+pub use crate::goatkv::utils::paths::WalPaths;
 pub use error::{WalError, WalResult};
-pub use paths::WalPaths;
 pub use reader::WalReader;
 pub use recovery::{replay_wal_file, WalReplayStats};
 pub use writer::WalWriter;
@@ -29,8 +29,8 @@ mod tests {
     #[test]
     fn test_wal_writer_write_and_checksum() {
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
-        let mut wal_writer =
-            WalWriter::new(temp_file.path().to_path_buf(), false).expect("Failed to create WalWriter");
+        let mut wal_writer = WalWriter::new(temp_file.path().to_path_buf(), false)
+            .expect("Failed to create WalWriter");
 
         let key = InternalKey::new(b"test_key".to_vec(), 1, InternalKeyKind::Put);
         let value = b"test_value".to_vec();
@@ -68,7 +68,8 @@ mod tests {
         let path = temp_file.path().to_path_buf();
 
         {
-            let mut wal_writer = WalWriter::new(path.clone(), false).expect("Failed to create WalWriter");
+            let mut wal_writer =
+                WalWriter::new(path.clone(), false).expect("Failed to create WalWriter");
 
             let key1 = InternalKey::new(b"key1".to_vec(), 1, InternalKeyKind::Put);
             let value1 = b"value1".to_vec();
@@ -110,7 +111,8 @@ mod tests {
         let path = temp_file.path().to_path_buf();
 
         {
-            let mut wal_writer = WalWriter::new(path.clone(), false).expect("Failed to create WalWriter");
+            let mut wal_writer =
+                WalWriter::new(path.clone(), false).expect("Failed to create WalWriter");
 
             let key = InternalKey::new(b"test".to_vec(), 1, InternalKeyKind::Put);
             let value = b"valid".to_vec();

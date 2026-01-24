@@ -173,8 +173,8 @@ impl VersionEdit {
             coding::put_varint64(&mut buf, *level as u64);
             coding::put_varint64(&mut buf, meta.file_id);
             coding::put_varint64(&mut buf, meta.file_size());
-            coding::put_length_prefixed_slice(&mut buf, &meta.smallest_key());
-            coding::put_length_prefixed_slice(&mut buf, &meta.largest_key());
+            coding::put_length_prefixed_slice(&mut buf, meta.smallest_key());
+            coding::put_length_prefixed_slice(&mut buf, meta.largest_key());
         }
 
         buf

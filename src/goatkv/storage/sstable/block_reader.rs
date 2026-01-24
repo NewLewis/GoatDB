@@ -451,7 +451,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::goatkv::storage::block_builder::BlockBuilder;
+    use crate::goatkv::storage::sstable::BlockBuilder;
 
     #[test]
     fn test_block_reader_new() {

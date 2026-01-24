@@ -6,10 +6,9 @@ use goat_db::goatkv::core::kv_engine::KvEngine;
 use goat_db::goatkv::metadata::current;
 use goat_db::goatkv::metadata::manifest::{ManifestWriter, INIT_MANIFEST_FILE_NAME};
 use goat_db::goatkv::metadata::version_edit::VersionEdit;
-use goat_db::goatkv::storage::wal::WalWriter;
-use goat_db::goatkv::utils::init_db_paths;
-use goat_db::goatkv::utils::options::KvEngineOptions;
 use goat_db::goatkv::storage::wal::WalPaths;
+use goat_db::goatkv::storage::wal::WalWriter;
+use goat_db::goatkv::utils::options::KvEngineOptions;
 
 fn temp_dir() -> tempfile::TempDir {
     tempfile::tempdir().expect("create tempdir")
@@ -23,7 +22,7 @@ fn wal_path(log_number: u64, base: &WalPaths) -> PathBuf {
 fn recovery_handles_truncated_wal_tail() {
     let tmp = temp_dir();
 
-    let (wal_paths, _sstable_paths, _manifest_paths) = init_db_paths(tmp.path()).unwrap();
+    let (wal_paths, _sstable_paths, _manifest_paths) = KvEngine::init_db_paths(tmp.path()).unwrap();
 
     // 写入一个完整记录
     {
@@ -65,7 +64,7 @@ fn recovery_handles_truncated_wal_tail() {
 fn recovery_replays_multiple_wals_in_order() {
     let tmp = temp_dir();
 
-    let (wal_paths, _sstable_paths, _manifest_paths) = init_db_paths(tmp.path()).unwrap();
+    let (wal_paths, _sstable_paths, _manifest_paths) = KvEngine::init_db_paths(tmp.path()).unwrap();
 
     // WAL 0
     {
@@ -127,11 +126,11 @@ fn recovery_replays_multiple_wals_in_order() {
 fn recovery_advances_log_number_past_existing_wals() {
     let tmp = temp_dir();
 
-    let (wal_paths, _sstable_paths, _manifest_paths) = init_db_paths(tmp.path()).unwrap();
+    let (wal_paths, _sstable_paths, _manifest_paths) = KvEngine::init_db_paths(tmp.path()).unwrap();
 
     // 制造已存在的更大 WAL 编号
     for num in [2u64, 4u64] {
-        fs::write(wal_path(num, &wal_paths), &[]).unwrap();
+        fs::write(wal_path(num, &wal_paths), []).unwrap();
     }
 
     let options = KvEngineOptions::default()
@@ -161,7 +160,7 @@ fn recovery_advances_log_number_past_existing_wals() {
 fn recovery_truncates_manifest_tail() {
     let tmp = temp_dir();
 
-    let (_wal_paths, sstable_paths, manifest_paths) = init_db_paths(tmp.path()).unwrap();
+    let (_wal_paths, sstable_paths, manifest_paths) = KvEngine::init_db_paths(tmp.path()).unwrap();
 
     let manifest_path = sstable_paths.data_dir().join(INIT_MANIFEST_FILE_NAME);
     let mut edit = VersionEdit::new();
@@ -214,7 +213,7 @@ fn recovery_truncates_manifest_tail() {
 fn recovery_errors_on_corrupted_manifest_edit() {
     let tmp = temp_dir();
 
-    let (_wal_paths, sstable_paths, manifest_paths) = init_db_paths(tmp.path()).unwrap();
+    let (_wal_paths, sstable_paths, manifest_paths) = KvEngine::init_db_paths(tmp.path()).unwrap();
 
     let manifest_path = sstable_paths.data_dir().join(INIT_MANIFEST_FILE_NAME);
     {
@@ -247,7 +246,6 @@ fn recovery_errors_on_corrupted_manifest_edit() {
         std::io::ErrorKind::InvalidData,
         "unexpected error kind for corrupted manifest: {err}"
     );
-
 }
 
 #[cfg(unix)]
@@ -257,7 +255,7 @@ fn recovery_replays_wal_if_flush_never_completed() {
 
     let tmp = temp_dir();
 
-    let (wal_paths, sstable_paths, _manifest_paths) = init_db_paths(tmp.path()).unwrap();
+    let (wal_paths, sstable_paths, _manifest_paths) = KvEngine::init_db_paths(tmp.path()).unwrap();
 
     // WAL 1 写入一条记录
     {
@@ -294,10 +292,7 @@ fn recovery_replays_wal_if_flush_never_completed() {
         fs::set_permissions(tmp_dir, perms).unwrap();
     }
 
-    assert!(
-        wal_path(1, &wal_paths).exists(),
-        "WAL 1 should still exist"
-    );
+    assert!(wal_path(1, &wal_paths).exists(), "WAL 1 should still exist");
 
     // 再次启动：如果没有不安全的 log_number 推进，应当能 replay WAL 1
     let options = KvEngineOptions::default()

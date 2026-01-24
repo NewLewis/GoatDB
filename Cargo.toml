@@ -22,6 +22,7 @@ rocksdb = { version = "0.24.0", optional = true }
 [features]
 default = []
 rocksdb = ["dep:rocksdb"]
+bench = []
 
 [dev-dependencies]
 tempfile = "3.10"
@@ -64,6 +65,11 @@ name = "e2e_multi_client"
 path = "tests/e2e/multi_client_test.rs"
 harness = true
 
+[[test]]
+name = "e2e_recovery"
+path = "tests/e2e/recovery_test.rs"
+harness = true
+
 # ========== Integration Tests ==========
 # Component-level integration tests
 # Uncomment and add more as needed:
@@ -73,8 +79,18 @@ harness = true
 # path = "tests/integration/storage_test.rs"
 # harness = true
 
+# ========== Bench Tests ==========
+# Bench-style test binaries (no test harness)
+
+[[test]]
+name = "goatkv_bench"
+path = "tests/bench/goatkv_bench.rs"
+harness = false
+required-features = ["bench"]
+
 [build-dependencies]
 tonic-prost-build = "0.14.2"
+
 
 [profile.release]
 debug = true  # 开启调试符号，这不会影响性能，只会增加二进制文件大小

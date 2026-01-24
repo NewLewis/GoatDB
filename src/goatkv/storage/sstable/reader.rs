@@ -3,9 +3,9 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
+use super::block_reader::BlockReader;
 use crate::goatkv::encoding::coding;
 use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind, SEQUENCE_NUMBER_MAX};
-use crate::goatkv::storage::block_reader::BlockReader;
 
 /// SSTable 文件的 Magic Number
 const MAGIC_NUMBER: u64 = 0x706A725F676F6174;
@@ -32,7 +32,7 @@ pub struct SSTableReader {
     /// 文件句柄
     file: File,
     /// BloomFilter
-    bloom_filter: crate::goatkv::storage::bloom_builder::BloomFilter,
+    bloom_filter: super::bloom::BloomFilter,
     /// 索引条目列表，按分隔键排序
     index_entries: Vec<IndexEntry>,
 }
@@ -158,7 +158,7 @@ impl SSTableReader {
         let bloom_filter_size = index_offset - bloom_offset;
         let mut bloom_bitmap = vec![0u8; bloom_filter_size as usize];
         file.read_exact(&mut bloom_bitmap)?;
-        let bloom_filter = crate::goatkv::storage::bloom_builder::BloomFilter::new(bloom_bitmap);
+        let bloom_filter = super::bloom::BloomFilter::new(bloom_bitmap);
 
         // 6. 读取和解析索引块
         // index_offset 是索引块的开始位置
@@ -388,9 +388,9 @@ impl SSTableReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::goatkv::core::kv_engine::KvEngine;
     use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
-    use crate::goatkv::storage::sstable_builder::SSTableBuilder;
-    use crate::goatkv::utils::init_db_paths;
+    use crate::goatkv::storage::sstable::SSTableBuilder;
     use std::io::Write;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -399,7 +399,7 @@ mod tests {
     /// 返回 (TempDir, SSTable路径)
     fn create_test_sstable() -> (TempDir, PathBuf) {
         let temp_dir = TempDir::new().unwrap();
-        let (_, sstable_paths, _) = init_db_paths(temp_dir.path()).unwrap();
+        let (_, sstable_paths, _) = KvEngine::init_db_paths(temp_dir.path()).unwrap();
 
         let mut builder = SSTableBuilder::new_with_manager(1, &sstable_paths).unwrap();
 
@@ -435,7 +435,7 @@ mod tests {
     fn test_sstable_iter_all_data() {
         // 创建200条数据并测试完整迭代
         let temp_dir = TempDir::new().unwrap();
-        let (_, sstable_paths, _) = init_db_paths(temp_dir.path()).unwrap();
+        let (_, sstable_paths, _) = KvEngine::init_db_paths(temp_dir.path()).unwrap();
         let mut builder = SSTableBuilder::new_with_manager(1, &sstable_paths).unwrap();
 
         let mut test_data = Vec::new();

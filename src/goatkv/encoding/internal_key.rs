@@ -94,7 +94,7 @@ impl InternalKey {
 
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.user_key.len() + 8);
-        buf.extend_from_slice(&self.user_key());
+        buf.extend_from_slice(self.user_key());
         // 关键修正：使用 Big Endian 并取反 (!seq)
         // 原因：
         // 1. 我们希望 Sequence Number 越大，Key 越小 (Logical Order: Seq Desc)

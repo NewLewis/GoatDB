@@ -10,8 +10,8 @@ use crate::goatkv::metadata::manifest::{ManifestReader, ManifestWriter, INIT_MAN
 use crate::goatkv::metadata::version::Version;
 use crate::goatkv::metadata::version_edit::VersionEdit;
 use crate::goatkv::utils::cleanup_task::CleanupTask;
-use crate::goatkv::utils::paths::{ManifestPaths, SstablePaths};
 use crate::goatkv::utils::options::KvEngineOptions;
+use crate::goatkv::utils::paths::{ManifestPaths, SstablePaths};
 
 /// VersionSet 管理所有版本和增量变更。
 ///
@@ -273,7 +273,7 @@ impl VersionSet {
             }
 
             // 尝试打开 SSTable，验证 footer/index/bloom 结构
-            crate::goatkv::storage::sstable_reader::SSTableReader::open(&path).map_err(|e| {
+            crate::goatkv::storage::sstable::SSTableReader::open(&path).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("Invalid SSTable {:?}: {}", path, e),
@@ -455,9 +455,10 @@ impl VersionSet {
         // - 采用 WAL 思路：先持久化 edit，再更新内存；
         // - 崩溃后能通过 MANIFEST 重放恢复一致性。
         if write_manifest {
-            let manifest = self.manifest_writer.as_mut().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "manifest writer not initialized")
-            })?;
+            let manifest = self
+                .manifest_writer
+                .as_mut()
+                .ok_or_else(|| io::Error::other("manifest writer not initialized"))?;
             manifest.append_edit(&edit)?;
             manifest.sync()?; // ⚠️ 必须 fsync
         }

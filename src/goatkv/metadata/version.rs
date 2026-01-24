@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::goatkv::encoding::internal_key::InternalKey;
 use crate::goatkv::metadata::file_metadata::FileMetadata;
-use crate::goatkv::storage::sstable_reader::SSTableReader;
+use crate::goatkv::storage::sstable::SSTableReader;
 use crate::goatkv::utils::paths::SstablePaths;
 
 /// Version 代表某一时刻数据库的完整状态

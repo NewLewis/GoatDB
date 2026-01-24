@@ -51,7 +51,7 @@
 
 高层步骤：
 
-1) 初始化路径（`init_db_paths`），清理临时目录。
+1) 初始化路径（`KvEngine::init_db_paths`），清理临时目录。
 2) 打开 `VersionSet`，回放 MANIFEST 并校验 SSTable。
 3) 从 MANIFEST 取出 `min_log_number`（当前持久化的 WAL 边界）。
 4) 从 `min_log_number` 起按序回放 WAL。

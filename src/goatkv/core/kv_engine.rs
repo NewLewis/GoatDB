@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 
@@ -9,12 +10,14 @@ use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
 use crate::goatkv::core::wal_handle::WalHandle;
 use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
 use crate::goatkv::metadata::version_set::{VersionSet, VersionSetOptions};
+use crate::goatkv::storage::wal::WalPaths;
 use crate::goatkv::storage::wal::{replay_wal_file, WalReplayStats, WalWriter};
 use crate::goatkv::utils::cleanup_task::CleanupTask;
 use crate::goatkv::utils::options::KvEngineOptions;
-use crate::goatkv::storage::wal::WalPaths;
-use crate::goatkv::utils::paths::{init_db_paths, ManifestPaths, SstablePaths};
+use crate::goatkv::utils::paths::{ManifestPaths, SstablePaths};
 use crate::goatkv::utils::sequence_number::SequenceNumber;
+
+type DbPaths = (Arc<WalPaths>, Arc<SstablePaths>, Arc<ManifestPaths>);
 
 /// LSM-Tree 键值存储引擎
 #[derive(Debug)]
@@ -55,6 +58,27 @@ impl Default for KvEngine {
 }
 
 impl KvEngine {
+    pub fn init_db_paths<P: AsRef<Path>>(base_dir: P) -> Result<DbPaths, std::io::Error> {
+        let base_dir = base_dir.as_ref().to_path_buf();
+        let data_dir = base_dir.join("data");
+        let wal_dir = base_dir.join("wal");
+        let log_dir = base_dir.join("log");
+        let tmp_dir = base_dir.join("tmp");
+
+        let dirs = [&base_dir, &data_dir, &wal_dir, &log_dir, &tmp_dir];
+        for dir in dirs {
+            if !dir.exists() {
+                fs::create_dir_all(dir)?;
+            }
+        }
+
+        let wal_paths = Arc::new(WalPaths::new(wal_dir));
+        let sstable_paths = Arc::new(SstablePaths::new(data_dir.clone(), tmp_dir));
+        let manifest_paths = Arc::new(ManifestPaths::new(base_dir, data_dir));
+
+        Ok((wal_paths, sstable_paths, manifest_paths))
+    }
+
     /// 创建新的 KvEngine，使用默认数据目录（当前目录下的 goatdb_data）
     pub fn new() -> Self {
         let options = KvEngineOptions::default();
@@ -70,7 +94,7 @@ impl KvEngine {
     /// - `Ok(KvEngine)`: 创建成功
     /// - `Err(std::io::Error)`: 创建目录或初始化失败
     pub fn new_with_options(options: KvEngineOptions) -> Result<Self, std::io::Error> {
-        let (wal_paths, sstable_paths, manifest_paths) = init_db_paths(&options.data_dir)?;
+        let (wal_paths, sstable_paths, manifest_paths) = Self::init_db_paths(&options.data_dir)?;
         let _ = sstable_paths.cleanup_tmp_dir();
 
         let (cleanup_worker, cleanup_sender) =

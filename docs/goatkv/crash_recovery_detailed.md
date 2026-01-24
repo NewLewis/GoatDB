@@ -111,7 +111,8 @@ sequenceDiagram
 ```rust
 pub fn new_with_options(options: KvEngineOptions) -> Result<Self, std::io::Error> {
     // 1. 初始化路径管理器
-    let (wal_paths, sstable_paths, manifest_paths) = init_db_paths(&options.data_dir)?;
+    let (wal_paths, sstable_paths, manifest_paths) =
+        KvEngine::init_db_paths(&options.data_dir)?;
     
     // 2. 创建VersionSet（恢复MANIFEST），并用 current 初始化 LSMState
     let version_set = Arc::new(RwLock::new(VersionSet::open(
@@ -416,7 +417,7 @@ flowchart TD
 
 ## 13. 测试覆盖
 
-基于 `tests/recovery_tests.rs`，当前测试覆盖以下边界情况：
+基于 `tests/e2e/recovery_test.rs`，当前测试覆盖以下边界情况：
 
 | 测试用例 | 验证内容 |
 |----------|----------|

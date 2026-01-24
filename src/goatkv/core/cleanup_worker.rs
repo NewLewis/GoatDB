@@ -3,8 +3,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
 
-use crate::goatkv::utils::cleanup_task::CleanupTask;
 use crate::goatkv::storage::wal::WalPaths;
+use crate::goatkv::utils::cleanup_task::CleanupTask;
 use crate::goatkv::utils::paths::SstablePaths;
 
 #[derive(Debug)]

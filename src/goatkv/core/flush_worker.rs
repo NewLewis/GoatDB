@@ -5,7 +5,7 @@ use crate::goatkv::core::lsm_state::LSMState;
 use crate::goatkv::core::mem_table::ImmutableMemTable;
 use crate::goatkv::metadata::version_edit::{NewFile, VersionEdit};
 use crate::goatkv::metadata::version_set::VersionSet;
-use crate::goatkv::storage::sstable_builder::SSTableBuilder;
+use crate::goatkv::storage::sstable::SSTableBuilder;
 use crate::goatkv::utils::paths::SstablePaths;
 
 /// 刷盘任务
