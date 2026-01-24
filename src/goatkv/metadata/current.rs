@@ -1,26 +1,27 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write; // 引入 Write trait 以便使用 write_all
 
-use crate::goatkv::utils::db_path_manager::DbPathManager;
+use crate::goatkv::utils::paths::ManifestPaths;
 
 pub const CURRENT_FILE_NAME: &str = "CURRENT";
 
-pub fn current_path() -> std::path::PathBuf {
-    DbPathManager::global().base_path().join(CURRENT_FILE_NAME)
+pub fn current_path(paths: &ManifestPaths) -> std::path::PathBuf {
+    paths.base_dir().join(CURRENT_FILE_NAME)
 }
 
 /// 读取CURRENT文件内容
-pub fn read_current() -> std::io::Result<Option<String>> {
-    if !current_path().exists() {
+pub fn read_current(paths: &ManifestPaths) -> std::io::Result<Option<String>> {
+    let current_path = current_path(paths);
+    if !current_path.exists() {
         return Ok(None);
     }
 
-    let content = fs::read_to_string(current_path())?;
+    let content = fs::read_to_string(current_path)?;
     Ok(Some(content.trim().to_string()))
 }
 
-pub fn write_current(manifest_name: &str) -> std::io::Result<()> {
-    let current_path = current_path();
+pub fn write_current(paths: &ManifestPaths, manifest_name: &str) -> std::io::Result<()> {
+    let current_path = current_path(paths);
     let temp_path = current_path.with_extension("tmp");
 
     // 1. 使用 OpenOptions 打开文件，赋予写入权限 (Write Mode)
@@ -56,8 +57,8 @@ pub fn write_current(manifest_name: &str) -> std::io::Result<()> {
 }
 
 /// 查找最新的MANIFEST文件编号
-pub fn find_latest_manifest() -> std::io::Result<Option<String>> {
-    let data_dir = DbPathManager::global().data_dir();
+pub fn find_latest_manifest(paths: &ManifestPaths) -> std::io::Result<Option<String>> {
+    let data_dir = paths.data_dir();
     let mut max_number: Option<u64> = None;
 
     for entry in fs::read_dir(data_dir)? {

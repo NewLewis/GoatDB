@@ -390,7 +390,7 @@ mod tests {
     use super::*;
     use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
     use crate::goatkv::storage::sstable_builder::SSTableBuilder;
-    use crate::goatkv::utils::db_path_manager::DbPathManager;
+    use crate::goatkv::utils::init_db_paths;
     use std::io::Write;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -399,9 +399,9 @@ mod tests {
     /// 返回 (TempDir, SSTable路径)
     fn create_test_sstable() -> (TempDir, PathBuf) {
         let temp_dir = TempDir::new().unwrap();
-        let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
+        let (_, sstable_paths, _) = init_db_paths(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &sstable_paths).unwrap();
 
         // 添加一些测试数据，使用 InternalKey 格式（与生产环境一致）
         // 使用递减的序列号以确保正确的排序
@@ -427,7 +427,7 @@ mod tests {
 
         builder.finish().unwrap();
 
-        let sst_path = db_path_manager.sstable_path_by_id(1);
+        let sst_path = sstable_paths.sstable_path_by_id(1);
         (temp_dir, sst_path)
     }
 
@@ -435,8 +435,8 @@ mod tests {
     fn test_sstable_iter_all_data() {
         // 创建200条数据并测试完整迭代
         let temp_dir = TempDir::new().unwrap();
-        let db_path_manager = DbPathManager::new(temp_dir.path()).unwrap();
-        let mut builder = SSTableBuilder::new_with_manager(1, &db_path_manager).unwrap();
+        let (_, sstable_paths, _) = init_db_paths(temp_dir.path()).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &sstable_paths).unwrap();
 
         let mut test_data = Vec::new();
         for i in 0..200 {
@@ -453,7 +453,7 @@ mod tests {
 
         builder.finish().unwrap();
 
-        let sst_path = db_path_manager.sstable_path_by_id(1);
+        let sst_path = sstable_paths.sstable_path_by_id(1);
         let mut reader = SSTableReader::open(&sst_path).unwrap();
 
         // 由于SSTable按key排序，我们先对测试数据排序

@@ -1,10 +1,12 @@
 mod error;
 mod format;
+mod paths;
 mod reader;
 mod recovery;
 mod writer;
 
 pub use error::{WalError, WalResult};
+pub use paths::WalPaths;
 pub use reader::WalReader;
 pub use recovery::{replay_wal_file, WalReplayStats};
 pub use writer::WalWriter;

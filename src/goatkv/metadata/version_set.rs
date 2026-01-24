@@ -10,7 +10,7 @@ use crate::goatkv::metadata::manifest::{ManifestReader, ManifestWriter, INIT_MAN
 use crate::goatkv::metadata::version::Version;
 use crate::goatkv::metadata::version_edit::VersionEdit;
 use crate::goatkv::utils::cleanup_task::CleanupTask;
-use crate::goatkv::utils::db_path_manager::DbPathManager;
+use crate::goatkv::utils::paths::{ManifestPaths, SstablePaths};
 use crate::goatkv::utils::options::KvEngineOptions;
 
 /// VersionSet 管理所有版本和增量变更。
@@ -85,8 +85,8 @@ pub struct VersionSet {
     obsolete_sender: Sender<CleanupTask>,
 
     // ---------------- 环境配置 ----------------
-    #[allow(dead_code)] // 预留给后续清理/路径相关逻辑
-    db_path: PathBuf,
+    manifest_paths: Arc<ManifestPaths>,
+    sstable_paths: Arc<SstablePaths>,
     options: Arc<VersionSetOptions>, // Options 通常只读，用 Arc 共享
 }
 
@@ -131,21 +131,23 @@ impl From<&KvEngineOptions> for VersionSetOptions {
 impl VersionSet {
     /// 创建一个新的空 VersionSet（用于新数据库）
     pub fn new(
-        db_path: &Path,
+        manifest_paths: Arc<ManifestPaths>,
+        sstable_paths: Arc<SstablePaths>,
         obsolete_sender: Sender<CleanupTask>,
     ) -> Result<Self, std::io::Error> {
         let options = VersionSetOptions::default();
-        Self::new_with_options(db_path, options, obsolete_sender)
+        Self::new_with_options(manifest_paths, sstable_paths, options, obsolete_sender)
     }
 
     /// 使用指定选项创建 VersionSet
     pub fn new_with_options(
-        db_path: &Path,
+        manifest_paths: Arc<ManifestPaths>,
+        sstable_paths: Arc<SstablePaths>,
         options: VersionSetOptions,
         obsolete_sender: Sender<CleanupTask>,
     ) -> Result<Self, std::io::Error> {
         // 创建空的当前版本：没有任何 SSTable
-        let current = Arc::new(Version::new(options.num_levels));
+        let current = Arc::new(Version::new(options.num_levels, sstable_paths.clone()));
 
         Ok(Self {
             current,
@@ -156,14 +158,16 @@ impl VersionSet {
             next_file_number: 1,
             last_sequence: 0,
             obsolete_sender,
-            db_path: db_path.to_path_buf(),
+            manifest_paths,
+            sstable_paths,
             options: Arc::new(options),
         })
     }
 
     /// 打开已有数据库或创建新数据库（包含 MANIFEST 恢复）
     pub fn open(
-        db_path: &Path,
+        manifest_paths: Arc<ManifestPaths>,
+        sstable_paths: Arc<SstablePaths>,
         options: VersionSetOptions,
         obsolete_sender: Sender<CleanupTask>,
     ) -> Result<Self, std::io::Error> {
@@ -172,7 +176,8 @@ impl VersionSet {
         // 设计理由：
         // - 统一恢复入口，避免分散在多个模块；
         // - 通过 replay edits 复原 current，保证与历史行为一致。
-        let mut version_set = Self::new_with_options(db_path, options, obsolete_sender)?;
+        let mut version_set =
+            Self::new_with_options(manifest_paths, sstable_paths, options, obsolete_sender)?;
         version_set.recover_manifest()?;
         // 恢复后做一致性校验，避免使用损坏或不完整的元数据
         version_set.validate_recovery()?;
@@ -180,7 +185,7 @@ impl VersionSet {
     }
 
     fn recover_manifest(&mut self) -> Result<(), std::io::Error> {
-        let data_dir = DbPathManager::global().data_dir();
+        let data_dir = self.manifest_paths.data_dir();
 
         let manifest_path = self.resolve_manifest(data_dir)?;
 
@@ -248,7 +253,7 @@ impl VersionSet {
                 ));
             }
 
-            let path = DbPathManager::global().sstable_path_by_id(file.file_id);
+            let path = self.sstable_paths.sstable_path_by_id(file.file_id);
             let metadata = std::fs::metadata(&path).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
@@ -306,7 +311,7 @@ impl VersionSet {
         // 设计理由：
         // - 避免磁盘泄漏；
         // - 恢复后对齐 manifest 状态，保持目录整洁。
-        let data_dir = DbPathManager::global().data_dir();
+        let data_dir = self.sstable_paths.data_dir();
         if data_dir.exists() {
             for entry in std::fs::read_dir(data_dir)? {
                 let entry = entry?;
@@ -336,9 +341,9 @@ impl VersionSet {
 
     fn create_initial_manifest(&self) -> Result<String, std::io::Error> {
         let manifest_name = INIT_MANIFEST_FILE_NAME.to_string();
-        let manifest_path = DbPathManager::global().data_dir().join(&manifest_name);
+        let manifest_path = self.manifest_paths.data_dir().join(&manifest_name);
         let _ = ManifestWriter::create(&manifest_path)?;
-        current::write_current(&manifest_name)?;
+        current::write_current(&self.manifest_paths, &manifest_name)?;
         Ok(manifest_name)
     }
 
@@ -369,11 +374,11 @@ impl VersionSet {
     fn resolve_manifest(&self, data_dir: &Path) -> Result<PathBuf, std::io::Error> {
         // 获取 CURRENT 指向的 MANIFEST；若 CURRENT 缺失，则回退到最新 MANIFEST
         // 或创建初始 MANIFEST。
-        let mut manifest_name = match current::read_current()? {
+        let mut manifest_name = match current::read_current(&self.manifest_paths)? {
             Some(name) => name,
             None => {
-                if let Some(latest) = current::find_latest_manifest()? {
-                    current::write_current(&latest)?;
+                if let Some(latest) = current::find_latest_manifest(&self.manifest_paths)? {
+                    current::write_current(&self.manifest_paths, &latest)?;
                     latest
                 } else {
                     self.create_initial_manifest()?
@@ -385,8 +390,8 @@ impl VersionSet {
         let mut manifest_valid = Self::is_manifest_name_valid(&manifest_name, &manifest_path);
         if !manifest_valid {
             // CURRENT 内容非法或指向不存在的 MANIFEST，尝试回退到最新 MANIFEST
-            if let Some(latest) = current::find_latest_manifest()? {
-                current::write_current(&latest)?;
+            if let Some(latest) = current::find_latest_manifest(&self.manifest_paths)? {
+                current::write_current(&self.manifest_paths, &latest)?;
                 manifest_name = latest;
                 manifest_path = data_dir.join(&manifest_name);
                 manifest_valid = Self::is_manifest_name_valid(&manifest_name, &manifest_path);
@@ -417,7 +422,11 @@ impl VersionSet {
         }
 
         Self::sort_level_files(&mut files);
-        self.current = Arc::new(Version::from_files(files, self.last_sequence));
+        self.current = Arc::new(Version::from_files(
+            files,
+            self.last_sequence,
+            self.sstable_paths.clone(),
+        ));
 
         Ok(())
     }
@@ -633,7 +642,11 @@ impl VersionSet {
         //
         // 设计理由：
         // - 将 last_sequence 绑定到版本，便于恢复时做一致性校验。
-        Ok(Arc::new(Version::from_files(new_files, self.last_sequence)))
+        Ok(Arc::new(Version::from_files(
+            new_files,
+            self.last_sequence,
+            self.sstable_paths.clone(),
+        )))
     }
 
     /// 添加旧版本到历史列表

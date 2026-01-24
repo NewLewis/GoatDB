@@ -300,11 +300,15 @@ impl VersionSet {
 ```rust
 impl VersionSet {
     /// 后台清理任务，定期调用
-    pub fn purge_obsolete_files(&mut self, path_manager: &DbPathManager) -> Result<()> {
+    pub fn purge_obsolete_files(
+        &mut self,
+        sstable_paths: &SstablePaths,
+        manifest_paths: &ManifestPaths,
+    ) -> Result<()> {
         let mut deleted = Vec::new();
 
         for file_meta in &self.obsolete_files {
-            let path = path_manager.sstable_path(
+            let path = sstable_paths.sstable_path(
                 /* 推断 level 和 file_num */
             );
 
@@ -321,15 +325,15 @@ impl VersionSet {
         self.obsolete_files.retain(|f| !deleted.contains(&f.file_id));
 
         // 清理旧的 MANIFEST 文件
-        self.cleanup_old_manifests(path_manager)?;
+        self.cleanup_old_manifests(manifest_paths)?;
 
         Ok(())
     }
 
-    fn cleanup_old_manifests(&self, path_manager: &DbPathManager) -> Result<()> {
+    fn cleanup_old_manifests(&self, manifest_paths: &ManifestPaths) -> Result<()> {
         // 保留最新的 MANIFEST 文件
         // 删除所有 .manifest-old 文件
-        let manifest_dir = path_manager.manifest_dir();
+        let manifest_dir = manifest_paths.data_dir();
         for entry in std::fs::read_dir(manifest_dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -441,13 +445,14 @@ MANIFEST-00123
 ```rust
 impl VersionSet {
     pub fn recover(options: &KvEngineOptions) -> Result<Self> {
-        let path_manager = DbPathManager::new(&options.data_dir);
+        let (_wal_paths, _sstable_paths, manifest_paths) =
+            init_db_paths(&options.data_dir)?;
 
         // 1. 读取 CURRENT 文件，获取最新的 MANIFEST
-        let manifest_num = self.read_current_file(&path_manager)?;
+        let manifest_num = self.read_current_file(&manifest_paths)?;
 
         // 2. 读取并重放 MANIFEST 中的所有 VersionEdit
-        let manifest_path = path_manager.manifest_path(manifest_num);
+        let manifest_path = manifest_paths.data_dir().join(manifest_num);
         let edits = self.read_manifest_edits(&manifest_path)?;
 
         // 3. 重放所有编辑，构建当前状态

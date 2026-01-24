@@ -45,9 +45,9 @@ impl WalWriter {
         self.writer.write_all(value)?;
 
         self.writer.flush()?;
-        // if self.wal_sync {
-        //     self.writer.get_ref().sync_data()?;
-        // }
+        if self.wal_sync {
+            self.writer.get_ref().sync_data()?;
+        }
         Ok(())
     }
 

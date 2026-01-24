@@ -5,7 +5,7 @@
 
 ## 1）磁盘组件与目录结构
 
-由 `DbPathManager` 管理的目录布局：
+由路径集合（WalPaths/SstablePaths/ManifestPaths）管理的目录布局：
 
 - `data/`：SSTable（`*.sst`）与 MANIFEST（如 `MANIFEST-0`）
 - `wal/`：WAL 文件（`000001.wal`、`000002.wal` …）。历史主 WAL `goatdb.wal`
@@ -51,7 +51,7 @@
 
 高层步骤：
 
-1) 初始化路径（`DbPathManager`），清理临时目录。
+1) 初始化路径（`init_db_paths`），清理临时目录。
 2) 打开 `VersionSet`，回放 MANIFEST 并校验 SSTable。
 3) 从 MANIFEST 取出 `min_log_number`（当前持久化的 WAL 边界）。
 4) 从 `min_log_number` 起按序回放 WAL。

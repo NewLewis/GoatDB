@@ -7,7 +7,7 @@ use crate::goatkv::encoding::internal_key::InternalKey;
 use crate::goatkv::metadata::file_metadata::TableProperties;
 use crate::goatkv::storage::block_builder::BlockBuilder;
 use crate::goatkv::storage::bloom_builder::BloomBuilder;
-use crate::goatkv::utils::db_path_manager::DbPathManager;
+use crate::goatkv::utils::paths::SstablePaths;
 
 /// SSTable文件的魔数（Magic Number）
 /// 用于标识文件格式，固定值为 0x706A725F676F6174
@@ -70,11 +70,11 @@ const MAGIC_NUMBER: u64 = 0x706A725F676F6174;
 ///
 /// # 示例
 /// ```no_run
-/// # use goat_db::goatkv::utils::db_path_manager::DbPathManager;
+/// # use goat_db::goatkv::utils::init_db_paths;
 /// # use goat_db::goatkv::storage::sstable_builder::SSTableBuilder;
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// DbPathManager::init("./data")?;
-/// let mut builder = SSTableBuilder::new(1)?;
+/// let (_wal_paths, sstable_paths, _manifest_paths) = init_db_paths("./data")?;
+/// let mut builder = SSTableBuilder::new(1, &sstable_paths)?;
 /// builder.write(b"apple", b"fruit");
 /// builder.write(b"banana", b"fruit");
 /// builder.finish();
@@ -123,7 +123,7 @@ impl SSTableBuilder {
     /// # 参数
     /// - `id`: SSTable的唯一标识符
     ///
-    /// # 文件命名规则（由 DbPathManager 管理）
+    /// # 文件命名规则（由统一命名规则管理）
     /// - 如果 file_id < 1,000,000：格式为 `{file_id:06}.sst`（如 000001.sst）
     /// - 如果 file_id >= 1,000,000：格式为 `{file_id}.sst`（如 1234567.sst）
     ///
@@ -131,38 +131,38 @@ impl SSTableBuilder {
     /// 返回io::Error，如果文件创建失败
     ///
     /// # 注意
-    /// 使用全局 DbPathManager 单例，必须先调用 `DbPathManager::init()` 初始化
+    /// 需要显式传入 SSTablePaths
     ///
     /// # 示例
     /// ```no_run
     /// # use goat_db::goatkv::storage::sstable_builder::SSTableBuilder;
-    /// # use goat_db::goatkv::utils::db_path_manager::DbPathManager;
+    /// # use goat_db::goatkv::utils::init_db_paths;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// DbPathManager::init("./data")?;
-    /// let builder = SSTableBuilder::new(1)?;
+    /// let (_wal_paths, sstable_paths, _manifest_paths) =
+    ///     goat_db::goatkv::utils::init_db_paths("./data")?;
+    /// let builder = SSTableBuilder::new(1, &sstable_paths)?;
     /// // 创建文件 ./data/000001.sst
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new(id: u64) -> io::Result<Self> {
-        let db_path_manager = DbPathManager::global();
-        Self::new_with_manager(id, db_path_manager)
+    pub fn new(id: u64, sstable_paths: &SstablePaths) -> io::Result<Self> {
+        Self::new_with_manager(id, sstable_paths)
     }
 
-    /// 创建一个新的SSTableBuilder，使用指定的DbPathManager
+    /// 创建一个新的SSTableBuilder，使用指定的 SSTablePaths
     ///
     /// # 参数
     /// - `id`: SSTable的唯一标识符
-    /// - `db_path_manager`: 数据库路径管理器引用
+    /// - `sstable_paths`: SSTable 路径集合
     ///
     /// # 错误
     /// 返回io::Error，如果文件创建失败
     ///
     /// # 注意
-    /// 此方法主要用于测试，允许使用临时DbPathManager而不影响全局单例
-    pub fn new_with_manager(id: u64, db_path_manager: &DbPathManager) -> io::Result<Self> {
-        let sstable_path = db_path_manager.sstable_path_by_id(id);
-        let tmp_path = db_path_manager.tmp_path(format!("sstable_{:06}.tmp", id));
+    /// 此方法主要用于测试，允许使用临时 SSTablePaths
+    pub fn new_with_manager(id: u64, sstable_paths: &SstablePaths) -> io::Result<Self> {
+        let sstable_path = sstable_paths.sstable_path_by_id(id);
+        let tmp_path = sstable_paths.tmp_path(format!("sstable_{:06}.tmp", id));
 
         let file = OpenOptions::new()
             .create(true)
@@ -208,11 +208,11 @@ impl SSTableBuilder {
     ///
     /// # 示例
     /// ```no_run
-    /// # use goat_db::goatkv::utils::db_path_manager::DbPathManager;
+    /// # use goat_db::goatkv::utils::init_db_paths;
     /// # use goat_db::goatkv::storage::sstable_builder::SSTableBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// DbPathManager::init("./data")?;
-    /// let mut builder = SSTableBuilder::new(1)?;
+    /// let (_wal_paths, sstable_paths, _manifest_paths) = init_db_paths("./data")?;
+    /// let mut builder = SSTableBuilder::new(1, &sstable_paths)?;
     /// builder.write(b"apple", b"fruit");
     /// builder.write(b"banana", b"fruit");
     /// builder.write(b"cherry", b"fruit");
@@ -325,11 +325,11 @@ impl SSTableBuilder {
     ///
     /// # 示例
     /// ```no_run
-    /// # use goat_db::goatkv::utils::db_path_manager::DbPathManager;
+    /// # use goat_db::goatkv::utils::init_db_paths;
     /// # use goat_db::goatkv::storage::sstable_builder::SSTableBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// DbPathManager::init("./data")?;
-    /// let mut builder = SSTableBuilder::new(1)?;
+    /// let (_wal_paths, sstable_paths, _manifest_paths) = init_db_paths("./data")?;
+    /// let mut builder = SSTableBuilder::new(1, &sstable_paths)?;
     /// builder.write(b"key1", b"value1");
     /// builder.write(b"key2", b"value2");
     /// let metadata = builder.finish()?;

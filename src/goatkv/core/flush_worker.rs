@@ -6,6 +6,7 @@ use crate::goatkv::core::mem_table::ImmutableMemTable;
 use crate::goatkv::metadata::version_edit::{NewFile, VersionEdit};
 use crate::goatkv::metadata::version_set::VersionSet;
 use crate::goatkv::storage::sstable_builder::SSTableBuilder;
+use crate::goatkv::utils::paths::SstablePaths;
 
 /// 刷盘任务
 #[derive(Debug)]
@@ -30,14 +31,19 @@ impl FlushWorker {
     /// # 参数
     /// - `lsm_state`: LSM 状态管理器，用于访问 immutable memtables 和 version snapshot
     /// - `version_set`: VersionSet 管理 manifest 与版本演进
+    /// - `sstable_paths`: SSTable 路径集合
     ///
     /// # 返回
     /// 返回新创建的 FlushWorker 实例
-    pub fn new(lsm_state: Arc<RwLock<LSMState>>, version_set: Arc<RwLock<VersionSet>>) -> Self {
+    pub fn new(
+        lsm_state: Arc<RwLock<LSMState>>,
+        version_set: Arc<RwLock<VersionSet>>,
+        sstable_paths: Arc<SstablePaths>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
 
         let handle = thread::spawn(move || {
-            Self::run_loop(rx, lsm_state, version_set);
+            Self::run_loop(rx, lsm_state, version_set, sstable_paths);
         });
 
         Self {
@@ -69,6 +75,7 @@ impl FlushWorker {
         rx: mpsc::Receiver<FlushTask>,
         lsm_state: Arc<RwLock<LSMState>>,
         version_set: Arc<RwLock<VersionSet>>,
+        sstable_paths: Arc<SstablePaths>,
     ) {
         while let Ok(task) = rx.recv() {
             // 从任务中获取要刷盘的 immutable memtable
@@ -82,7 +89,7 @@ impl FlushWorker {
                 (file_id, next_file_number)
             };
 
-            let mut sst_builder = match SSTableBuilder::new(file_id) {
+            let mut sst_builder = match SSTableBuilder::new(file_id, &sstable_paths) {
                 Ok(builder) => builder,
                 Err(e) => {
                     eprintln!("Failed to create SSTableBuilder: {}", e);

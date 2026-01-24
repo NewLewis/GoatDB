@@ -11,8 +11,9 @@ use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
 use crate::goatkv::metadata::version_set::{VersionSet, VersionSetOptions};
 use crate::goatkv::storage::wal::{replay_wal_file, WalReplayStats, WalWriter};
 use crate::goatkv::utils::cleanup_task::CleanupTask;
-use crate::goatkv::utils::db_path_manager::DbPathManager;
 use crate::goatkv::utils::options::KvEngineOptions;
+use crate::goatkv::storage::wal::WalPaths;
+use crate::goatkv::utils::paths::{init_db_paths, ManifestPaths, SstablePaths};
 use crate::goatkv::utils::sequence_number::SequenceNumber;
 
 /// LSM-Tree 键值存储引擎
@@ -22,14 +23,22 @@ pub struct KvEngine {
     wal_writer: Arc<Mutex<WalWriter>>,
     /// 序列号生成器
     sequence_number: Arc<SequenceNumber>,
+    /// 清理任务发送端
+    cleanup_sender: mpsc::Sender<CleanupTask>,
+    /// 是否允许删除 WAL（关闭时禁用）
+    cleanup_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// LSM 状态管理器（memtables + current version）
     lsm_state: Arc<RwLock<LSMState>>,
     /// VersionSet 管理 manifest 与版本演进
     version_set: Arc<RwLock<VersionSet>>,
-    /// 清理任务发送端
-    cleanup_sender: mpsc::Sender<CleanupTask>,
     /// 配置选项
     options: Arc<KvEngineOptions>,
+    /// WAL 路径集合
+    wal_paths: Arc<WalPaths>,
+    /// SSTable 路径集合
+    sstable_paths: Arc<SstablePaths>,
+    /// MANIFEST/CURRENT 路径集合
+    manifest_paths: Arc<ManifestPaths>,
     /// 后台刷盘 Worker
     flush_worker: FlushWorker,
     /// 后台清理 Worker
@@ -61,18 +70,23 @@ impl KvEngine {
     /// - `Ok(KvEngine)`: 创建成功
     /// - `Err(std::io::Error)`: 创建目录或初始化失败
     pub fn new_with_options(options: KvEngineOptions) -> Result<Self, std::io::Error> {
-        // 初始化全局路径管理器单例
-        // 使用 try_init 以便在测试中可以重用已初始化的单例
-        let _ = DbPathManager::try_init(&options.data_dir)?;
-        let _ = DbPathManager::global().cleanup_tmp_dir();
+        let (wal_paths, sstable_paths, manifest_paths) = init_db_paths(&options.data_dir)?;
+        let _ = sstable_paths.cleanup_tmp_dir();
 
-        let (cleanup_worker, cleanup_sender) = CleanupWorker::new();
+        let (cleanup_worker, cleanup_sender) =
+            CleanupWorker::new(wal_paths.clone(), sstable_paths.clone());
+        let cleanup_enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
         let mem_table = Arc::new(MemTable::new(options.mem_table_size));
 
         // 创建 VersionSet 并获取当前版本快照
         let vs_options = VersionSetOptions::from(&options);
-        let version_set = VersionSet::open(&options.data_dir, vs_options, cleanup_sender.clone())?;
+        let version_set = VersionSet::open(
+            manifest_paths.clone(),
+            sstable_paths.clone(),
+            vs_options,
+            cleanup_sender.clone(),
+        )?;
         let version_set = Arc::new(RwLock::new(version_set));
         let current_version = {
             let vs_guard = version_set.read().unwrap();
@@ -91,10 +105,12 @@ impl KvEngine {
                 vs_guard.log_number()
             };
             Self::replay_into_state(
+                &wal_paths,
                 &lsm_state,
                 options.mem_table_size,
                 min_log_number,
                 &cleanup_sender,
+                &cleanup_enabled,
             )?
         } else {
             (
@@ -125,7 +141,7 @@ impl KvEngine {
             log_number
         };
 
-        let wal_path = DbPathManager::global().wal_path_by_id(current_log_number);
+        let wal_path = wal_paths.wal_path_by_id(current_log_number);
         let wal_writer = WalWriter::new(wal_path, options.wal_sync)
             .map_err(|e| std::io::Error::other(format!("Failed to open WAL file: {}", e)))?;
 
@@ -143,10 +159,18 @@ impl KvEngine {
             lsm_state: lsm_state.clone(),
             version_set: version_set.clone(),
             cleanup_sender: cleanup_sender.clone(),
+            cleanup_enabled: cleanup_enabled.clone(),
             options: Arc::new(options),
-            flush_worker: FlushWorker::new(lsm_state.clone(), version_set.clone()),
+            flush_worker: FlushWorker::new(
+                lsm_state.clone(),
+                version_set.clone(),
+                sstable_paths.clone(),
+            ),
             cleanup_worker,
             current_log_number: AtomicU64::new(current_log_number),
+            wal_paths,
+            sstable_paths,
+            manifest_paths,
         };
 
         // 提交恢复阶段遗留的 immutable memtables
@@ -173,12 +197,14 @@ impl KvEngine {
 
     /// 从 WAL 文件恢复数据到内存表
     fn replay_into_state(
+        wal_paths: &WalPaths,
         lsm_state: &Arc<RwLock<LSMState>>,
         mem_table_size: usize,
         min_log_number: u64,
         cleanup_sender: &mpsc::Sender<CleanupTask>,
+        cleanup_enabled: &Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<(WalReplayStats, u64), std::io::Error> {
-        let wal_files = Self::list_wal_files(min_log_number)?;
+        let wal_files = Self::list_wal_files(wal_paths, min_log_number)?;
         let mut stats = WalReplayStats {
             max_sequence: 0,
             entries: 0,
@@ -200,7 +226,11 @@ impl KvEngine {
                 if state.mem_table.should_flush() {
                     let wal_handle = if log_number > 0 {
                         let handle = wal_handle.get_or_insert_with(|| {
-                            Arc::new(WalHandle::new(log_number, cleanup_sender.clone()))
+                            Arc::new(WalHandle::new(
+                                log_number,
+                                cleanup_sender.clone(),
+                                cleanup_enabled.clone(),
+                            ))
                         });
                         Some(handle.clone())
                     } else {
@@ -227,7 +257,11 @@ impl KvEngine {
                 if !state.mem_table.is_empty() {
                     let wal_handle = if log_number > 0 {
                         let handle = wal_handle.get_or_insert_with(|| {
-                            Arc::new(WalHandle::new(log_number, cleanup_sender.clone()))
+                            Arc::new(WalHandle::new(
+                                log_number,
+                                cleanup_sender.clone(),
+                                cleanup_enabled.clone(),
+                            ))
                         });
                         Some(handle.clone())
                     } else {
@@ -248,9 +282,11 @@ impl KvEngine {
         Ok((stats, max_log_number))
     }
 
-    fn list_wal_files(min_log_number: u64) -> Result<Vec<(u64, PathBuf)>, std::io::Error> {
-        let path_manager = DbPathManager::global();
-        let wal_dir = path_manager.wal_dir();
+    fn list_wal_files(
+        wal_paths: &WalPaths,
+        min_log_number: u64,
+    ) -> Result<Vec<(u64, PathBuf)>, std::io::Error> {
+        let wal_dir = wal_paths.wal_dir();
         let mut wal_files = Vec::new();
 
         if wal_dir.exists() {
@@ -275,7 +311,7 @@ impl KvEngine {
 
         wal_files.sort_by_key(|(num, _)| *num);
 
-        let main_wal = path_manager.main_wal_path();
+        let main_wal = wal_paths.main_wal_path();
         if min_log_number == 0 && main_wal.exists() {
             wal_files.insert(0, (0, main_wal));
         }
@@ -284,10 +320,27 @@ impl KvEngine {
     }
 }
 
+impl Drop for KvEngine {
+    fn drop(&mut self) {
+        // Shutdown: avoid deleting WAL files when in-memory state may not be flushed.
+        self.cleanup_enabled.store(false, Ordering::SeqCst);
+    }
+}
+
 impl KvEngine {
-    /// 获取路径管理器引用（全局单例）
-    pub fn path_manager() -> &'static DbPathManager {
-        DbPathManager::global()
+    /// 获取 WAL 路径集合
+    pub fn wal_paths(&self) -> &WalPaths {
+        &self.wal_paths
+    }
+
+    /// 获取 SSTable 路径集合
+    pub fn sstable_paths(&self) -> &SstablePaths {
+        &self.sstable_paths
+    }
+
+    /// 获取 MANIFEST/CURRENT 路径集合
+    pub fn manifest_paths(&self) -> &ManifestPaths {
+        &self.manifest_paths
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -396,7 +449,7 @@ impl KvEngine {
                 std::cmp::max(vs_next, current_next)
             };
             let old_log_number = self.current_log_number.load(Ordering::SeqCst);
-            let new_wal_path = DbPathManager::global().wal_path_by_id(candidate_log_number);
+            let new_wal_path = self.wal_paths.wal_path_by_id(candidate_log_number);
             let (new_log_number, rotation_succeeded) =
                 match WalWriter::new(new_wal_path, self.options.wal_sync) {
                     Ok(new_manager) => {
@@ -415,6 +468,7 @@ impl KvEngine {
                 Some(Arc::new(WalHandle::new(
                     old_log_number,
                     self.cleanup_sender.clone(),
+                    self.cleanup_enabled.clone(),
                 )))
             } else {
                 None
@@ -533,19 +587,20 @@ mod tests {
     }
 
     #[test]
-    fn test_path_manager_integration() {
-        let _engine = KvEngine::new_for_test();
-        let path_manager = KvEngine::path_manager();
+    fn test_paths_integration() {
+        let engine = KvEngine::new_for_test();
+        let wal_paths = engine.wal_paths();
+        let sstable_paths = engine.sstable_paths();
+        let manifest_paths = engine.manifest_paths();
 
-        // Verify path manager is properly integrated
-        assert!(path_manager.base_path().exists());
-        assert!(path_manager.data_dir().exists());
-        assert!(path_manager.wal_dir().exists());
-        assert!(path_manager.log_dir().exists());
-        assert!(path_manager.tmp_dir().exists());
+        // Verify paths are properly integrated
+        assert!(manifest_paths.base_dir().exists());
+        assert!(manifest_paths.data_dir().exists());
+        assert!(wal_paths.wal_dir().exists());
+        assert!(sstable_paths.tmp_dir().exists());
 
         // Verify WAL file is in the correct location
-        let wal_path = path_manager.main_wal_path();
-        assert!(wal_path.parent().unwrap() == path_manager.wal_dir());
+        let wal_path = wal_paths.main_wal_path();
+        assert!(wal_path.parent().unwrap() == wal_paths.wal_dir());
     }
 }

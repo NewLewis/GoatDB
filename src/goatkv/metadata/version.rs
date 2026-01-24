@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::goatkv::encoding::internal_key::InternalKey;
 use crate::goatkv::metadata::file_metadata::FileMetadata;
 use crate::goatkv::storage::sstable_reader::SSTableReader;
-use crate::goatkv::utils::db_path_manager::DbPathManager;
+use crate::goatkv::utils::paths::SstablePaths;
 
 /// Version 代表某一时刻数据库的完整状态
 /// 一旦创建后不可修改，支持并发无锁读取
@@ -19,20 +19,27 @@ pub struct Version {
 
     /// 该版本创建时的序列号
     creation_seqno: u64,
+    /// 路径管理器（用于定位 SSTable）
+    sstable_paths: Arc<SstablePaths>,
 }
 
 impl Version {
     /// 创建一个新的空 Version
-    pub fn new(num_levels: usize) -> Self {
+    pub fn new(num_levels: usize, sstable_paths: Arc<SstablePaths>) -> Self {
         Self {
             files: vec![Vec::new(); num_levels],
             level_size_bytes: vec![0; num_levels],
             creation_seqno: 0,
+            sstable_paths,
         }
     }
 
     /// 从文件列表构建 Version
-    pub fn from_files(files: Vec<Vec<Arc<FileMetadata>>>, creation_seqno: u64) -> Self {
+    pub fn from_files(
+        files: Vec<Vec<Arc<FileMetadata>>>,
+        creation_seqno: u64,
+        sstable_paths: Arc<SstablePaths>,
+    ) -> Self {
         // 计算层级大小
         let level_size_bytes: Vec<u64> = files
             .iter()
@@ -43,6 +50,7 @@ impl Version {
             files,
             level_size_bytes,
             creation_seqno,
+            sstable_paths,
         }
     }
 
@@ -57,7 +65,7 @@ impl Version {
             // smallest_key和largest_key都存在的是internal_key不能直接用于比较，需要转换为user_key进行比较
             if key >= file.smallest_user_key() && key <= file.largest_user_key() {
                 // key在文件范围中，说明该文件中可能包含key
-                let sstable_path = DbPathManager::global().sstable_path_by_id(file.file_id);
+                let sstable_path = self.sstable_paths.sstable_path_by_id(file.file_id);
                 match SSTableReader::open(&sstable_path) {
                     Ok(mut reader) => {
                         match reader.get(key) {
@@ -80,7 +88,7 @@ impl Version {
         // 对于其他层级，由于文件不重叠且有序，可以使用二分查找
         for level in 1..self.files.len() {
             if let Some(file) = self.search_level(level, key) {
-                let sstable_path = DbPathManager::global().sstable_path_by_id(file.file_id);
+                let sstable_path = self.sstable_paths.sstable_path_by_id(file.file_id);
                 match SSTableReader::open(&sstable_path) {
                     Ok(mut reader) => {
                         match reader.get(key) {

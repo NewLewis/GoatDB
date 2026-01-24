@@ -1,50 +1,33 @@
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use goat_db::goatkv::core::kv_engine::KvEngine;
 use goat_db::goatkv::metadata::current;
 use goat_db::goatkv::metadata::manifest::{ManifestWriter, INIT_MANIFEST_FILE_NAME};
 use goat_db::goatkv::metadata::version_edit::VersionEdit;
 use goat_db::goatkv::storage::wal::WalWriter;
-use goat_db::goatkv::utils::db_path_manager::DbPathManager;
+use goat_db::goatkv::utils::init_db_paths;
 use goat_db::goatkv::utils::options::KvEngineOptions;
-
-// 全局串行锁，避免 DbPathManager 全局单例在并行测试下冲突
-static TEST_MUTEX: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-
-fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
-    TEST_MUTEX
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap()
-}
-
-fn reset_db_path_manager() {
-    let _ = DbPathManager::reset_for_tests();
-}
+use goat_db::goatkv::storage::wal::WalPaths;
 
 fn temp_dir() -> tempfile::TempDir {
     tempfile::tempdir().expect("create tempdir")
 }
 
-fn wal_path(log_number: u64, base: &DbPathManager) -> PathBuf {
+fn wal_path(log_number: u64, base: &WalPaths) -> PathBuf {
     base.wal_path_by_id(log_number)
 }
 
 #[test]
 fn recovery_handles_truncated_wal_tail() {
-    let _guard = lock_tests();
-    reset_db_path_manager();
     let tmp = temp_dir();
 
-    DbPathManager::init(tmp.path()).unwrap();
-    let pm = DbPathManager::global().clone();
+    let (wal_paths, _sstable_paths, _manifest_paths) = init_db_paths(tmp.path()).unwrap();
 
     // 写入一个完整记录
     {
-        let mut wal = WalWriter::new(wal_path(0, &pm), false).unwrap();
+        let mut wal = WalWriter::new(wal_path(0, &wal_paths), false).unwrap();
         let key = goat_db::goatkv::encoding::internal_key::InternalKey::new(
             b"ok".to_vec(),
             1,
@@ -56,7 +39,7 @@ fn recovery_handles_truncated_wal_tail() {
     {
         let mut f = fs::OpenOptions::new()
             .append(true)
-            .open(wal_path(0, &pm))
+            .open(wal_path(0, &wal_paths))
             .unwrap();
         f.write_all(&[0xAA, 0xBB, 0xCC]).unwrap(); // 不完整数据
         f.flush().unwrap();
@@ -73,24 +56,20 @@ fn recovery_handles_truncated_wal_tail() {
     assert_eq!(engine.get(b"ok"), Some(b"v1".to_vec()));
 
     // 截断应已发生：文件现在能被重新打开且尾部无多余无效记录（无法精确比对长度，但能重新打开 WalWriter）
-    WalWriter::new(wal_path(0, &pm), false).expect("truncated WAL should be openable");
+    WalWriter::new(wal_path(0, &wal_paths), false).expect("truncated WAL should be openable");
 
     drop(engine);
-    reset_db_path_manager();
 }
 
 #[test]
 fn recovery_replays_multiple_wals_in_order() {
-    let _guard = lock_tests();
-    reset_db_path_manager();
     let tmp = temp_dir();
 
-    DbPathManager::init(tmp.path()).unwrap();
-    let pm = DbPathManager::global().clone();
+    let (wal_paths, _sstable_paths, _manifest_paths) = init_db_paths(tmp.path()).unwrap();
 
     // WAL 0
     {
-        let mut wal = WalWriter::new(wal_path(0, &pm), false).unwrap();
+        let mut wal = WalWriter::new(wal_path(0, &wal_paths), false).unwrap();
         let key = goat_db::goatkv::encoding::internal_key::InternalKey::new(
             b"a".to_vec(),
             1,
@@ -101,7 +80,7 @@ fn recovery_replays_multiple_wals_in_order() {
 
     // WAL 1
     {
-        let mut wal = WalWriter::new(wal_path(1, &pm), false).unwrap();
+        let mut wal = WalWriter::new(wal_path(1, &wal_paths), false).unwrap();
         let key = goat_db::goatkv::encoding::internal_key::InternalKey::new(
             b"b".to_vec(),
             2,
@@ -127,8 +106,8 @@ fn recovery_replays_multiple_wals_in_order() {
     // 等待后台 flush 完成并删除旧 WAL（最多 1 秒）
     for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let wal0 = wal_path(0, &pm);
-        let wal1 = wal_path(1, &pm);
+        let wal0 = wal_path(0, &wal_paths);
+        let wal1 = wal_path(1, &wal_paths);
         if !wal1.exists() {
             break;
         }
@@ -137,26 +116,22 @@ fn recovery_replays_multiple_wals_in_order() {
     }
 
     assert!(
-        !wal_path(1, &pm).exists(),
+        !wal_path(1, &wal_paths).exists(),
         "WAL 1 should be cleaned after flush"
     );
 
     drop(engine);
-    reset_db_path_manager();
 }
 
 #[test]
 fn recovery_advances_log_number_past_existing_wals() {
-    let _guard = lock_tests();
-    reset_db_path_manager();
     let tmp = temp_dir();
 
-    DbPathManager::init(tmp.path()).unwrap();
-    let pm = DbPathManager::global().clone();
+    let (wal_paths, _sstable_paths, _manifest_paths) = init_db_paths(tmp.path()).unwrap();
 
     // 制造已存在的更大 WAL 编号
     for num in [2u64, 4u64] {
-        fs::write(wal_path(num, &pm), &[]).unwrap();
+        fs::write(wal_path(num, &wal_paths), &[]).unwrap();
     }
 
     let options = KvEngineOptions::default()
@@ -168,28 +143,27 @@ fn recovery_advances_log_number_past_existing_wals() {
     let engine = KvEngine::new_with_options(options).unwrap();
 
     // 新的 WAL 编号应当是 max(existing)+1
-    let expected_new = wal_path(5, &pm);
+    let expected_new = wal_path(5, &wal_paths);
     assert!(
         expected_new.exists(),
         "expected new WAL {:?} to be created",
         expected_new
     );
-    assert!(wal_path(4, &pm).exists(), "existing WAL should remain");
+    assert!(
+        wal_path(4, &wal_paths).exists(),
+        "existing WAL should remain"
+    );
 
     drop(engine);
-    reset_db_path_manager();
 }
 
 #[test]
 fn recovery_truncates_manifest_tail() {
-    let _guard = lock_tests();
-    reset_db_path_manager();
     let tmp = temp_dir();
 
-    DbPathManager::init(tmp.path()).unwrap();
-    let pm = DbPathManager::global().clone();
+    let (_wal_paths, sstable_paths, manifest_paths) = init_db_paths(tmp.path()).unwrap();
 
-    let manifest_path = pm.data_dir().join(INIT_MANIFEST_FILE_NAME);
+    let manifest_path = sstable_paths.data_dir().join(INIT_MANIFEST_FILE_NAME);
     let mut edit = VersionEdit::new();
     edit.set_log_number(1);
     let encoded = edit.encode();
@@ -199,7 +173,7 @@ fn recovery_truncates_manifest_tail() {
         writer.append_edit(&edit).unwrap();
         writer.sync().unwrap();
     }
-    current::write_current(INIT_MANIFEST_FILE_NAME).unwrap();
+    current::write_current(&manifest_paths, INIT_MANIFEST_FILE_NAME).unwrap();
 
     // 追加半条 edit，制造尾部截断
     let mut partial_edit = VersionEdit::new();
@@ -234,19 +208,15 @@ fn recovery_truncates_manifest_tail() {
     );
 
     drop(engine);
-    reset_db_path_manager();
 }
 
 #[test]
 fn recovery_errors_on_corrupted_manifest_edit() {
-    let _guard = lock_tests();
-    reset_db_path_manager();
     let tmp = temp_dir();
 
-    DbPathManager::init(tmp.path()).unwrap();
-    let pm = DbPathManager::global().clone();
+    let (_wal_paths, sstable_paths, manifest_paths) = init_db_paths(tmp.path()).unwrap();
 
-    let manifest_path = pm.data_dir().join(INIT_MANIFEST_FILE_NAME);
+    let manifest_path = sstable_paths.data_dir().join(INIT_MANIFEST_FILE_NAME);
     {
         let mut f = fs::OpenOptions::new()
             .create(true)
@@ -261,7 +231,7 @@ fn recovery_errors_on_corrupted_manifest_edit() {
         f.write_all(&payload).unwrap();
         f.flush().unwrap();
     }
-    current::write_current(INIT_MANIFEST_FILE_NAME).unwrap();
+    current::write_current(&manifest_paths, INIT_MANIFEST_FILE_NAME).unwrap();
 
     let options = KvEngineOptions::default()
         .with_data_dir(tmp.path())
@@ -278,7 +248,6 @@ fn recovery_errors_on_corrupted_manifest_edit() {
         "unexpected error kind for corrupted manifest: {err}"
     );
 
-    reset_db_path_manager();
 }
 
 #[cfg(unix)]
@@ -286,16 +255,13 @@ fn recovery_errors_on_corrupted_manifest_edit() {
 fn recovery_replays_wal_if_flush_never_completed() {
     use std::os::unix::fs::PermissionsExt;
 
-    let _guard = lock_tests();
-    reset_db_path_manager();
     let tmp = temp_dir();
 
-    DbPathManager::init(tmp.path()).unwrap();
-    let pm = DbPathManager::global().clone();
+    let (wal_paths, sstable_paths, _manifest_paths) = init_db_paths(tmp.path()).unwrap();
 
     // WAL 1 写入一条记录
     {
-        let mut wal = WalWriter::new(wal_path(1, &pm), false).unwrap();
+        let mut wal = WalWriter::new(wal_path(1, &wal_paths), false).unwrap();
         let key = goat_db::goatkv::encoding::internal_key::InternalKey::new(
             b"k".to_vec(),
             1,
@@ -306,7 +272,7 @@ fn recovery_replays_wal_if_flush_never_completed() {
 
     // 让 tmp dir 只读，触发恢复后 flush 失败，模拟“恢复后立即崩溃未落盘”
     {
-        let tmp_dir = pm.tmp_dir();
+        let tmp_dir = sstable_paths.tmp_dir();
         let mut perms = fs::metadata(tmp_dir).unwrap().permissions();
         perms.set_mode(0o555);
         fs::set_permissions(tmp_dir, perms).unwrap();
@@ -322,13 +288,16 @@ fn recovery_replays_wal_if_flush_never_completed() {
 
     // 恢复权限，便于后续启动与清理临时目录
     {
-        let tmp_dir = pm.tmp_dir();
+        let tmp_dir = sstable_paths.tmp_dir();
         let mut perms = fs::metadata(tmp_dir).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(tmp_dir, perms).unwrap();
     }
 
-    assert!(wal_path(1, &pm).exists(), "WAL 1 should still exist");
+    assert!(
+        wal_path(1, &wal_paths).exists(),
+        "WAL 1 should still exist"
+    );
 
     // 再次启动：如果没有不安全的 log_number 推进，应当能 replay WAL 1
     let options = KvEngineOptions::default()
@@ -341,5 +310,4 @@ fn recovery_replays_wal_if_flush_never_completed() {
     assert_eq!(engine.get(b"k"), Some(b"v".to_vec()));
 
     drop(engine);
-    reset_db_path_manager();
 }

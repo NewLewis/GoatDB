@@ -12,7 +12,7 @@ GoatDB 采用 LSM-Tree (Log-Structured Merge-Tree) 架构，其崩溃恢复机�
 
 ## 2. 磁盘组件与目录结构
 
-由 `DbPathManager` 管理的目录布局如下：
+由路径集合（WalPaths/SstablePaths/ManifestPaths）管理的目录布局如下：
 
 ```mermaid
 graph TD
@@ -111,10 +111,14 @@ sequenceDiagram
 ```rust
 pub fn new_with_options(options: KvEngineOptions) -> Result<Self, std::io::Error> {
     // 1. 初始化路径管理器
-    let _ = DbPathManager::try_init(&options.data_dir)?;
+    let (wal_paths, sstable_paths, manifest_paths) = init_db_paths(&options.data_dir)?;
     
     // 2. 创建VersionSet（恢复MANIFEST），并用 current 初始化 LSMState
-    let version_set = Arc::new(RwLock::new(VersionSet::open(...)?));
+    let version_set = Arc::new(RwLock::new(VersionSet::open(
+        manifest_paths.clone(),
+        sstable_paths.clone(),
+        ...,
+    )?));
     let lsm_state = Arc::new(RwLock::new(LSMState::new(...)));
     
     // 3. 获取min_log_number（已持久化的WAL边界）
@@ -125,7 +129,7 @@ pub fn new_with_options(options: KvEngineOptions) -> Result<Self, std::io::Error
     
     // 4. 回放WAL
     let (wal_stats, wal_max_number) = if options.recover_from_wal {
-        Self::replay_into_state(&lsm_state, options.mem_table_size, min_log_number)?
+        Self::replay_into_state(&wal_paths, &lsm_state, options.mem_table_size, min_log_number)?
     } else { ... };
     
     // 5. 选择新的WAL编号（不推进MANIFEST log_number）
