@@ -1,0 +1,147 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="900" viewBox="0 0 980 900" style="background-color: #ffffff;">
+  <defs>
+    <style>
+      /* 基础样式 */
+      .box { fill: #f5f7fb; stroke: #2f3b52; stroke-width: 2; }
+      .mem-box { fill: #e8f4f8; stroke: #2f3b52; stroke-width: 2; }
+      .sstable-box { fill: #f0f7f0; stroke: #2f3b52; stroke-width: 2; }
+      .result-box { fill: #e8f8e8; stroke: #2f3b52; stroke-width: 2; }
+      .error-box { fill: #fff0f0; stroke: #2f3b52; stroke-width: 2; }
+      .diamond { fill: #fff8e8; stroke: #2f3b52; stroke-width: 2; }
+
+      /* 字体样式 */
+      .title { font-family: "Helvetica Neue", Arial, sans-serif; font-weight: bold; font-size: 16px; fill: #1c2433; }
+      .text { font-family: "Helvetica Neue", Arial, sans-serif; font-size: 14px; fill: #333333; }
+      .label { font-family: "Helvetica Neue", Arial, sans-serif; font-size: 12px; fill: #444; background-color: #fff; padding: 2px; }
+      .path-label { font-family: "Helvetica Neue", Arial, sans-serif; font-size: 11px; fill: #666; }
+
+      /* 线条样式 */
+      .arrow { stroke: #2f3b52; stroke-width: 2; fill: none; marker-end: url(#arrow); stroke-linejoin: round; }
+      .arrow-dash { stroke: #2f3b52; stroke-width: 2; fill: none; marker-end: url(#arrow); stroke-dasharray: 6,4; stroke-linejoin: round; }
+      .arrow-connector { stroke: #4a5a75; stroke-width: 2; fill: none; marker-end: url(#arrow); stroke-linejoin: round; }
+    </style>
+    <!-- 箭头定义 -->
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2f3b52" />
+    </marker>
+  </defs>
+
+  <!-- === 标题 === -->
+  <text class="title" x="490" y="40" text-anchor="middle" font-size="20px">LSM-Tree 读路径查找流程</text>
+  <text class="text" x="490" y="65" text-anchor="middle" fill="#666">Version 3：修复连接线缺失</text>
+
+  <!-- === 起点 === -->
+  <rect class="box" x="440" y="85" width="100" height="50" rx="8" />
+  <text class="title" x="490" y="115" text-anchor="middle">读请求 (Get)</text>
+
+  <!-- === 步骤1: MemTable === -->
+  <!-- 箭头：起点 -> 步骤1 -->
+  <path class="arrow" d="M490 135 L490 165" />
+
+  <g transform="translate(380, 165)">
+    <rect class="mem-box" width="220" height="70" rx="8" />
+    <text class="title" x="110" y="30" text-anchor="middle">1. MemTable</text>
+    <text class="text" x="110" y="50" text-anchor="middle">活跃内存表 (Skiplist)</text>
+  </g>
+
+  <!-- 【新增修复】箭头：步骤1 -> 判定1 -->
+  <path class="arrow" d="M490 235 L490 255" />
+
+  <!-- 判定1 -->
+  <polygon class="diamond" points="490,255 530,275 490,295 450,275" />
+  <text class="text" x="490" y="280" text-anchor="middle">Found?</text>
+
+  <!-- 判定1 YES -->
+  <path class="arrow-dash" d="M530 275 L600 275 L600 680 L500 680 L500 710" />
+  <text class="label" x="540" y="270">Yes</text>
+
+  <!-- 判定1 NO -->
+  <path class="arrow" d="M490 295 L490 335" />
+  <text class="label" x="500" y="315">No</text>
+
+  <!-- === 步骤2: Immutable === -->
+  <g transform="translate(380, 335)">
+    <rect class="mem-box" width="220" height="70" rx="8" />
+    <text class="title" x="110" y="30" text-anchor="middle">2. Immutable Mem</text>
+    <text class="text" x="110" y="50" text-anchor="middle">只读内存表队列</text>
+  </g>
+
+  <!-- 【新增修复】箭头：步骤2 -> 判定2 -->
+  <path class="arrow" d="M490 405 L490 425" />
+
+  <!-- 判定2 -->
+  <polygon class="diamond" points="490,425 530,445 490,465 450,445" />
+  <text class="text" x="490" y="450" text-anchor="middle">Found?</text>
+
+  <!-- 判定2 YES -->
+  <path class="arrow-dash" d="M530 445 L580 445 L580 680 L520 680 L520 710" />
+  <text class="label" x="540" y="440">Yes</text>
+
+  <!-- 判定2 NO -> 转向左侧 L0 -->
+  <path class="arrow" d="M450 445 L260 445 L260 500" />
+  <text class="label" x="350" y="440">No (Check Disk)</text>
+
+  <!-- === 步骤3: L0 (左侧) === -->
+  <g transform="translate(120, 500)">
+    <rect class="sstable-box" width="280" height="80" rx="8" />
+    <text class="title" x="140" y="30" text-anchor="middle">3. Level 0 SSTables</text>
+    <text class="text" x="140" y="50" text-anchor="middle">Key范围重叠</text>
+    <text class="text" x="140" y="70" text-anchor="middle">需按时间倒序遍历</text>
+  </g>
+
+  <!-- 【新增修复】箭头：步骤3 -> 判定3 -->
+  <path class="arrow" d="M260 580 L260 610" />
+
+  <!-- 判定3 -->
+  <polygon class="diamond" points="260,610 300,630 260,650 220,630" />
+  <text class="text" x="260" y="635" text-anchor="middle">Found?</text>
+
+  <!-- 判定3 YES -->
+  <path class="arrow-dash" d="M300 630 L450 630 L450 710" />
+  <text class="label" x="310" y="625">Yes</text>
+
+  <!-- 判定3 NO -> 转向右侧 L1 -->
+  <path class="arrow-connector" d="M220 630 L80 630 L80 485 L720 485 L720 500" />
+  <text class="label" x="90" y="625">No</text>
+  <text class="path-label" x="400" y="480" text-anchor="middle">L0 未命中，继续查找 L1+</text>
+
+  <!-- === 步骤4: L1+ (右侧) === -->
+  <g transform="translate(580, 500)">
+    <rect class="sstable-box" width="280" height="80" rx="8" />
+    <text class="title" x="140" y="30" text-anchor="middle">4. Level 1+ SSTables</text>
+    <text class="text" x="140" y="50" text-anchor="middle">Key有序且不重叠</text>
+    <text class="text" x="140" y="70" text-anchor="middle">二分查找定位</text>
+  </g>
+
+  <!-- 【新增修复】箭头：步骤4 -> 判定4 -->
+  <path class="arrow" d="M720 580 L720 610" />
+
+  <!-- 判定4 -->
+  <polygon class="diamond" points="720,610 760,630 720,650 680,630" />
+  <text class="text" x="720" y="635" text-anchor="middle">Found?</text>
+
+  <!-- 判定4 YES -->
+  <path class="arrow-dash" d="M680 630 L540 630 L540 710" />
+  <text class="label" x="650" y="625">Yes</text>
+
+  <!-- 判定4 NO -->
+  <path class="arrow" d="M720 650 L720 710" />
+  <text class="label" x="725" y="660">No</text>
+
+  <!-- === 结果: 返回数据 === -->
+  <rect class="result-box" x="420" y="710" width="160" height="60" rx="10" />
+  <text class="title" x="500" y="745" text-anchor="middle">返回 Value</text>
+
+  <!-- === 结果: KeyNotFound === -->
+  <rect class="error-box" x="660" y="710" width="120" height="60" rx="10" />
+  <text class="title" x="720" y="745" text-anchor="middle">Not Found</text>
+
+  <!-- === 底部说明 === -->
+  <g transform="translate(60, 790)">
+    <rect class="box" width="860" height="90" rx="10" />
+    <text class="title" x="30" y="30">设计解析</text>
+    <text class="text" x="30" y="55">1. 内存优先：检查 MemTable 和 Immutable，若命中则立即返回，无需IO。</text>
+    <text class="text" x="30" y="75">2. 磁盘回退：若内存未命中，先查 L0 (可能重叠，慢)，再查 L1+ (有序，快)。</text>
+  </g>
+
+</svg>

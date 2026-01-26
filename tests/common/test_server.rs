@@ -1,9 +1,9 @@
 use std::io::Read;
 use std::net::TcpListener;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use rand::Rng;
 use tempfile::TempDir;
 use tokio::time::sleep;
 use tonic::transport::Channel;
@@ -19,7 +19,7 @@ pub mod goatkv {
 #[derive(Debug)]
 pub struct TestServerOptions {
     pub port: Option<u16>,
-    pub data_dir: Option<TempDir>,
+    pub data_dir: Option<PathBuf>,
     pub show_logs: bool,
     pub capture_stderr: bool,
 }
@@ -40,7 +40,9 @@ pub struct TestServer {
     pub process: Child,
     pub address: String,
     #[allow(dead_code)]
-    pub data_dir: TempDir,
+    pub data_dir: PathBuf,
+    #[allow(dead_code)]
+    temp_dir: Option<TempDir>,
     stderr_output: Option<Vec<u8>>,
 }
 
@@ -53,16 +55,11 @@ impl TestServer {
 
     /// 使用指定数据目录启动测试服务器
     pub async fn start_with_dir<P: AsRef<std::path::Path>>(data_dir: P) -> Self {
-        let temp_dir = TempDir::new().unwrap();
-        let data_dir_path = data_dir.as_ref().to_str().unwrap().to_string();
-
-        // 创建临时目录的副本，但使用指定的数据目录
-        let data_dir = temp_dir;
+        let data_dir_path = data_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir_path).unwrap();
-
         let options = TestServerOptions {
             port: None,
-            data_dir: Some(data_dir),
+            data_dir: Some(data_dir_path),
             show_logs: false,
             capture_stderr: true,
         };
@@ -75,9 +72,17 @@ impl TestServer {
         let port = opts.port.unwrap_or_else(find_free_port);
         let address = format!("127.0.0.1:{}", port);
 
-        let data_dir = opts
-            .data_dir
-            .unwrap_or_else(|| tempfile::tempdir().unwrap());
+        let (data_dir_path, temp_dir) = match opts.data_dir {
+            Some(path) => {
+                std::fs::create_dir_all(&path).unwrap();
+                (path, None)
+            }
+            None => {
+                let temp_dir = tempfile::tempdir().unwrap();
+                let path = temp_dir.path().to_path_buf();
+                (path, Some(temp_dir))
+            }
+        };
 
         // 构建命令行参数
         let args = vec![
@@ -88,7 +93,7 @@ impl TestServer {
             "--address".to_string(),
             address.clone(),
             "--data-dir".to_string(),
-            data_dir.path().to_str().unwrap().to_string(),
+            data_dir_path.to_str().unwrap().to_string(),
         ];
 
         // 决定stderr的处理方式
@@ -156,14 +161,15 @@ impl TestServer {
                 exit_code,
                 stderr_str,
                 address,
-                data_dir.path().display()
+                data_dir_path.display()
             );
         }
 
         Self {
             process,
             address: server_url,
-            data_dir,
+            data_dir: data_dir_path,
+            temp_dir,
             stderr_output: Some(stderr_output),
         }
     }
@@ -244,16 +250,8 @@ impl Drop for TestServer {
 
 /// 查找空闲端口
 fn find_free_port() -> u16 {
-    let mut rng = rand::thread_rng();
-
-    for _ in 0..10 {
-        let port = 50000 + rng.gen_range(0..10000);
-
-        // 尝试绑定到端口来检查是否可用
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-
-    panic!("Could not find free port after 10 attempts");
+    // 让 OS 分配临时端口，避免随机碰撞
+    TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|listener| listener.local_addr().map(|addr| addr.port()))
+        .expect("Failed to allocate an ephemeral port")
 }

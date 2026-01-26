@@ -44,6 +44,23 @@ pub struct KvEngineOptions {
     /// Whether to synchronize WAL writes to disk
     /// Default: true (safer but slower)
     pub wal_sync: bool,
+
+    // ===== VersionSet Options =====
+    /// 保留的历史版本数量
+    /// Default: 10
+    pub max_versions: usize,
+
+    /// MANIFEST 文件大小限制（超过则重写）
+    /// Default: 32MB
+    pub manifest_max_size: u64,
+
+    /// 触发 MANIFEST 重写的版本编辑数量
+    /// Default: 10000
+    pub manifest_rewrite_edit_count: usize,
+
+    /// LSM 层级数量
+    /// Default: 7
+    pub num_levels: usize,
 }
 
 impl Default for KvEngineOptions {
@@ -56,6 +73,11 @@ impl Default for KvEngineOptions {
             mem_table_size: 1024 * 1024, // 1MB
             recover_from_wal: true,
             wal_sync: true,
+            // VersionSet defaults
+            max_versions: 10,
+            manifest_max_size: 32 * 1024 * 1024, // 32MB
+            manifest_rewrite_edit_count: 10000,
+            num_levels: 7,
         }
     }
 }
@@ -90,6 +112,30 @@ impl KvEngineOptions {
         self
     }
 
+    /// Sets the maximum number of versions to keep in history
+    pub fn with_max_versions(mut self, max: usize) -> Self {
+        self.max_versions = max;
+        self
+    }
+
+    /// Sets the MANIFEST file size limit (after which it will be rewritten)
+    pub fn with_manifest_max_size(mut self, size: u64) -> Self {
+        self.manifest_max_size = size;
+        self
+    }
+
+    /// Sets the number of VersionEdits before triggering MANIFEST rewrite
+    pub fn with_manifest_rewrite_edit_count(mut self, count: usize) -> Self {
+        self.manifest_rewrite_edit_count = count;
+        self
+    }
+
+    /// Sets the number of LSM levels
+    pub fn with_num_levels(mut self, levels: usize) -> Self {
+        self.num_levels = levels;
+        self
+    }
+
     /// Creates options suitable for testing
     ///
     /// This creates a KvEngineOptions with a temporary data directory
@@ -97,9 +143,15 @@ impl KvEngineOptions {
     #[cfg(test)]
     pub fn for_test() -> Self {
         use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
 
         // Create a temporary directory for testing
-        let temp_dir = env::temp_dir().join("goatdb_test");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos();
+        let temp_dir =
+            env::temp_dir().join(format!("goatdb_test_{}_{}", std::process::id(), nanos));
         if !temp_dir.exists() {
             fs::create_dir_all(&temp_dir).expect("Failed to create test directory");
         }
@@ -109,6 +161,11 @@ impl KvEngineOptions {
             mem_table_size: 1024 * 1024, // 1MB
             recover_from_wal: false,     // Don't recover in tests
             wal_sync: false,             // Don't sync in tests for speed
+            // VersionSet defaults (use same defaults as production)
+            max_versions: 10,
+            manifest_max_size: 32 * 1024 * 1024, // 32MB
+            manifest_rewrite_edit_count: 10000,
+            num_levels: 7,
         }
     }
 }
@@ -165,7 +222,12 @@ mod tests {
     #[test]
     fn test_for_test() {
         let options = KvEngineOptions::for_test();
-        assert!(options.data_dir.ends_with("goatdb_test"));
+        let dir_name = options
+            .data_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        assert!(dir_name.starts_with("goatdb_test_"));
         assert_eq!(options.mem_table_size, 1024 * 1024);
         assert!(!options.recover_from_wal);
         assert!(!options.wal_sync);

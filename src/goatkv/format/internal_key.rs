@@ -88,6 +88,26 @@ impl InternalKey {
         }
     }
 
+    pub fn new_separator(user_key: Vec<u8>) -> Self {
+        Self::new(user_key, SEQUENCE_NUMBER_MAX, InternalKeyKind::Put)
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.user_key.len() + 8);
+        buf.extend_from_slice(self.user_key());
+        // 关键修正：使用 Big Endian 并取反 (!seq)
+        // 原因：
+        // 1. 我们希望 Sequence Number 越大，Key 越小 (Logical Order: Seq Desc)
+        // 2. SSTable 字节序排序是 Ascending
+        // 3. !seq (取反) 后，大 Seq 变成小数值
+        // 4. Big Endian 保证字节序比较等同于数值比较
+        // 例如:
+        // Seq 200 (Encoded) -> !200 -> Small Value -> Small Bytes -> First in SSTable
+        // Seq 100 (Encoded) -> !100 -> Large Value -> Large Bytes -> Later in SSTable
+        buf.extend_from_slice(&(!self.encoded_sequence_number).to_be_bytes());
+        buf
+    }
+
     /// Create an InternalKey from raw encoded value.
     ///
     /// # Arguments

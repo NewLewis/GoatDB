@@ -1,17 +1,19 @@
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{mpsc, Arc, RwLock};
 use std::thread;
 
 use crate::goatkv::core::lsm_state::LSMState;
-use crate::goatkv::core::mem_table::MemTable;
-use crate::goatkv::storage::sstable_builder::SSTableBuilder;
-use crate::goatkv::utils::db_path_manager::DbPathManager;
+use crate::goatkv::core::mem_table::ImmutableMemTable;
+use crate::goatkv::metadata::version_edit::{NewFile, VersionEdit};
+use crate::goatkv::metadata::version_set::VersionSet;
+use crate::goatkv::storage::sstable::SSTableBuilder;
+use crate::goatkv::utils::paths::SstablePaths;
+use tracing::error;
 
 /// 刷盘任务
 #[derive(Debug)]
 pub struct FlushTask {
-    #[allow(dead_code)]
-    pub(crate) mem_table: Arc<MemTable>,
-    pub(crate) id: usize,
+    pub(crate) immutable_mem_table: Arc<ImmutableMemTable>,
+    pub(crate) new_log_number: u64,
 }
 
 /// 后台刷盘 Worker
@@ -21,28 +23,33 @@ pub struct FlushTask {
 #[derive(Debug)]
 pub struct FlushWorker {
     sender: mpsc::Sender<FlushTask>,
-    _handle: thread::JoinHandle<()>,
+    handle: Option<thread::JoinHandle<()>>,
 }
 
 impl FlushWorker {
     /// 创建新的 FlushWorker 并启动后台线程
     ///
     /// # 参数
-    /// - `lsm_state`: LSM 状态管理器，用于访问 immutable memtables 和 sstables
-    /// - `db_path_manager`: 数据库路径管理器，用于创建 SSTable 文件
+    /// - `lsm_state`: LSM 状态管理器，用于访问 immutable memtables 和 version snapshot
+    /// - `version_set`: VersionSet 管理 manifest 与版本演进
+    /// - `sstable_paths`: SSTable 路径集合
     ///
     /// # 返回
     /// 返回新创建的 FlushWorker 实例
-    pub fn new(lsm_state: Arc<RwLock<LSMState>>, db_path_manager: Arc<DbPathManager>) -> Self {
+    pub fn new(
+        lsm_state: Arc<RwLock<LSMState>>,
+        version_set: Arc<RwLock<VersionSet>>,
+        sstable_paths: Arc<SstablePaths>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
 
         let handle = thread::spawn(move || {
-            Self::run_loop(rx, lsm_state, db_path_manager);
+            Self::run_loop(rx, lsm_state, version_set, sstable_paths);
         });
 
         Self {
             sender: tx,
-            _handle: handle,
+            handle: Some(handle),
         }
     }
 
@@ -63,53 +70,68 @@ impl FlushWorker {
     /// 持续从 channel 接收刷盘任务并执行：
     /// 1. 从 immutable memtable 读取数据
     /// 2. 创建 SSTable 文件
-    /// 3. 将 SSTableReader 添加到 LSM 状态
+    /// 3. 创建 VersionEdit 并应用到 VersionSet
     /// 4. 移除已刷盘的 immutable memtable
     fn run_loop(
         rx: mpsc::Receiver<FlushTask>,
         lsm_state: Arc<RwLock<LSMState>>,
-        db_path_manager: Arc<DbPathManager>,
+        version_set: Arc<RwLock<VersionSet>>,
+        sstable_paths: Arc<SstablePaths>,
     ) {
         while let Ok(task) = rx.recv() {
-            let mut sst_builder =
-                match SSTableBuilder::new(task.id as u64, db_path_manager.data_dir().into()) {
-                    Ok(builder) => builder,
-                    Err(e) => {
-                        eprintln!("Failed to create SSTableBuilder: {}", e);
-                        continue;
+            // 从任务中获取要刷盘的 immutable memtable
+            let imm_table = task.immutable_mem_table.clone();
+
+            // 在不持有锁的情况下处理数据
+            let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let mut max_sequence = 0u64;
+            for (key, value) in imm_table.iter() {
+                max_sequence = max_sequence.max(key.sequence_number());
+                entries.push((key.serialize(), value.to_vec()));
+            }
+
+            if entries.is_empty() {
+                let mut version_edit = VersionEdit::new();
+                if task.new_log_number > 0 {
+                    version_edit.set_log_number(task.new_log_number);
+                }
+                let last_sequence = {
+                    let vs = version_set.read().unwrap();
+                    std::cmp::max(max_sequence, vs.last_sequence())
+                };
+                version_edit.set_last_sequence(last_sequence);
+
+                let current_version = {
+                    let mut vs = version_set.write().unwrap();
+                    if let Err(e) = vs.apply_edit(version_edit) {
+                        error!("Failed to apply VersionEdit: {}", e);
+                        continue; // 不重试，直接退出
                     }
+                    vs.current()
                 };
 
-            // 获取 immutable_memtable 并克隆数据，避免长时间持有锁
-            let entries: Vec<(Vec<u8>, Vec<u8>)> = {
-                let lsm_state_guard = lsm_state.read().unwrap();
-                let imm_table = match lsm_state_guard.immutable_mem_tables.front() {
-                    Some(t) => t,
-                    None => {
-                        eprintln!("No immutable memtable found for task id={}", task.id);
-                        continue;
-                    }
-                };
+                {
+                    let mut lsm_state_guard = lsm_state.write().unwrap();
+                    lsm_state_guard.version = current_version;
+                    lsm_state_guard.immutable_mem_tables.pop_front();
+                }
+                continue;
+            }
 
-                imm_table
-                    .iter()
-                    .map(|(key, value)| {
-                        let mut serialized_key = Vec::new();
-                        serialized_key.extend_from_slice(key.user_key());
-                        // 关键修正：使用 Big Endian 并取反 (!seq)
-                        // 原因：
-                        // 1. 我们希望 Sequence Number 越大，Key 越小 (Logical Order: Seq Desc)
-                        // 2. SSTable 字节序排序是 Ascending
-                        // 3. !seq (取反) 后，大 Seq 变成小数值
-                        // 4. Big Endian 保证字节序比较等同于数值比较
-                        // 例如:
-                        // Seq 200 (Encoded) -> !200 -> Small Value -> Small Bytes -> First in SSTable
-                        // Seq 100 (Encoded) -> !100 -> Large Value -> Large Bytes -> Later in SSTable
-                        serialized_key
-                            .extend_from_slice(&(!key.encoded_sequence_number()).to_be_bytes());
-                        (serialized_key, value.to_vec())
-                    })
-                    .collect()
+            // 分配文件 ID
+            let (file_id, next_file_number) = {
+                let mut vs = version_set.write().unwrap();
+                let file_id = vs.allocate_file_number();
+                let next_file_number = vs.next_file_number();
+                (file_id, next_file_number)
+            };
+
+            let mut sst_builder = match SSTableBuilder::new(file_id, &sstable_paths) {
+                Ok(builder) => builder,
+                Err(e) => {
+                    error!("Failed to create SSTableBuilder: {}", e);
+                    continue;
+                }
             };
 
             // 在不持有锁的情况下写入 SSTable
@@ -117,36 +139,57 @@ impl FlushWorker {
                 sst_builder.write(&key, &value);
             }
 
-            let sstable = match sst_builder.finish() {
-                Ok(sst) => sst,
+            let props = match sst_builder.finish() {
+                Ok(meta) => meta,
                 Err(e) => {
-                    eprintln!("Failed to finish SSTable {}: {}", task.id, e);
-                    continue;
+                    error!("Failed to finish SSTable {}: {}", file_id, e);
+                    continue; // 不重试，直接退出
                 }
             };
 
-            let reader = match sstable.open_reader() {
-                Ok(reader) => reader,
-                Err(e) => {
-                    eprintln!(
-                        "Failed to open newly created SSTable {:?}: {}",
-                        sstable.path, e
-                    );
-                    continue;
+            // 创建 VersionEdit 记录新增的 SSTable
+            let mut version_edit = VersionEdit::new();
+            version_edit.add_file(0, NewFile::new_with_props(file_id, props));
+            version_edit.set_next_file_number(next_file_number);
+            // 在 manifest 中记录新 WAL 号，表示此前的 WAL 已可被忽略
+            if task.new_log_number > 0 {
+                version_edit.set_log_number(task.new_log_number);
+            }
+            let last_sequence = {
+                let vs = version_set.read().unwrap();
+                std::cmp::max(max_sequence, vs.last_sequence())
+            };
+            version_edit.set_last_sequence(last_sequence);
+
+            let current_version = {
+                let mut vs = version_set.write().unwrap();
+                if let Err(e) = vs.apply_edit(version_edit) {
+                    error!("Failed to apply VersionEdit: {}", e);
+                    continue; // 不 pop_front，等待后续重试
                 }
+                vs.current()
             };
 
-            // 从 immutable_mem_tables 中移除已刷盘的 memtable，并将 SSTableReader 添加到 sstables
-            // 注意：需要获取写锁
-            let mut lsm_state_guard = lsm_state.write().unwrap();
+            // 从 immutable_mem_tables 中移除已刷盘的 memtable
+            // 注意：需要获取 lsm_state 写锁，并且需要找到对应的任务
+            {
+                let mut lsm_state_guard = lsm_state.write().unwrap();
+                lsm_state_guard.version = current_version;
+                lsm_state_guard.immutable_mem_tables.pop_front();
+            }
+        }
+    }
+}
 
-            // 添加到 SSTable 列表头部（最新的在最前面）
-            lsm_state_guard
-                .sstables
-                .insert(0, Arc::new(Mutex::new(reader)));
+impl Drop for FlushWorker {
+    fn drop(&mut self) {
+        // Close channel before joining so the worker can exit.
+        let (tx, _rx) = mpsc::channel();
+        let old_sender = std::mem::replace(&mut self.sender, tx);
+        drop(old_sender);
 
-            // 移除 old memtable
-            lsm_state_guard.immutable_mem_tables.pop_front();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
         }
     }
 }

@@ -2,13 +2,14 @@ use std::sync::Arc;
 
 use clap::Parser;
 use goat_db::goatkv::core::kv_engine::KvEngine;
-use goat_db::goatkv::utils::KvEngineOptions;
+use goat_db::goatkv::utils::{init_logging, KvEngineOptions};
 use goatkv::{
     goat_kv_service_server::{GoatKvService, GoatKvServiceServer},
     DeleteRequest, DeleteResponse, FlushRequest, FlushResponse, GetRequest, GetResponse,
     UpdateRequest, UpdateResponse, WriteRequest, WriteResponse,
 };
 use tonic::{transport::Server, Request, Response, Status};
+use tracing::{debug, info};
 
 // 引入编译生成的代码
 pub mod goatkv {
@@ -38,7 +39,7 @@ impl GoatKvService for GoatKVServiceImpl {
     ) -> Result<Response<WriteResponse>, Status> {
         let req = request.into_inner();
 
-        println!(
+        debug!(
             "Received write request - key_len: {}, value_len: {}",
             req.key.len(),
             req.value.len()
@@ -62,7 +63,7 @@ impl GoatKvService for GoatKVServiceImpl {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         let req = request.into_inner();
 
-        println!("Received get request - key_len: {}", req.key.len());
+        debug!("Received get request - key_len: {}", req.key.len());
 
         // 验证输入
         if req.key.is_empty() {
@@ -95,7 +96,7 @@ impl GoatKvService for GoatKVServiceImpl {
     ) -> Result<Response<UpdateResponse>, Status> {
         let req = request.into_inner();
 
-        println!(
+        debug!(
             "Received update request - key_len: {}, value_len: {}",
             req.key.len(),
             req.value.len()
@@ -132,7 +133,7 @@ impl GoatKvService for GoatKVServiceImpl {
     ) -> Result<Response<DeleteResponse>, Status> {
         let req = request.into_inner();
 
-        println!("Received delete request - key_len: {}", req.key.len());
+        debug!("Received delete request - key_len: {}", req.key.len());
 
         // 验证输入
         if req.key.is_empty() {
@@ -154,7 +155,7 @@ impl GoatKvService for GoatKVServiceImpl {
         &self,
         _request: Request<FlushRequest>,
     ) -> Result<Response<FlushResponse>, Status> {
-        println!("Received flush request");
+        debug!("Received flush request");
 
         // 调用 engine 的 flush 方法
         self.engine.flush();
@@ -193,12 +194,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 创建 KvEngine，使用指定的数据目录或默认值
     let mut options = KvEngineOptions::default();
+    if let Some(ref dir) = args.data_dir {
+        options = options.with_data_dir(dir);
+    }
+    let _log_guards = init_logging("goatkv_server", &options.data_dir, "info");
 
     if let Some(dir) = args.data_dir {
-        println!("Using data directory: {}", dir);
-        options = options.with_data_dir(dir);
+        info!("Using data directory: {}", dir);
     } else {
-        println!("Using default data directory (./goatdb_data)");
+        info!("Using default data directory (./goatdb_data)");
     }
 
     let engine = KvEngine::new_with_options(options)
@@ -206,15 +210,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let service = GoatKVServiceImpl::new(engine);
 
-    println!("gRPC Server listening on {}", addr);
-    println!("Starting server...");
+    info!("gRPC Server listening on {}", addr);
+    info!("Starting server...");
 
     Server::builder()
         .add_service(GoatKvServiceServer::new(service))
         .serve(addr)
         .await?;
 
-    println!("Server finished");
+    info!("Server finished");
 
     Ok(())
 }

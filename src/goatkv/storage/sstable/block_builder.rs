@@ -1,4 +1,4 @@
-use crate::goatkv::encoding::varint;
+use crate::goatkv::format::coding;
 
 /// Block的最大大小限制
 /// 当Block的大小达到此值时，应该调用finish()结束当前Block
@@ -70,7 +70,7 @@ impl BlockBuilder {
     ///
     /// # 示例
     /// ```
-    /// # use goat_db::goatkv::storage::block_builder::BlockBuilder;
+    /// # use goat_db::goatkv::storage::sstable::BlockBuilder;
     /// let builder = BlockBuilder::new();
     /// ```
     pub fn new() -> Self {
@@ -102,7 +102,7 @@ impl BlockBuilder {
     ///
     /// # 示例
     /// ```
-    /// # use goat_db::goatkv::storage::block_builder::BlockBuilder;
+    /// # use goat_db::goatkv::storage::sstable::BlockBuilder;
     /// let mut builder = BlockBuilder::new();
     /// builder.add(b"apple", b"fruit");
     /// builder.add(b"application", b"app");
@@ -127,12 +127,9 @@ impl BlockBuilder {
 
         // 编码条目数据到buffer
         // 格式：[shared(varint)][unshared(varint)][value_len(varint)][key_non_shared][value]
-        self.buffer
-            .extend_from_slice(&varint::encode(shared as u64));
-        self.buffer
-            .extend_from_slice(&varint::encode(unshared as u64));
-        self.buffer
-            .extend_from_slice(&varint::encode(value.len() as u64));
+        coding::put_varint64(&mut self.buffer, shared as u64);
+        coding::put_varint64(&mut self.buffer, unshared as u64);
+        coding::put_varint64(&mut self.buffer, value.len() as u64);
 
         // 只存储key的非共享部分
         self.buffer.extend_from_slice(&key[shared as usize..]);
@@ -175,7 +172,7 @@ impl BlockBuilder {
     ///
     /// # 示例
     /// ```
-    /// # use goat_db::goatkv::storage::block_builder::BlockBuilder;
+    /// # use goat_db::goatkv::storage::sstable::BlockBuilder;
     /// let mut builder = BlockBuilder::new();
     /// builder.add(b"key1", b"value1");
     /// builder.add(b"key2", b"value2");
@@ -243,7 +240,7 @@ impl BlockBuilder {
     ///
     /// # 示例
     /// ```
-    /// # use goat_db::goatkv::storage::block_builder::BlockBuilder;
+    /// # use goat_db::goatkv::storage::sstable::BlockBuilder;
     /// let mut builder = BlockBuilder::new();
     /// builder.add(b"key", b"value");
     /// assert!(builder.len() > 0); // 实际长度取决于varint编码
@@ -260,7 +257,7 @@ impl BlockBuilder {
     ///
     /// # 示例
     /// ```
-    /// # use goat_db::goatkv::storage::block_builder::BlockBuilder;
+    /// # use goat_db::goatkv::storage::sstable::BlockBuilder;
     /// let builder = BlockBuilder::new();
     /// assert!(builder.is_empty());
     /// ```
@@ -279,7 +276,7 @@ impl BlockBuilder {
     ///
     /// # 示例
     /// ```
-    /// # use goat_db::goatkv::storage::block_builder::BlockBuilder;
+    /// # use goat_db::goatkv::storage::sstable::BlockBuilder;
     /// let mut builder = BlockBuilder::new();
     /// // 刚开始时block是空的，should_finish返回false
     /// assert!(!builder.should_finish());
@@ -297,7 +294,7 @@ impl BlockBuilder {
     ///
     /// # 示例
     /// ```
-    /// # use goat_db::goatkv::storage::block_builder::BlockBuilder;
+    /// # use goat_db::goatkv::storage::sstable::BlockBuilder;
     /// let mut builder = BlockBuilder::new();
     /// // 构建第一个block
     /// builder.add(b"key1", b"value1");
@@ -322,7 +319,7 @@ impl BlockBuilder {
     ///
     /// # 示例
     /// ```
-    /// # use goat_db::goatkv::storage::block_builder::BlockBuilder;
+    /// # use goat_db::goatkv::storage::sstable::BlockBuilder;
     /// let builder = BlockBuilder::new();
     /// assert!(builder.empty());
     ///

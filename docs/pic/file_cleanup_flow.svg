@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="600" viewBox="0 0 980 600" style="background-color: #ffffff;">
+  <defs>
+    <style>
+      /* 基础样式 */
+      .box { fill: #f5f7fb; stroke: #2f3b52; stroke-width: 2; }
+      .sync-box { fill: #e8f4f8; stroke: #2f3b52; stroke-width: 2; }
+      .async-box { fill: #f0f7f0; stroke: #2f3b52; stroke-width: 2; }
+      .channel-box { fill: #fff8e8; stroke: #2f3b52; stroke-width: 2; stroke-dasharray: 5,3; }
+      .data-box { fill: #ffffff; stroke: #888; stroke-width: 1.5; }
+
+      /* 文本样式 */
+      .title { font-family: "Helvetica Neue", Arial, sans-serif; font-weight: bold; font-size: 16px; fill: #1c2433; }
+      .text { font-family: "Helvetica Neue", Arial, sans-serif; font-size: 14px; fill: #333333; }
+      .label { font-family: "Helvetica Neue", Arial, sans-serif; font-size: 12px; fill: #666; font-style: italic; }
+      .zone-label { font-family: "Helvetica Neue", Arial, sans-serif; font-weight: bold; font-size: 14px; fill: #4a5a75; }
+
+      /* 线条样式 */
+      .arrow { stroke: #2f3b52; stroke-width: 2; fill: none; marker-end: url(#arrow); stroke-linejoin: round; }
+      .arrow-dashed { stroke: #2f3b52; stroke-width: 2; fill: none; marker-end: url(#arrow); stroke-dasharray: 6,4; stroke-linejoin: round; }
+      .separator { stroke: #cbd5e0; stroke-width: 2; stroke-dasharray: 8,8; }
+    </style>
+    <!-- 箭头定义 -->
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2f3b52" />
+    </marker>
+  </defs>
+
+  <!-- === 区域划分 === -->
+  <!-- 分割线 -->
+  <line x1="50" y1="280" x2="930" y2="280" class="separator" />
+  <text class="zone-label" x="50" y="40">主线程 (Sync)</text>
+  <text class="zone-label" x="50" y="310">后台线程 (Async)</text>
+
+  <!-- === 第一行：主流程 (Sync) === -->
+
+  <!-- Box 1: VersionSet -->
+  <g transform="translate(60, 60)">
+    <rect class="sync-box" width="220" height="90" rx="8" />
+    <text class="title" x="20" y="30">VersionSet</text>
+    <text class="text" x="20" y="55">应用 VersionEdit</text>
+    <text class="text" x="20" y="75">生成新版本</text>
+  </g>
+
+  <!-- 箭头 1 -> 2 -->
+  <path class="arrow" d="M280 105 L340 105" />
+
+  <!-- Box 2: 关键路径 -->
+  <g transform="translate(340, 60)">
+    <rect class="sync-box" width="240" height="90" rx="8" />
+    <text class="title" x="20" y="30">关键路径操作</text>
+    <text class="text" x="20" y="55">1. 验证 &amp; 写入 Manifest</text>
+    <text class="text" x="20" y="75">2. 切换当前 Version</text>
+  </g>
+
+  <!-- 箭头 2 -> 3 (Send) -->
+  <path class="arrow" d="M580 105 L660 105" />
+  <text class="label" x="600" y="95" text-anchor="middle">Send</text>
+
+  <!-- Box 3: Channel Sender -->
+  <g transform="translate(660, 75)">
+    <rect class="channel-box" width="220" height="60" rx="8" />
+    <text class="title" x="110" y="25" text-anchor="middle">mpsc::Sender</text>
+    <text class="text" x="110" y="45" text-anchor="middle">CleanupTask 通道</text>
+  </g>
+
+  <!-- === 中间：数据流 (Task Types) === -->
+  <!-- 这是一个垂直流动区域，不应该阻挡线条 -->
+
+  <!-- 箭头：从 Sender 下沉到 Worker -->
+  <!-- 路径：从右上 Sender 底部出来 -> 向下穿过分割线 -> 进入下方 Worker 顶部 -->
+  <!-- 这种画法避免了左绕右绕 -->
+  <path class="arrow-dashed" d="M770 135 L770 330" />
+
+  <!-- 数据结构展示 (挂在垂直箭头的旁边) -->
+  <g transform="translate(790, 180)">
+    <rect class="data-box" width="160" height="80" rx="4" />
+    <text class="title" x="10" y="25" font-size="12px">Enum CleanupTask</text>
+    <text class="text" x="10" y="45" font-size="12px">- Sstable(file_id)</text>
+    <text class="text" x="10" y="65" font-size="12px">- Wal(log_num)</text>
+  </g>
+  <!-- 连接线：指向数据流 -->
+  <line x1="770" y1="220" x2="790" y2="220" stroke="#888" stroke-dasharray="2,2" />
+
+  <!-- === 第二行：后台处理 (Async) === -->
+
+  <!-- Box 4: CleanupWorker -->
+  <!-- 放在右下角接收数据 -->
+  <g transform="translate(640, 330)">
+    <rect class="async-box" width="260" height="90" rx="8" />
+    <text class="title" x="20" y="30">CleanupWorker</text>
+    <text class="text" x="20" y="55">循环接收 (recv)</text>
+    <text class="text" x="20" y="75">后台线程不阻塞主流程</text>
+  </g>
+
+  <!-- 箭头 4 -> 5 (执行删除) -->
+  <!-- 向左指，形成回环视觉，或者分两行。这里为了流程顺畅，放在左边比较好，或者下面。-->
+  <!-- 修正布局：为了避免交叉，将Worker放在右边接数据，然后向左指向“删除操作” -->
+  <path class="arrow" d="M640 375 L520 375" />
+
+  <!-- Box 5: 物理删除 -->
+  <g transform="translate(200, 330)">
+    <rect class="async-box" width="320" height="90" rx="8" />
+    <text class="title" x="20" y="30">物理文件删除 (I/O)</text>
+    <text class="text" x="20" y="55">std::fs::remove_file</text>
+    <text class="text" x="20" y="75">删除 SSTable / WAL / Manifest</text>
+  </g>
+
+  <!-- === 底部：优势说明 === -->
+  <g transform="translate(60, 480)">
+    <rect class="box" width="860" height="100" rx="10" />
+    <text class="title" x="25" y="30">异步清理设计优势</text>
+    <text class="text" x="25" y="55">1. 零阻塞：物理 I/O 耗时操作完全移出 flush/compaction 关键路径，降低写延迟。</text>
+    <text class="text" x="25" y="75">2. 引用安全：利用 Rust 的引用计数或 Drop 机制，确保只有当文件不再被任何 Iterator 引用时才发送删除任务。</text>
+  </g>
+
+</svg>

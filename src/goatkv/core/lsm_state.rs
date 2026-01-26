@@ -1,28 +1,32 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
-use crate::goatkv::storage::sstable_reader::SSTableReader;
-use crate::goatkv::utils::options::KvEngineOptions;
+use crate::goatkv::core::wal_handle::WalHandle;
+use crate::goatkv::metadata::version::Version;
 
 #[derive(Debug)]
 pub struct LSMState {
-    /// 内存表（可写）
+    /// Mutable memtable
     pub mem_table: Arc<MemTable>,
-    /// 不可变内存表队列（待刷盘）
-    pub immutable_mem_tables: VecDeque<Arc<ImmutableMemTable>>,
-    /// SSTable 列表 (L0)
-    /// 使用 Mutex 因为 SSTableReader::get 需要 &mut self (文件IO)
-    pub sstables: Vec<Arc<Mutex<SSTableReader>>>,
+    /// Immutable memtables waiting for flush
+    pub immutable_mem_tables: VecDeque<ImmutableMemTableEntry>,
+    /// Current version snapshot for SSTable reads
+    pub version: Arc<Version>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImmutableMemTableEntry {
+    pub table: Arc<ImmutableMemTable>,
+    pub wal_handle: Option<Arc<WalHandle>>,
 }
 
 impl LSMState {
-    pub fn new(options: &KvEngineOptions) -> Self {
+    pub fn new(mem_table: Arc<MemTable>, version: Arc<Version>) -> Self {
         LSMState {
-            mem_table: Arc::new(MemTable::new(options.mem_table_size)),
+            mem_table,
             immutable_mem_tables: VecDeque::new(),
-            sstables: Vec::new(),
+            version,
         }
     }
 }

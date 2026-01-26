@@ -18,7 +18,17 @@ impl SequenceNumber {
         }
     }
 
+    pub fn with_start(start: u64) -> Self {
+        Self {
+            counter: AtomicU64::new(start),
+        }
+    }
+
     pub fn next(&self) -> u64 {
         self.counter.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub fn set(&self, value: u64) {
+        self.counter.store(value, Ordering::SeqCst);
     }
 }

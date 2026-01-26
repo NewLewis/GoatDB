@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="520" viewBox="0 0 980 520" shape-rendering="geometricPrecision" text-rendering="geometricPrecision">
+  <defs>
+    <style>
+      .box { fill: #f5f7fb; stroke: #2f3b52; stroke-width: 2.4; }
+      .title { font: 700 17px "Helvetica Neue", Arial, sans-serif; fill: #1c2433; }
+      .text { font: 14px "Helvetica Neue", Arial, sans-serif; fill: #1c2433; }
+      .arrow { stroke: #2f3b52; stroke-width: 2.4; fill: none; marker-end: url(#arrow); stroke-linecap: round; stroke-linejoin: round; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2f3b52" />
+    </marker>
+  </defs>
+
+  <rect class="box" x="40" y="40" width="340" height="200" rx="10" />
+  <text class="title" x="60" y="70">VersionSet</text>
+  <text class="text" x="60" y="100">- current (Version)</text>
+  <text class="text" x="60" y="125">- versions (history)</text>
+  <text class="text" x="60" y="150">- manifest writer</text>
+  <text class="text" x="60" y="175">- log/next_file/last_seq</text>
+  <text class="text" x="60" y="200">- paths + options</text>
+
+  <rect class="box" x="520" y="40" width="380" height="200" rx="10" />
+  <text class="title" x="540" y="70">Version</text>
+  <text class="text" x="540" y="100">- files[level] = list of SSTables</text>
+  <text class="text" x="540" y="125">- level_size_bytes</text>
+  <text class="text" x="540" y="150">- creation_seqno</text>
+  <text class="text" x="540" y="175">- sstable_paths</text>
+
+  <rect class="box" x="40" y="300" width="340" height="180" rx="10" />
+  <text class="title" x="60" y="330">VersionEdit</text>
+  <text class="text" x="60" y="360">- add_file(level, meta)</text>
+  <text class="text" x="60" y="385">- delete_file(level, id)</text>
+  <text class="text" x="60" y="410">- log/next_file/last_seq</text>
+
+  <rect class="box" x="520" y="300" width="380" height="180" rx="10" />
+  <text class="title" x="540" y="330">Manifest</text>
+  <text class="text" x="540" y="360">- append-only edits</text>
+  <text class="text" x="540" y="385">- length prefix + edit bytes</text>
+  <text class="text" x="540" y="410">- replay on recovery</text>
+
+  <path class="arrow" d="M380 110 L520 110" />
+  <path class="arrow" d="M210 240 L210 300" />
+  <path class="arrow" d="M380 170 L520 340" />
+</svg>

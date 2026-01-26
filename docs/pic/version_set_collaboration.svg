@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="650" viewBox="0 0 980 650" style="background-color: #ffffff;">
+  <defs>
+    <style>
+      /* 盒子样式 */
+      .box { fill: #f5f7fb; stroke: #2f3b52; stroke-width: 2; }
+      .center-box { fill: #e8f4f8; stroke: #2f3b52; stroke-width: 2.5; } /* VersionSet 加重 */
+      .worker-box { fill: #f0f7f0; stroke: #2f3b52; stroke-width: 2; }
+      .control-box { fill: #fff8e8; stroke: #2f3b52; stroke-width: 2; }
+
+      /* 字体样式 */
+      .title { font-family: "Helvetica Neue", Arial, sans-serif; font-weight: bold; font-size: 16px; fill: #1c2433; }
+      .text { font-family: "Helvetica Neue", Arial, sans-serif; font-size: 14px; fill: #333333; }
+      .label { font-family: "Helvetica Neue", Arial, sans-serif; font-size: 12px; fill: #555; background-color: #ffffff; padding: 4px; }
+      .label-box { fill: #ffffff; stroke: none; opacity: 0.9; }
+
+      /* 线条样式 */
+      .arrow { stroke: #2f3b52; stroke-width: 2; fill: none; marker-end: url(#arrow); stroke-linejoin: round; }
+      .arrow-dashed { stroke: #4a5a75; stroke-width: 2; fill: none; marker-end: url(#arrow); stroke-dasharray: 6,4; stroke-linejoin: round; }
+    </style>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2f3b52" />
+    </marker>
+  </defs>
+
+  <!-- 标题 -->
+  <text class="title" x="490" y="40" text-anchor="middle" font-size="20px">VersionSet 模块协作架构</text>
+
+  <!-- === 顶部：KvEngine (Controller) === -->
+  <g transform="translate(380, 70)">
+    <rect class="control-box" width="220" height="80" rx="8" />
+    <text class="title" x="110" y="30" text-anchor="middle">KvEngine</text>
+    <text class="text" x="110" y="55" text-anchor="middle">系统入口 / 读写协调</text>
+  </g>
+
+  <!-- === 中间层 === -->
+
+  <!-- 左侧：FlushWorker -->
+  <g transform="translate(60, 220)">
+    <rect class="worker-box" width="220" height="100" rx="8" />
+    <text class="title" x="110" y="30" text-anchor="middle">FlushWorker</text>
+    <text class="text" x="110" y="55" text-anchor="middle">MemTable -> SST</text>
+    <text class="text" x="110" y="75" text-anchor="middle">(Producer)</text>
+  </g>
+
+  <!-- 中心：VersionSet -->
+  <g transform="translate(360, 210)">
+    <rect class="center-box" width="260" height="120" rx="10" />
+    <text class="title" x="130" y="35" text-anchor="middle">VersionSet</text>
+    <text class="text" x="130" y="65" text-anchor="middle">核心元数据管理</text>
+    <text class="text" x="130" y="90" text-anchor="middle">Manage Manifest / Versions</text>
+  </g>
+
+  <!-- 右侧：Compaction -->
+  <g transform="translate(700, 220)">
+    <rect class="worker-box" width="220" height="100" rx="8" />
+    <text class="title" x="110" y="30" text-anchor="middle">Compaction</text>
+    <text class="text" x="110" y="55" text-anchor="middle">Merge L(n) -> L(n+1)</text>
+    <text class="text" x="110" y="75" text-anchor="middle">(Producer)</text>
+  </g>
+
+  <!-- === 底部：Cleanup (Consumer) === -->
+  <g transform="translate(380, 400)">
+    <rect class="worker-box" width="220" height="80" rx="8" />
+    <text class="title" x="110" y="30" text-anchor="middle">CleanupWorker</text>
+    <text class="text" x="110" y="55" text-anchor="middle">异步文件物理删除</text>
+  </g>
+
+  <!-- === 连线：控制流 (外绕) === -->
+
+  <!-- KvEngine -> Flush (左外绕) -->
+  <path class="arrow-dashed" d="M380 110 L170 110 L170 220" />
+  <rect x="120" y="150" width="100" height="20" class="label-box" />
+  <text class="label" x="170" y="165" text-anchor="middle">Trigger Flush</text>
+
+  <!-- KvEngine -> Compaction (右外绕) -->
+  <path class="arrow-dashed" d="M600 110 L810 110 L810 220" />
+  <rect x="760" y="150" width="100" height="20" class="label-box" />
+  <text class="label" x="810" y="165" text-anchor="middle">Trigger Compact</text>
+
+  <!-- === 连线：数据流 (水平汇聚) === -->
+
+  <!-- Flush -> VersionSet -->
+  <path class="arrow" d="M280 270 L360 270" />
+  <text class="label" x="320" y="265" text-anchor="middle">Apply Edit</text>
+
+  <!-- Compaction -> VersionSet -->
+  <path class="arrow" d="M700 270 L620 270" />
+  <text class="label" x="660" y="265" text-anchor="middle">Apply Edit</text>
+
+  <!-- === 连线：状态与任务 (垂直中心) === -->
+
+  <!-- VersionSet -> KvEngine (向上提供状态) -->
+  <path class="arrow" d="M490 210 L490 150" />
+  <rect x="440" y="170" width="100" height="20" class="label-box" />
+  <text class="label" x="490" y="185" text-anchor="middle">Read current()</text>
+
+  <!-- VersionSet -> Cleanup (向下分发任务) -->
+  <path class="arrow" d="M490 330 L490 400" />
+  <rect x="430" y="355" width="120" height="20" class="label-box" />
+  <text class="label" x="490" y="370" text-anchor="middle">Send Task</text>
+
+  <!-- === 底部说明区域 === -->
+  <g transform="translate(60, 520)">
+    <rect class="box" width="860" height="100" rx="10" />
+    <text class="title" x="25" y="30">系统交互说明</text>
+    <text class="text" x="25" y="55">1. 写路径 (Left)：FlushWorker 完成内存转磁盘后，向 VersionSet 提交 VersionEdit。</text>
+    <text class="text" x="25" y="75">2. 读路径 (Center)：KvEngine 随时向 VersionSet 获取最新的 Current Version 指针进行无锁读取。</text>
+    <text class="text" x="25" y="95">3. 清理路径 (Bottom)：VersionSet 版本轮转后，将过期的文件列表封装为 Task 发送给 CleanupWorker。</text>
+  </g>
+
+</svg>

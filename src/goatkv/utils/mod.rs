@@ -1,6 +1,10 @@
 // 辅助工具组件
-pub mod db_path_manager;
+pub mod cleanup_task;
+pub mod io_helpers;
+pub mod logging;
 pub mod options;
-pub mod sequence_number;
+pub mod paths;
 
+pub use logging::init_logging;
 pub use options::KvEngineOptions;
+pub use paths::{ManifestPaths, SstablePaths, WalPaths};

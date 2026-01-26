@@ -1,11 +1,11 @@
 use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind, SEQUENCE_NUMBER_MAX};
-use crate::goatkv::encoding::varint;
-use crate::goatkv::storage::block_reader::BlockReader;
+use super::block_reader::BlockReader;
+use crate::goatkv::format::coding;
+use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind, SEQUENCE_NUMBER_MAX};
 
 /// SSTable 文件的 Magic Number
 const MAGIC_NUMBER: u64 = 0x706A725F676F6174;
@@ -32,26 +32,9 @@ pub struct SSTableReader {
     /// 文件句柄
     file: File,
     /// BloomFilter
-    bloom_filter: crate::goatkv::storage::bloom_builder::BloomFilter,
+    bloom_filter: super::bloom::BloomFilter,
     /// 索引条目列表，按分隔键排序
     index_entries: Vec<IndexEntry>,
-}
-
-/// SSTable 文件句柄/元数据
-#[derive(Debug, Clone)]
-pub struct SSTable {
-    pub id: u64,
-    pub path: PathBuf,
-}
-
-impl SSTable {
-    pub fn new(id: u64, path: PathBuf) -> Self {
-        Self { id, path }
-    }
-
-    pub fn open_reader(&self) -> io::Result<SSTableReader> {
-        SSTableReader::open(&self.path)
-    }
 }
 
 impl SSTableReader {
@@ -102,28 +85,30 @@ impl SSTableReader {
         let mut cursor = 0;
 
         // 解析 bloom_offset (varint)
-        let (bloom_offset, bloom_bytes_len) = match varint::decode_with_length(&footer[cursor..]) {
-            Ok(result) => result,
-            Err(e) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Failed to decode bloom filter offset: {}", e),
-                ));
-            }
-        };
+        let (bloom_offset, bloom_bytes_len) =
+            match coding::decode_varint64_with_length(&footer[cursor..]) {
+                Ok(result) => result,
+                Err(e) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Failed to decode bloom filter offset: {}", e),
+                    ));
+                }
+            };
 
         cursor += bloom_bytes_len;
 
         // 解析 index_offset (varint)
-        let (index_offset, index_bytes_len) = match varint::decode_with_length(&footer[cursor..]) {
-            Ok(result) => result,
-            Err(e) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Failed to decode index block offset: {}", e),
-                ));
-            }
-        };
+        let (index_offset, index_bytes_len) =
+            match coding::decode_varint64_with_length(&footer[cursor..]) {
+                Ok(result) => result,
+                Err(e) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Failed to decode index block offset: {}", e),
+                    ));
+                }
+            };
 
         cursor += index_bytes_len;
 
@@ -173,7 +158,7 @@ impl SSTableReader {
         let bloom_filter_size = index_offset - bloom_offset;
         let mut bloom_bitmap = vec![0u8; bloom_filter_size as usize];
         file.read_exact(&mut bloom_bitmap)?;
-        let bloom_filter = crate::goatkv::storage::bloom_builder::BloomFilter::new(bloom_bitmap);
+        let bloom_filter = super::bloom::BloomFilter::new(bloom_bitmap);
 
         // 6. 读取和解析索引块
         // index_offset 是索引块的开始位置
@@ -231,7 +216,8 @@ impl SSTableReader {
             }
 
             // 解码块偏移量
-            let (block_offset, offset_len) = match varint::decode_with_length(&offset_data) {
+            let (block_offset, offset_len) = match coding::decode_varint64_with_length(&offset_data)
+            {
                 Ok(result) => result,
                 Err(e) => {
                     return Err(io::Error::new(
@@ -243,7 +229,7 @@ impl SSTableReader {
 
             // 解码块大小
             let block_size_data = &offset_data[offset_len..];
-            let block_size = match varint::decode(block_size_data) {
+            let block_size = match coding::decode_varint64(block_size_data) {
                 Ok(size) => size,
                 Err(e) => {
                     return Err(io::Error::new(
@@ -277,54 +263,15 @@ impl SSTableReader {
     }
 
     /// 在 SSTable 中查找指定的 key (UserKey)
-    pub fn get(&mut self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    pub fn get(&mut self, key: &[u8]) -> io::Result<Option<(InternalKey, Vec<u8>)>> {
         // 1. 使用 BloomFilter 快速过滤 (BloomFilter now indexes UserKey)
         if !self.may_contain(key) {
             return Ok(None);
         }
 
-        // 2. 在索引中查找对应的数据块
-        // 构造 probe key: InternalKey(user_key, MAX_SEQ, Lookup/Put)
-        // 我们想找到第一个 InternalKey >= (user_key, MAX_SEQ) 的条目
-        // 注意：InternalKey 排序是 (UserKey Asc, Seq Desc)
-        // 所以 (UserKey, MAX_SEQ) 是该 UserKey 的"最小"InternalKey（排最前面）
-        // 只要 block 的 separator >= probe_key，该 block 就可能包含目标 UserKey
         let probe_key = InternalKey::new(key.to_vec(), SEQUENCE_NUMBER_MAX, InternalKeyKind::Put);
 
-        // MemTable flush logic:
-        // `sstable_builder` just wrote bytes.
-        // `mem_table` flush constructed it manually.
-        // InternalKey struct has `encoded_sequence_number`.
-        // Format: user_key + 8 bytes (big endian? No, usually le bytes of u64? Let's check mem_table logic)
-
-        // MemTable flush logic:
-        /*
-        serialized_key.extend_from_slice(key.user_key());
-        serialized_key.extend_from_slice(&key.encoded_sequence_number().to_le_bytes());
-        */
-
-        let mut target_key_bytes = Vec::new();
-        target_key_bytes.extend_from_slice(key);
-
-        // 启发式检测：检查 SSTable 中 key 的格式
-        // 如果第一个索引条目的分隔键长度 >= 8，假设是 InternalKey 格式（包含序列号）
-        // 否则假设是纯 UserKey 格式（测试中的情况）
-        let use_internal_key_format = self
-            .index_entries
-            .first()
-            .map(|entry| entry.separator.len() >= 8)
-            .unwrap_or(false);
-
-        if use_internal_key_format {
-            // 实际系统使用的格式：大端序 + 取反
-            target_key_bytes
-                .extend_from_slice(&(!probe_key.encoded_sequence_number()).to_be_bytes());
-        } else {
-            // 测试使用的格式：小端序（或无序列号）
-            target_key_bytes.extend_from_slice(&probe_key.encoded_sequence_number().to_le_bytes());
-        }
-
-        let block_info = self.find_block_for_key(&target_key_bytes);
+        let block_info = self.find_block_for_key(&probe_key.serialize());
 
         let (block_offset, block_size) = match block_info {
             Some(info) => info,
@@ -376,14 +323,10 @@ impl SSTableReader {
                     // 2. Invert back to get real encoded seq
                     let encoded_seq = !inverted_seq;
 
-                    // Kind is lowest byte of encoded_seq
-                    // Kind is lowest byte
-                    let kind = encoded_seq & 0xFF; // 0=Put, 1=Delete
-                    if kind == 1 {
-                        return Ok(None); // Deleted
-                    } else {
-                        return Ok(Some(v));
-                    }
+                    return Ok(Some((
+                        InternalKey::from_encoded(user_key_part.to_vec(), encoded_seq),
+                        v,
+                    )));
                 }
                 Ordering::Greater => {
                     // Moved past target user key
@@ -445,17 +388,21 @@ impl SSTableReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
-    use crate::goatkv::storage::sstable_builder::SSTableBuilder;
+    use crate::goatkv::core::kv_engine::KvEngine;
+    use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
+    use crate::goatkv::storage::sstable::SSTableBuilder;
     use std::io::Write;
+    use std::path::PathBuf;
     use tempfile::TempDir;
+    use tracing::{info, warn};
 
     /// 创建测试用的 SSTable 文件
-    fn create_test_sstable() -> TempDir {
+    /// 返回 (TempDir, SSTable路径)
+    fn create_test_sstable() -> (TempDir, PathBuf) {
         let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path();
+        let (_, sstable_paths, _) = KvEngine::init_db_paths(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new(1, dir_path.to_path_buf()).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &sstable_paths).unwrap();
 
         // 添加一些测试数据，使用 InternalKey 格式（与生产环境一致）
         // 使用递减的序列号以确保正确的排序
@@ -481,13 +428,87 @@ mod tests {
 
         builder.finish().unwrap();
 
-        temp_dir
+        let sst_path = sstable_paths.sstable_path_by_id(1);
+        (temp_dir, sst_path)
+    }
+
+    #[test]
+    fn test_sstable_iter_all_data() {
+        // 创建200条数据并测试完整迭代
+        let temp_dir = TempDir::new().unwrap();
+        let (_, sstable_paths, _) = KvEngine::init_db_paths(temp_dir.path()).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &sstable_paths).unwrap();
+
+        let mut test_data = Vec::new();
+        for i in 0..200 {
+            let key = format!("key_{:03}", i);
+            let value = format!("value_{:03}", i);
+
+            let internal_key = InternalKey::new(key.as_bytes().to_vec(), i, InternalKeyKind::Put);
+            let key_bytes = key.as_bytes().to_vec();
+            let value_bytes = value.as_bytes().to_vec();
+
+            builder.write(&internal_key.serialize(), &value_bytes);
+            test_data.push((key_bytes, value_bytes));
+        }
+
+        builder.finish().unwrap();
+
+        let sst_path = sstable_paths.sstable_path_by_id(1);
+        let mut reader = SSTableReader::open(&sst_path).unwrap();
+
+        // 由于SSTable按key排序，我们先对测试数据排序
+        let mut sorted_data = test_data.clone();
+        sorted_data.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // 检查测试数据本身是否有重复
+        let mut seen_keys = std::collections::HashSet::new();
+        for (key, _) in &test_data {
+            if seen_keys.contains(key) {
+                warn!(
+                    "WARNING: Duplicate key in test data: {:?}",
+                    String::from_utf8_lossy(key)
+                );
+            }
+            seen_keys.insert(key.clone());
+        }
+        info!("Unique keys in test data: {}", seen_keys.len());
+
+        // 读取所有block并遍历
+        let mut all_entries = Vec::new();
+
+        // 读取每个block的数据
+        let _file_size = std::fs::metadata(&sst_path).unwrap().len();
+        let mut _current_offset = 0;
+
+        for entry in reader.index_entries.iter() {
+            let block_offset = entry.block_offset;
+            let block_size = entry.block_size;
+
+            reader
+                .file
+                .seek(std::io::SeekFrom::Start(block_offset))
+                .unwrap();
+            let mut block_data = vec![0u8; block_size as usize];
+            reader.file.read_exact(&mut block_data).unwrap();
+
+            let block_reader = BlockReader::new(&block_data).unwrap();
+
+            for (key, value) in block_reader.iter() {
+                all_entries.push((key, value));
+            }
+        }
+
+        info!("Total entries read: {}", all_entries.len());
+        info!("Total entries expected: {}", test_data.len());
+
+        // 检查是否读取了所有条目
+        assert_eq!(all_entries.len(), test_data.len());
     }
 
     #[test]
     fn test_sstable_reader_open() {
-        let temp_dir = create_test_sstable();
-        let sst_path = temp_dir.path().join("000001.sst");
+        let (_temp_dir, sst_path) = create_test_sstable();
 
         // 先检查文件是否存在
         assert!(sst_path.exists());
@@ -496,7 +517,7 @@ mod tests {
 
         // 如果失败，打印错误信息
         if let Err(ref e) = reader {
-            println!("Error opening SSTable: {}", e);
+            warn!("Error opening SSTable: {}", e);
         }
 
         assert!(reader.is_ok());
@@ -505,7 +526,7 @@ mod tests {
         // 验证基本属性
         assert!(reader.index_entry_count() > 0);
         assert!(reader.min_key().is_some());
-        println!(
+        info!(
             "Reader created successfully with {} index entries",
             reader.index_entry_count()
         );
@@ -513,21 +534,20 @@ mod tests {
 
     #[test]
     fn test_sstable_reader_get() {
-        let temp_dir = create_test_sstable();
-        let sst_path = temp_dir.path().join("000001.sst");
+        let (_temp_dir, sst_path) = create_test_sstable();
         let mut reader = SSTableReader::open(&sst_path).unwrap();
 
         // 测试存在的key
         let result = reader.get(b"apple");
         assert!(result.is_ok());
-        let value = result.unwrap();
-        assert_eq!(value, Some(b"fruit1".to_vec()));
+        let (_, value) = result.unwrap().unwrap();
+        assert_eq!(value, b"fruit1".to_vec());
 
         // 测试另一个存在的key
         let result = reader.get(b"cherry");
         assert!(result.is_ok());
-        let value = result.unwrap();
-        assert_eq!(value, Some(b"fruit3".to_vec()));
+        let (_, value) = result.unwrap().unwrap();
+        assert_eq!(value, b"fruit3".to_vec());
 
         // 测试不存在的key
         let result = reader.get(b"fig");
@@ -538,8 +558,7 @@ mod tests {
 
     #[test]
     fn test_sstable_reader_may_contain() {
-        let temp_dir = create_test_sstable();
-        let sst_path = temp_dir.path().join("000001.sst");
+        let (_temp_dir, sst_path) = create_test_sstable();
         let reader = SSTableReader::open(&sst_path).unwrap();
 
         // BloomFilter 应该对存在的key返回true
@@ -573,87 +592,5 @@ mod tests {
 
         let reader = SSTableReader::open(&file_path);
         assert!(reader.is_err());
-    }
-
-    #[test]
-    fn test_sstable_iter_all_data() {
-        // 创建200条数据并测试完整迭代
-        let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path();
-        let mut builder = SSTableBuilder::new(1, dir_path.to_path_buf()).unwrap();
-
-        let mut test_data = Vec::new();
-        for i in 0..200 {
-            let key = format!("key_{:03}", i);
-            let value = format!("value_{:03}", i);
-            let key_bytes = key.as_bytes().to_vec();
-            let value_bytes = value.as_bytes().to_vec();
-
-            builder.write(&key_bytes, &value_bytes);
-            test_data.push((key_bytes, value_bytes));
-        }
-
-        builder.finish().unwrap();
-
-        let sst_path = temp_dir.path().join("000001.sst");
-        let mut reader = SSTableReader::open(&sst_path).unwrap();
-
-        // 由于SSTable按key排序，我们先对测试数据排序
-        let mut sorted_data = test_data.clone();
-        sorted_data.sort_by(|a, b| a.0.cmp(&b.0));
-
-        // 检查测试数据本身是否有重复
-        let mut seen_keys = std::collections::HashSet::new();
-        for (key, _) in &test_data {
-            if seen_keys.contains(key) {
-                println!(
-                    "WARNING: Duplicate key in test data: {:?}",
-                    String::from_utf8_lossy(key)
-                );
-            }
-            seen_keys.insert(key.clone());
-        }
-        println!("Unique keys in test data: {}", seen_keys.len());
-
-        // 读取所有block并遍历
-        let mut all_entries = Vec::new();
-
-        // 读取每个block的数据
-        let _file_size = std::fs::metadata(&sst_path).unwrap().len();
-        let mut _current_offset = 0;
-
-        for entry in reader.index_entries.iter() {
-            let block_offset = entry.block_offset;
-            let block_size = entry.block_size;
-
-            reader
-                .file
-                .seek(std::io::SeekFrom::Start(block_offset))
-                .unwrap();
-            let mut block_data = vec![0u8; block_size as usize];
-            reader.file.read_exact(&mut block_data).unwrap();
-
-            let block_reader = BlockReader::new(&block_data).unwrap();
-
-            for (key, value) in block_reader.iter() {
-                all_entries.push((key, value));
-            }
-
-            _current_offset = block_offset + block_size;
-        }
-
-        // 验证所有数据都被读取
-        assert_eq!(
-            all_entries.len(),
-            sorted_data.len(),
-            "Should read all {} entries",
-            sorted_data.len()
-        );
-
-        // 验证数据顺序和内容
-        for (i, (actual, expected)) in all_entries.iter().zip(sorted_data.iter()).enumerate() {
-            assert_eq!(actual.0, expected.0, "Key mismatch at index {}", i);
-            assert_eq!(actual.1, expected.1, "Value mismatch at index {}", i);
-        }
     }
 }

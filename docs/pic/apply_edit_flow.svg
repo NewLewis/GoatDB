@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="420" viewBox="0 0 980 420" shape-rendering="geometricPrecision" text-rendering="geometricPrecision">
+  <defs>
+    <style>
+      .box { fill: #f5f7fb; stroke: #2f3b52; stroke-width: 2.4; }
+      .text { font: 15px "Helvetica Neue", Arial, sans-serif; fill: #1c2433; }
+      .arrow { stroke: #2f3b52; stroke-width: 2.4; fill: none; marker-end: url(#arrow); stroke-linecap: round; stroke-linejoin: round; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2f3b52" />
+    </marker>
+  </defs>
+
+  <rect class="box" x="40" y="60" width="200" height="60" rx="10" />
+  <text class="text" x="60" y="95">Validate edit</text>
+
+  <rect class="box" x="260" y="60" width="220" height="60" rx="10" />
+  <text class="text" x="280" y="95">Append edit to MANIFEST</text>
+
+  <rect class="box" x="500" y="60" width="200" height="60" rx="10" />
+  <text class="text" x="520" y="95">Update global counters</text>
+
+  <rect class="box" x="720" y="60" width="200" height="60" rx="10" />
+  <text class="text" x="740" y="95">Build new Version</text>
+
+  <rect class="box" x="260" y="180" width="220" height="60" rx="10" />
+  <text class="text" x="280" y="215">Swap current + keep old</text>
+
+  <rect class="box" x="520" y="180" width="220" height="60" rx="10" />
+  <text class="text" x="540" y="215">Queue obsolete files</text>
+
+  <path class="arrow" d="M240 90 L260 90" />
+  <path class="arrow" d="M480 90 L500 90" />
+  <path class="arrow" d="M700 90 L720 90" />
+  <path class="arrow" d="M820 120 L820 150 L370 150 L370 180" />
+  <path class="arrow" d="M480 210 L520 210" />
+</svg>
