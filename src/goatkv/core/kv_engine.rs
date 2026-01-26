@@ -502,6 +502,9 @@ impl KvEngine {
 
             // 克隆当前的 memtable
             let mem_table = state.mem_table.clone();
+            if mem_table.is_empty() {
+                return;
+            }
 
             // 创建 immutable_mem_table
             let immutable_mem_table = Arc::new(ImmutableMemTable::new(mem_table.inner()));
@@ -609,6 +612,21 @@ mod tests {
         assert_eq!(engine.get(b"key1"), None);
         assert_eq!(engine.get(b"key2"), Some(b"updated_value2".to_vec()));
         assert_eq!(engine.get(b"key3"), Some(b"value3".to_vec()));
+    }
+
+    #[test]
+    fn test_empty_flush_is_noop() {
+        let engine = KvEngine::new_for_test();
+
+        engine.flush();
+
+        let state = engine.lsm_state.read().unwrap();
+        assert!(state.immutable_mem_tables.is_empty());
+        assert!(state.mem_table.is_empty());
+        drop(state);
+
+        let version = engine.version_set.read().unwrap().current();
+        assert!(version.get_files(0).is_empty());
     }
 
     #[test]

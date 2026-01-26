@@ -82,6 +82,42 @@ impl FlushWorker {
             // 从任务中获取要刷盘的 immutable memtable
             let imm_table = task.immutable_mem_table.clone();
 
+            // 在不持有锁的情况下处理数据
+            let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let mut max_sequence = 0u64;
+            for (key, value) in imm_table.iter() {
+                max_sequence = max_sequence.max(key.sequence_number());
+                entries.push((key.serialize(), value.to_vec()));
+            }
+
+            if entries.is_empty() {
+                let mut version_edit = VersionEdit::new();
+                if task.new_log_number > 0 {
+                    version_edit.set_log_number(task.new_log_number);
+                }
+                let last_sequence = {
+                    let vs = version_set.read().unwrap();
+                    std::cmp::max(max_sequence, vs.last_sequence())
+                };
+                version_edit.set_last_sequence(last_sequence);
+
+                let current_version = {
+                    let mut vs = version_set.write().unwrap();
+                    if let Err(e) = vs.apply_edit(version_edit) {
+                        error!("Failed to apply VersionEdit: {}", e);
+                        continue; // 不 pop_front，等待后续重试
+                    }
+                    vs.current()
+                };
+
+                {
+                    let mut lsm_state_guard = lsm_state.write().unwrap();
+                    lsm_state_guard.version = current_version;
+                    lsm_state_guard.immutable_mem_tables.pop_front();
+                }
+                continue;
+            }
+
             // 分配文件 ID
             let (file_id, next_file_number) = {
                 let mut vs = version_set.write().unwrap();
@@ -97,14 +133,6 @@ impl FlushWorker {
                     continue;
                 }
             };
-
-            // 在不持有锁的情况下处理数据
-            let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-            let mut max_sequence = 0u64;
-            for (key, value) in imm_table.iter() {
-                max_sequence = max_sequence.max(key.sequence_number());
-                entries.push((key.serialize(), value.to_vec()));
-            }
 
             // 在不持有锁的情况下写入 SSTable
             for (key, value) in entries {

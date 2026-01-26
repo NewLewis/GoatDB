@@ -60,8 +60,8 @@ impl Version {
     // todo table cache
     pub fn get(&self, key: &[u8]) -> Option<(InternalKey, Vec<u8>)> {
         // 先检查 Level 0
-        // todo level 0的遍历顺序问题
-        for file in &self.files[0] {
+        // Level 0 文件可能重叠，必须从最新的 SSTable 开始查找，避免返回旧值
+        for file in self.files[0].iter().rev() {
             // Level 0 的文件可能重叠，需要检查所有文件
             // smallest_key和largest_key都存在的是internal_key不能直接用于比较，需要转换为user_key进行比较
             if key >= file.smallest_user_key() && key <= file.largest_user_key() {

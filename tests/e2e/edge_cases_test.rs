@@ -217,3 +217,78 @@ async fn test_flush_then_immediate_read_consistency() {
     assert!(resp.success);
     assert_eq!(resp.value, b"flush_value".to_vec());
 }
+
+#[tokio::test]
+async fn test_l0_newest_file_wins_on_overlap() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    client
+        .write(WriteRequest {
+            key: b"overlap_key".to_vec(),
+            value: b"value_v1".to_vec(),
+        })
+        .await
+        .unwrap();
+    let flush = client.flush(FlushRequest {}).await.unwrap().into_inner();
+    assert!(flush.success);
+
+    client
+        .write(WriteRequest {
+            key: b"overlap_key".to_vec(),
+            value: b"value_v2".to_vec(),
+        })
+        .await
+        .unwrap();
+    let flush = client.flush(FlushRequest {}).await.unwrap().into_inner();
+    assert!(flush.success);
+
+    let resp = client
+        .get(GetRequest {
+            key: b"overlap_key".to_vec(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.success);
+    assert_eq!(resp.value, b"value_v2".to_vec());
+}
+
+#[tokio::test]
+async fn test_empty_flush_is_noop() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    let flush = client.flush(FlushRequest {}).await.unwrap().into_inner();
+    assert!(flush.success);
+
+    let flush = client.flush(FlushRequest {}).await.unwrap().into_inner();
+    assert!(flush.success);
+
+    let resp = client
+        .get(GetRequest {
+            key: b"missing_key".to_vec(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!resp.success);
+
+    client
+        .write(WriteRequest {
+            key: b"after_empty_flush".to_vec(),
+            value: b"value".to_vec(),
+        })
+        .await
+        .unwrap();
+
+    let resp = client
+        .get(GetRequest {
+            key: b"after_empty_flush".to_vec(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.success);
+    assert_eq!(resp.value, b"value".to_vec());
+}
