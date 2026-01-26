@@ -1,9 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="980" height="260" viewBox="0 0 980 260">
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="260" viewBox="0 0 980 260" shape-rendering="geometricPrecision" text-rendering="geometricPrecision">
   <defs>
     <style>
-      .box { fill: #f5f7fb; stroke: #2f3b52; stroke-width: 2; }
-      .text { font: 14px sans-serif; fill: #1c2433; }
-      .arrow { stroke: #2f3b52; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .box { fill: #f5f7fb; stroke: #2f3b52; stroke-width: 2.4; }
+      .text { font: 15px "Helvetica Neue", Arial, sans-serif; fill: #1c2433; }
+      .arrow { stroke: #2f3b52; stroke-width: 2.4; fill: none; marker-end: url(#arrow); stroke-linecap: round; stroke-linejoin: round; }
     </style>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
       <path d="M0,0 L0,6 L9,3 z" fill="#2f3b52" />

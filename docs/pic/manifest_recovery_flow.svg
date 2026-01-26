@@ -1,99 +1,132 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="980" height="620" viewBox="0 0 980 620">
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="750" viewBox="0 0 1000 750" style="background-color: #ffffff;">
   <defs>
+    <!-- 样式定义 -->
     <style>
       .box { fill: #f5f7fb; stroke: #2f3b52; stroke-width: 2; }
-      .title { font: 700 16px sans-serif; fill: #1c2433; }
-      .text { font: 13px sans-serif; fill: #1c2433; }
-      .arrow { stroke: #2f3b52; stroke-width: 2; fill: none; marker-end: url(#arrow); }
       .recovery-box { fill: #f0f7f0; stroke: #2f3b52; stroke-width: 2; }
+      .check-box { fill: #fff8e8; stroke: #2f3b52; stroke-width: 2; }
       .file-box { fill: #e8f4f8; stroke: #2f3b52; stroke-width: 2; }
       .data-box { fill: #f8f0f5; stroke: #2f3b52; stroke-width: 2; }
-      .check-box { fill: #fff8e8; stroke: #2f3b52; stroke-width: 2; }
+
+      .title { font-family: "Helvetica Neue", Arial, sans-serif; font-weight: bold; font-size: 16px; fill: #1c2433; }
+      .text { font-family: "Helvetica Neue", Arial, sans-serif; font-size: 14px; fill: #333333; }
+      .arrow { stroke: #2f3b52; stroke-width: 2; fill: none; marker-end: url(#arrow); stroke-linejoin: round; }
+      .arrow-dashed { stroke: #2f3b52; stroke-width: 2; fill: none; marker-end: url(#arrow); stroke-dasharray: 6,4; stroke-linejoin: round; }
     </style>
-    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+    <!-- 箭头标记 -->
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
       <path d="M0,0 L0,6 L9,3 z" fill="#2f3b52" />
     </marker>
   </defs>
 
-  <!-- 标题 -->
-  <text class="title" x="490" y="40" text-anchor="middle">MANIFEST 恢复流程（崩溃恢复）</text>
+  <!-- 顶部标题 -->
+  <text class="title" x="500" y="40" text-anchor="middle" font-size="20px">MANIFEST 恢复流程（崩溃恢复）</text>
+  <text class="text" x="500" y="65" text-anchor="middle" font-weight="bold" fill="#555">恢复方向 →</text>
+  <line x1="50" y1="75" x2="950" y2="75" stroke="#ccc" stroke-width="1" />
 
-  <!-- 第1步：定位 MANIFEST 文件 -->
-  <rect class="recovery-box" x="60" y="80" width="280" height="100" rx="10" />
-  <text class="title" x="80" y="110">步骤1：定位 MANIFEST</text>
-  <text class="text" x="80" y="135">读取 CURRENT 文件</text>
-  <text class="text" x="80" y="160">获取最新 MANIFEST 路径</text>
-  <text class="text" x="80" y="185">示例：MANIFEST-42</text>
+  <!-- === 第一行：定位、回放、构建 === -->
 
-  <!-- 第2步：顺序读取 VersionEdit -->
-  <rect class="recovery-box" x="380" y="80" width="280" height="100" rx="10" />
-  <text class="title" x="400" y="110">步骤2：顺序回放</text>
-  <text class="text" x="400" y="135">读取所有 VersionEdit 记录</text>
-  <text class="text" x="400" y="160">长度前缀 + 编码数据</text>
-  <text class="text" x="400" y="185">支持部分损坏安全截断</text>
+  <!-- 步骤1 -->
+  <g transform="translate(50, 90)">
+    <rect class="recovery-box" width="280" height="100" rx="8" />
+    <text class="title" x="20" y="30">步骤1：定位 MANIFEST</text>
+    <text class="text" x="20" y="55">读取 CURRENT 文件</text>
+    <text class="text" x="20" y="75">获取最新 MANIFEST 路径</text>
+  </g>
 
-  <!-- 第3步：原地构建文件列表 -->
-  <rect class="recovery-box" x="700" y="80" width="220" height="100" rx="10" />
-  <text class="title" x="720" y="110">步骤3：原地构建</text>
-  <text class="text" x="720" y="135">应用 edits 到临时列表</text>
-  <text class="text" x="720" y="160">避免重复创建 Version</text>
-  <text class="text" x="720" y="185">O(E) 而非 O(E×F)</text>
+  <!-- 箭头 1->2 -->
+  <path class="arrow" d="M330 140 L370 140" />
 
-  <!-- 第4步：校验完整性 -->
-  <rect class="check-box" x="220" y="220" width="280" height="100" rx="10" />
-  <text class="title" x="240" y="250">步骤4：校验完整性</text>
-  <text class="text" x="240" y="275">确保 next_file_number</text>
-  <text class="text" x="240" y="300">大于最大文件编号</text>
-  <text class="text" x="240" y="325">防止文件编号冲突</text>
+  <!-- 步骤2 -->
+  <g transform="translate(370, 90)">
+    <rect class="recovery-box" width="280" height="100" rx="8" />
+    <text class="title" x="20" y="30">步骤2：顺序回放</text>
+    <text class="text" x="20" y="55">读取所有 VersionEdit 记录</text>
+    <text class="text" x="20" y="75">长度前缀 + 编码数据</text>
+  </g>
 
-  <!-- 第5步：重建 Version -->
-  <rect class="recovery-box" x="540" y="220" width="280" height="100" rx="10" />
-  <text class="title" x="560" y="250">步骤5：重建 Version</text>
-  <text class="text" x="560" y="275">一次性创建最终 Version</text>
-  <text class="text" x="560" y="300">设置 creation_seqno</text>
-  <text class="text" x="560" y="325">绑定 sstable_paths</text>
+  <!-- 箭头 2->3 -->
+  <path class="arrow" d="M650 140 L690 140" />
 
-  <!-- 第6步：重新打开 MANIFEST -->
-  <rect class="recovery-box" x="380" y="360" width="280" height="100" rx="10" />
-  <text class="title" x="400" y="390">步骤6：重新打开</text>
-  <text class="text" x="400" y="415">以追加模式打开 MANIFEST</text>
-  <text class="text" x="400" y="440">准备后续写入</text>
-  <text class="text" x="400" y="465">更新 manifest_writer</text>
+  <!-- 步骤3 -->
+  <g transform="translate(690, 90)">
+    <rect class="recovery-box" width="240" height="100" rx="8" />
+    <text class="title" x="20" y="30">步骤3：原地构建</text>
+    <text class="text" x="20" y="55">应用 edits 到临时列表</text>
+    <text class="text" x="20" y="75">O(E) 复杂度</text>
+  </g>
 
-  <!-- 箭头连接流程 -->
-  <path class="arrow" d="M340 130 L380 130" />
-  <path class="arrow" d="M660 130 L700 130" />
-  <path class="arrow" d="M920 130 L920 180 L310 180 L310 220" />
-  <path class="arrow" d="M500 320 L540 270" />
-  <path class="arrow" d="M820 320 L820 350 L660 350 L660 360" />
+  <!-- === 第二行：校验、重建 === -->
 
-  <!-- 设计优势说明 -->
-  <rect class="box" x="60" y="480" width="860" height="120" rx="10" />
-  <text class="title" x="80" y="510">恢复流程设计优势</text>
-  <text class="text" x="80" y="535">1. 高效恢复：原地合并 edits，复杂度 O(E) 而非 O(E×F)，减少内存分配</text>
-  <text class="text" x="80" y="560">2. 状态一致：顺序回放与运行期行为一致，恢复结果可预测</text>
-  <text class="text" x="80" y="585">3. 容错处理：支持部分损坏的 MANIFEST 安全截断，避免数据丢失</text>
+  <!-- 箭头 3->4 (关键修复：绕行路径) -->
+  <!-- 从步骤3底部出来，下移，左移，再进入步骤4顶部 -->
+  <path class="arrow" d="M810 190 L810 230 L340 230 L340 260" />
 
-  <!-- MANIFEST 文件格式说明 -->
-  <rect class="data-box" x="60" y="320" width="120" height="80" rx="10" />
-  <text class="title" x="80" y="345" text-anchor="middle">CURRENT</text>
-  <text class="text" x="80" y="370" text-anchor="middle">MANIFEST-42</text>
+  <!-- 步骤4 -->
+  <g transform="translate(200, 260)">
+    <rect class="check-box" width="280" height="100" rx="8" />
+    <text class="title" x="20" y="30">步骤4：校验完整性</text>
+    <text class="text" x="20" y="55">check next_file_number</text>
+    <text class="text" x="20" y="75">防止文件编号冲突</text>
+  </g>
 
-  <rect class="data-box" x="200" y="320" width="120" height="80" rx="10" />
-  <text class="title" x="220" y="345" text-anchor="middle">MANIFEST-42</text>
-  <text class="text" x="220" y="370" text-anchor="middle">[长度][数据]...</text>
+  <!-- 箭头 4->5 -->
+  <path class="arrow" d="M480 310 L520 310" />
 
-  <!-- 文件连接箭头 -->
-  <path class="arrow" d="M180 360 L200 360" />
-  <path class="arrow" d="M320 360 L380 410" stroke-dasharray="5,5" />
+  <!-- 步骤5 -->
+  <g transform="translate(520, 260)">
+    <rect class="recovery-box" width="280" height="100" rx="8" />
+    <text class="title" x="20" y="30">步骤5：重建 Version</text>
+    <text class="text" x="20" y="55">一次性创建最终 Version</text>
+    <text class="text" x="20" y="75">绑定 sstable_paths</text>
+  </g>
 
-  <!-- 标注：恢复方向 -->
-  <text class="title" x="490" y="65" text-anchor="middle">恢复方向 →</text>
-  <line x1="60" y1="70" x2="920" y2="70" stroke="#2f3b52" stroke-width="1" />
+  <!-- === 第三行：重新打开、数据展示 === -->
 
-  <!-- VersionEdit 示例 -->
-  <rect class="file-box" x="700" y="360" width="220" height="80" rx="10" />
-  <text class="title" x="720" y="385">VersionEdit 示例</text>
-  <text class="text" x="720" y="410">- 新增 L0 文件</text>
-  <text class="text" x="720" y="435">- 删除旧文件</text>
+  <!-- 箭头 5->6 (优化路径) -->
+  <path class="arrow" d="M660 360 L660 395 L500 395 L500 420" />
+
+  <!-- 文件图标区域 (移动到左侧不重叠位置) -->
+  <g transform="translate(50, 430)">
+    <rect class="data-box" width="100" height="70" rx="5" />
+    <text class="title" x="50" y="30" text-anchor="middle" font-size="12px">CURRENT</text>
+    <text class="text" x="50" y="50" text-anchor="middle" font-size="10px">Pointer</text>
+  </g>
+
+  <path class="arrow" d="M150 465 L170 465" />
+
+  <g transform="translate(170, 430)">
+    <rect class="data-box" width="140" height="70" rx="5" />
+    <text class="title" x="70" y="30" text-anchor="middle" font-size="12px">MANIFEST-42</text>
+    <text class="text" x="70" y="50" text-anchor="middle" font-size="10px">[Length][Record]...</text>
+  </g>
+
+  <!-- 虚线箭头：Manifest -> 重新打开 -->
+  <path class="arrow-dashed" d="M310 465 L360 465" />
+
+  <!-- 步骤6 -->
+  <g transform="translate(360, 420)">
+    <rect class="recovery-box" width="280" height="90" rx="8" />
+    <text class="title" x="20" y="30">步骤6：重新打开</text>
+    <text class="text" x="20" y="50">追加模式打开 MANIFEST</text>
+    <text class="text" x="20" y="70">重置 manifest_writer</text>
+  </g>
+
+  <!-- VersionEdit 示例 (放在右侧) -->
+  <g transform="translate(680, 425)">
+    <rect class="file-box" width="220" height="80" rx="8" />
+    <text class="title" x="110" y="25" text-anchor="middle">VersionEdit 结构</text>
+    <text class="text" x="20" y="50">- 新增 L0 文件 (kNewFile)</text>
+    <text class="text" x="20" y="70">- 删除旧文件 (kDeleted)</text>
+  </g>
+
+  <!-- === 底部：优势说明 === -->
+  <g transform="translate(50, 560)">
+    <rect class="box" width="900" height="140" rx="10" />
+    <text class="title" x="25" y="35">恢复流程设计优势</text>
+    <text class="text" x="25" y="65">1. 高效恢复：原地合并 edits，复杂度 O(E) 而非 O(E×F)，大幅减少内存分配与计算开销。</text>
+    <text class="text" x="25" y="90">2. 状态一致：顺序回放与运行期行为完全一致，保证恢复后的 Version 状态可预测。</text>
+    <text class="text" x="25" y="115">3. 容错处理：支持部分损坏的 MANIFEST 安全截断 (Truncate)，避免整个数据库无法打开。</text>
+  </g>
+
 </svg>

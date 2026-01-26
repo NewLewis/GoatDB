@@ -1,68 +1,124 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="980" height="520" viewBox="0 0 980 520">
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="600" viewBox="0 0 980 600" style="background-color: #ffffff;">
   <defs>
     <style>
+      /* 盒子样式 */
       .box { fill: #f5f7fb; stroke: #2f3b52; stroke-width: 2; }
-      .title { font: 700 16px sans-serif; fill: #1c2433; }
-      .text { font: 13px sans-serif; fill: #1c2433; }
-      .arrow { stroke: #2f3b52; stroke-width: 2; fill: none; marker-end: url(#arrow); }
-      .counter-box { fill: #e8f4f8; stroke: #2f3b52; stroke-width: 2; }
+      .manager-box { fill: #e8f4f8; stroke: #2f3b52; stroke-width: 2.5; }
+      .counter-box { fill: #fff8e8; stroke: #2f3b52; stroke-width: 2; }
+      .action-box { fill: #f0f7f0; stroke: #2f3b52; stroke-width: 2; }
+      .persist-box { fill: #f0f0f0; stroke: #666; stroke-width: 2; stroke-dasharray: 4,2; }
+
+      /* 字体样式 */
+      .title { font-family: "Helvetica Neue", Arial, sans-serif; font-weight: bold; font-size: 16px; fill: #1c2433; }
+      .text { font-family: "Helvetica Neue", Arial, sans-serif; font-size: 14px; fill: #333333; }
+      .label { font-family: "Helvetica Neue", Arial, sans-serif; font-size: 12px; fill: #555; background-color: #fff; padding: 2px; }
+
+      /* 线条样式 */
+      .arrow { stroke: #2f3b52; stroke-width: 2; fill: none; marker-end: url(#arrow); stroke-linejoin: round; }
+      .arrow-org { stroke: #4a5a75; stroke-width: 2; fill: none; marker-end: url(#arrow); stroke-linejoin: round; } /* 组织结构线 */
+      .arrow-dash { stroke: #888; stroke-width: 2; fill: none; marker-end: url(#arrow-gray); stroke-dasharray: 6,4; stroke-linejoin: round; }
     </style>
-    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+
+    <!-- 黑色箭头 -->
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="3" orient="auto" markerUnits="strokeWidth">
       <path d="M0,0 L0,6 L9,3 z" fill="#2f3b52" />
+    </marker>
+    <!-- 灰色箭头 (用于恢复流程) -->
+    <marker id="arrow-gray" markerWidth="12" markerHeight="12" refX="10" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#888" />
     </marker>
   </defs>
 
-  <!-- VersionSet 中心管理 -->
-  <rect class="box" x="360" y="60" width="260" height="100" rx="10" />
-  <text class="title" x="380" y="90">VersionSet</text>
-  <text class="text" x="380" y="115">全局计数器管理器</text>
+  <!-- 标题 -->
+  <text class="title" x="490" y="30" text-anchor="middle" font-size="20px">VersionSet 计数器管理与生命周期</text>
 
-  <!-- 三个计数器状态 -->
-  <rect class="counter-box" x="100" y="200" width="220" height="100" rx="10" />
-  <text class="title" x="120" y="230">log_number</text>
-  <text class="text" x="120" y="255">当前有效 WAL 编号</text>
-  <text class="text" x="120" y="280">创建新 WAL 时递增</text>
+  <!-- === 1. 管理层 (Top) === -->
+  <g transform="translate(360, 50)">
+    <rect class="manager-box" width="260" height="70" rx="10" />
+    <text class="title" x="130" y="30" text-anchor="middle">VersionSet</text>
+    <text class="text" x="130" y="50" text-anchor="middle">全局状态管理器</text>
+  </g>
 
-  <rect class="counter-box" x="380" y="200" width="220" height="100" rx="10" />
-  <text class="title" x="400" y="230">next_file_number</text>
-  <text class="text" x="400" y="255">下一个可用文件编号</text>
-  <text class="text" x="400" y="280">分配 SSTable/WAL 时递增</text>
+  <!-- 组织结构连接线 (Org Chart Style) -->
+  <!-- 竖线向下 -->
+  <path d="M490 120 L490 150" stroke="#4a5a75" stroke-width="2" fill="none" />
+  <!-- 横线分叉 -->
+  <path d="M190 150 L790 150" stroke="#4a5a75" stroke-width="2" fill="none" />
+  <!-- 三条竖线向下指向计数器 -->
+  <path class="arrow-org" d="M190 150 L190 180" />
+  <path class="arrow-org" d="M490 150 L490 180" />
+  <path class="arrow-org" d="M790 150 L790 180" />
 
-  <rect class="counter-box" x="660" y="200" width="220" height="100" rx="10" />
-  <text class="title" x="680" y="230">last_sequence</text>
-  <text class="text" x="680" y="255">全局最大序列号</text>
-  <text class="text" x="680" y="280">每次写操作递增</text>
+  <!-- === 2. 计数器层 (Middle) === -->
 
-  <!-- 更新流程 -->
-  <rect class="box" x="100" y="340" width="200" height="60" rx="10" />
-  <text class="text" x="120" y="375">创建新 WAL 文件</text>
+  <!-- Counter 1: log_number -->
+  <g transform="translate(80, 180)">
+    <rect class="counter-box" width="220" height="90" rx="8" />
+    <text class="title" x="110" y="30" text-anchor="middle">log_number</text>
+    <text class="text" x="110" y="55" text-anchor="middle">当前 WAL 编号</text>
+    <text class="label" x="110" y="75" text-anchor="middle" fill="#666">保证日志顺序</text>
+  </g>
 
-  <rect class="box" x="380" y="340" width="200" height="60" rx="10" />
-  <text class="text" x="400" y="375">分配新文件编号</text>
+  <!-- Counter 2: next_file_number -->
+  <g transform="translate(380, 180)">
+    <rect class="counter-box" width="220" height="90" rx="8" />
+    <text class="title" x="110" y="30" text-anchor="middle">next_file_number</text>
+    <text class="text" x="110" y="55" text-anchor="middle">文件 ID 分配器</text>
+    <text class="label" x="110" y="75" text-anchor="middle" fill="#666">全局唯一 (SST/WAL)</text>
+  </g>
 
-  <rect class="box" x="660" y="340" width="200" height="60" rx="10" />
-  <text class="text" x="680" y="375">执行写操作</text>
+  <!-- Counter 3: last_sequence -->
+  <g transform="translate(680, 180)">
+    <rect class="counter-box" width="220" height="90" rx="8" />
+    <text class="title" x="110" y="30" text-anchor="middle">last_sequence</text>
+    <text class="text" x="110" y="55" text-anchor="middle">逻辑时钟 (LSN)</text>
+    <text class="label" x="110" y="75" text-anchor="middle" fill="#666">MVCC 版本控制</text>
+  </g>
 
-  <!-- 恢复流程 -->
-  <rect class="box" x="380" y="440" width="220" height="60" rx="10" />
-  <text class="title" x="400" y="470">恢复流程</text>
-  <text class="text" x="400" y="495">从 MANIFEST 读取计数器</text>
+  <!-- === 3. 触发操作层 (Actions - Bottom Up) === -->
 
-  <!-- 箭头连接 -->
-  <path class="arrow" d="M480 160 L480 200" />
+  <!-- Action 1 -->
+  <g transform="translate(80, 360)">
+    <rect class="action-box" width="220" height="60" rx="8" />
+    <text class="text" x="110" y="35" text-anchor="middle">WAL 切换 / 创建</text>
+  </g>
+  <!-- Arrow Up 1 -->
+  <path class="arrow" d="M190 360 L190 280" />
+  <text class="label" x="200" y="320">Update (+1)</text>
 
-  <path class="arrow" d="M210 260 L210 290 L280 290 L280 340" />
-  <path class="arrow" d="M490 260 L490 290 L470 290 L470 340" />
-  <path class="arrow" d="M770 260 L770 290 L740 290 L740 340" />
+  <!-- Action 2 -->
+  <g transform="translate(380, 360)">
+    <rect class="action-box" width="220" height="60" rx="8" />
+    <text class="text" x="110" y="35" text-anchor="middle">新建 SSTable / Manifest</text>
+  </g>
+  <!-- Arrow Up 2 -->
+  <path class="arrow" d="M490 360 L490 280" />
+  <text class="label" x="500" y="320">Update (+1)</text>
 
-  <path class="arrow" d="M200 400 L200 430 L370 430 L370 440" />
-  <path class="arrow" d="M480 400 L480 440" />
-  <path class="arrow" d="M760 400 L760 430 L590 430 L590 440" />
+  <!-- Action 3 -->
+  <g transform="translate(680, 360)">
+    <rect class="action-box" width="220" height="60" rx="8" />
+    <text class="text" x="110" y="35" text-anchor="middle">Put / Delete / Merge</text>
+  </g>
+  <!-- Arrow Up 3 -->
+  <path class="arrow" d="M790 360 L790 280" />
+  <text class="label" x="800" y="320">Update (+1)</text>
 
-  <!-- 从 VersionSet 到计数器的连接 -->
-  <path class="arrow" d="M420 160 L420 200" />
-  <path class="arrow" d="M540 160 L540 200" />
+  <!-- === 4. 恢复层 (Persistence) === -->
+  <!-- 分割线 -->
+  <line x1="50" y1="460" x2="930" y2="460" stroke="#ddd" stroke-width="2" stroke-dasharray="4,4" />
 
-  <!-- 恢复箭头 -->
-  <path class="arrow" d="M490 500 L490 520" />
+  <g transform="translate(290, 490)">
+    <rect class="persist-box" width="400" height="60" rx="8" />
+    <text class="title" x="200" y="35" text-anchor="middle" fill="#666">MANIFEST (Current Version)</text>
+  </g>
+
+  <!-- 恢复箭头 (虚线向上) -->
+  <!-- 指向 Action层和Counter层的空隙，表示初始化 -->
+  <path class="arrow-dash" d="M400 490 L400 440 L110 440 L110 280" />
+  <path class="arrow-dash" d="M490 490 L490 280" />
+  <path class="arrow-dash" d="M580 490 L580 440 L870 440 L870 280" />
+
+  <text class="label" x="490" y="475" text-anchor="middle" fill="#888">System Start: Recover / Initialize</text>
+
 </svg>
