@@ -432,7 +432,6 @@ impl SSTableBuilder {
         drop(writer);
 
         std::fs::rename(&self.tmp_path, &self.final_path)?;
-        #[cfg(unix)]
         sync_dir(
             self.final_path
                 .parent()
@@ -521,6 +520,7 @@ impl SSTableBuilder {
     }
 }
 
+#[cfg(unix)]
 fn sync_dir(path: &Path) -> io::Result<()> {
     let dir = File::open(path)?;
     dir.sync_all()
