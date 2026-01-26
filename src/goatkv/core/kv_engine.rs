@@ -7,6 +7,7 @@ use crate::goatkv::core::cleanup_worker::CleanupWorker;
 use crate::goatkv::core::flush_worker::{FlushTask, FlushWorker};
 use crate::goatkv::core::lsm_state::{ImmutableMemTableEntry, LSMState};
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
+use crate::goatkv::core::sequence_number::SequenceNumber;
 use crate::goatkv::core::wal_handle::WalHandle;
 use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
 use crate::goatkv::metadata::version_set::{VersionSet, VersionSetOptions};
@@ -15,7 +16,6 @@ use crate::goatkv::storage::wal::{replay_wal_file, WalReplayStats, WalWriter};
 use crate::goatkv::utils::cleanup_task::CleanupTask;
 use crate::goatkv::utils::options::KvEngineOptions;
 use crate::goatkv::utils::paths::{ManifestPaths, SstablePaths};
-use crate::goatkv::utils::sequence_number::SequenceNumber;
 use tracing::{error, warn};
 
 type DbPaths = (Arc<WalPaths>, Arc<SstablePaths>, Arc<ManifestPaths>);

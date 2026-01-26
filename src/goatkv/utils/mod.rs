@@ -4,7 +4,6 @@ pub mod io_helpers;
 pub mod logging;
 pub mod options;
 pub mod paths;
-pub mod sequence_number;
 
 pub use logging::init_logging;
 pub use options::KvEngineOptions;
