@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="520" viewBox="0 0 980 520">
+  <defs>
+    <style>
+      .box { fill: #f5f7fb; stroke: #2f3b52; stroke-width: 2; }
+      .title { font: 700 16px sans-serif; fill: #1c2433; }
+      .text { font: 13px sans-serif; fill: #1c2433; }
+      .arrow { stroke: #2f3b52; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .counter-box { fill: #e8f4f8; stroke: #2f3b52; stroke-width: 2; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2f3b52" />
+    </marker>
+  </defs>
+
+  <!-- VersionSet 中心管理 -->
+  <rect class="box" x="360" y="60" width="260" height="100" rx="10" />
+  <text class="title" x="380" y="90">VersionSet</text>
+  <text class="text" x="380" y="115">全局计数器管理器</text>
+
+  <!-- 三个计数器状态 -->
+  <rect class="counter-box" x="100" y="200" width="220" height="100" rx="10" />
+  <text class="title" x="120" y="230">log_number</text>
+  <text class="text" x="120" y="255">当前有效 WAL 编号</text>
+  <text class="text" x="120" y="280">创建新 WAL 时递增</text>
+
+  <rect class="counter-box" x="380" y="200" width="220" height="100" rx="10" />
+  <text class="title" x="400" y="230">next_file_number</text>
+  <text class="text" x="400" y="255">下一个可用文件编号</text>
+  <text class="text" x="400" y="280">分配 SSTable/WAL 时递增</text>
+
+  <rect class="counter-box" x="660" y="200" width="220" height="100" rx="10" />
+  <text class="title" x="680" y="230">last_sequence</text>
+  <text class="text" x="680" y="255">全局最大序列号</text>
+  <text class="text" x="680" y="280">每次写操作递增</text>
+
+  <!-- 更新流程 -->
+  <rect class="box" x="100" y="340" width="200" height="60" rx="10" />
+  <text class="text" x="120" y="375">创建新 WAL 文件</text>
+
+  <rect class="box" x="380" y="340" width="200" height="60" rx="10" />
+  <text class="text" x="400" y="375">分配新文件编号</text>
+
+  <rect class="box" x="660" y="340" width="200" height="60" rx="10" />
+  <text class="text" x="680" y="375">执行写操作</text>
+
+  <!-- 恢复流程 -->
+  <rect class="box" x="380" y="440" width="220" height="60" rx="10" />
+  <text class="title" x="400" y="470">恢复流程</text>
+  <text class="text" x="400" y="495">从 MANIFEST 读取计数器</text>
+
+  <!-- 箭头连接 -->
+  <path class="arrow" d="M480 160 L480 200" />
+
+  <path class="arrow" d="M210 260 L210 290 L280 290 L280 340" />
+  <path class="arrow" d="M490 260 L490 290 L470 290 L470 340" />
+  <path class="arrow" d="M770 260 L770 290 L740 290 L740 340" />
+
+  <path class="arrow" d="M200 400 L200 430 L370 430 L370 440" />
+  <path class="arrow" d="M480 400 L480 440" />
+  <path class="arrow" d="M760 400 L760 430 L590 430 L590 440" />
+
+  <!-- 从 VersionSet 到计数器的连接 -->
+  <path class="arrow" d="M420 160 L420 200" />
+  <path class="arrow" d="M540 160 L540 200" />
+
+  <!-- 恢复箭头 -->
+  <path class="arrow" d="M490 500 L490 520" />
+</svg>

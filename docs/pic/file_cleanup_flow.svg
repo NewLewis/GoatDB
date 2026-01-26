@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="520" viewBox="0 0 980 520">
+  <defs>
+    <style>
+      .box { fill: #f5f7fb; stroke: #2f3b52; stroke-width: 2; }
+      .title { font: 700 16px sans-serif; fill: #1c2433; }
+      .text { font: 13px sans-serif; fill: #1c2433; }
+      .arrow { stroke: #2f3b52; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .async-box { fill: #f0f7f0; stroke: #2f3b52; stroke-width: 2; }
+      .channel-box { fill: #f8f0f5; stroke: #2f3b52; stroke-width: 2; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2f3b52" />
+    </marker>
+  </defs>
+
+  <!-- 主流程：VersionEdit 应用 -->
+  <rect class="box" x="60" y="80" width="240" height="100" rx="10" />
+  <text class="title" x="80" y="110">VersionSet</text>
+  <text class="text" x="80" y="135">应用 VersionEdit</text>
+  <text class="text" x="80" y="160">生成新版本</text>
+
+  <!-- 同步路径：关键操作 -->
+  <rect class="box" x="340" y="80" width="260" height="100" rx="10" />
+  <text class="title" x="360" y="110">关键路径操作</text>
+  <text class="text" x="360" y="135">- 验证 Edit</text>
+  <text class="text" x="360" y="160">- 写 MANIFEST</text>
+  <text class="text" x="360" y="185">- 版本切换</text>
+
+  <!-- 异步路径起点 -->
+  <rect class="channel-box" x="640" y="80" width="280" height="60" rx="10" />
+  <text class="title" x="660" y="110">CleanupTask 通道</text>
+  <text class="text" x="660" y="135">Sender/Receiver (mpsc)</text>
+
+  <!-- CleanupWorker 后台线程 -->
+  <rect class="async-box" x="100" y="240" width="320" height="100" rx="10" />
+  <text class="title" x="120" y="270">CleanupWorker</text>
+  <text class="text" x="120" y="295">后台清理线程</text>
+  <text class="text" x="120" y="320">循环接收任务</text>
+
+  <!-- 文件删除操作 -->
+  <rect class="async-box" x="500" y="240" width="380" height="100" rx="10" />
+  <text class="title" x="520" y="270">物理文件删除</text>
+  <text class="text" x="520" y="295">- 删除旧 SSTable</text>
+  <text class="text" x="520" y="320">- 删除旧 WAL</text>
+  <text class="text" x="520" y="345">- 删除旧 MANIFEST</text>
+
+  <!-- 设计优势说明 -->
+  <rect class="box" x="60" y="380" width="860" height="100" rx="10" />
+  <text class="title" x="80" y="410">异步清理设计优势</text>
+  <text class="text" x="80" y="435">1. 避免阻塞：物理 I/O 不阻塞 flush/compaction 关键路径</text>
+  <text class="text" x="80" y="460">2. 引用安全：确保无读操作引用被删文件后才执行删除</text>
+  <text class="text" x="80" y="485">3. 资源隔离：I/O 压力与元数据操作解耦，提高系统稳定性</text>
+
+  <!-- 箭头连接：主流程 -->
+  <path class="arrow" d="M300 130 L340 130" />
+
+  <!-- 箭头：关键路径到异步通道 -->
+  <path class="arrow" d="M600 130 L640 110" />
+
+  <!-- 箭头：异步通道到 CleanupWorker -->
+  <path class="arrow" d="M780 110 L780 190 L420 190 L420 240" />
+
+  <!-- 箭头：CleanupWorker 到文件删除 -->
+  <path class="arrow" d="M420 290 L500 290" />
+
+  <!-- 虚线箭头：表示异步/非阻塞 -->
+  <path d="M300 180 L300 220 L580 220 L580 190" stroke="#2f3b52" stroke-width="2" stroke-dasharray="5,5" fill="none" marker-end="url(#arrow)" />
+
+  <!-- 标注：同步路径 -->
+  <text class="title" x="200" y="50" text-anchor="middle">同步关键路径</text>
+  <line x1="180" y1="55" x2="320" y2="55" stroke="#2f3b52" stroke-width="1" />
+
+  <!-- 标注：异步路径 -->
+  <text class="title" x="740" y="50" text-anchor="middle">异步清理路径</text>
+  <line x1="620" y1="55" x2="860" y2="55" stroke="#2f3b52" stroke-width="1" />
+
+  <!-- CleanupTask 类型说明 -->
+  <rect class="channel-box" x="640" y="150" width="280" height="80" rx="10" />
+  <text class="title" x="660" y="175">CleanupTask 类型</text>
+  <text class="text" x="660" y="200">Sstable(file_id: u64)</text>
+  <text class="text" x="660" y="225">Wal(log_number: u64)</text>
+</svg>

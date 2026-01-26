@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="620" viewBox="0 0 980 620">
+  <defs>
+    <style>
+      .box { fill: #f5f7fb; stroke: #2f3b52; stroke-width: 2; }
+      .title { font: 700 16px sans-serif; fill: #1c2433; }
+      .text { font: 13px sans-serif; fill: #1c2433; }
+      .arrow { stroke: #2f3b52; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .decision-box { fill: #fff8e8; stroke: #2f3b52; stroke-width: 2; }
+      .mem-box { fill: #e8f4f8; stroke: #2f3b52; stroke-width: 2; }
+      .sstable-box { fill: #f0f7f0; stroke: #2f3b52; stroke-width: 2; }
+      .result-box { fill: #f8f0f5; stroke: #2f3b52; stroke-width: 2; }
+      .diamond { fill: #fff8e8; stroke: #2f3b52; stroke-width: 2; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2f3b52" />
+    </marker>
+  </defs>
+
+  <!-- 标题 -->
+  <text class="title" x="490" y="40" text-anchor="middle">读路径查找流程</text>
+
+  <!-- 起点：读请求 -->
+  <rect class="box" x="440" y="80" width="100" height="60" rx="10" />
+  <text class="title" x="490" y="115" text-anchor="middle">读请求</text>
+
+  <!-- 第1步：MemTable查找 -->
+  <rect class="mem-box" x="380" y="170" width="220" height="80" rx="10" />
+  <text class="title" x="400" y="200">步骤1：MemTable</text>
+  <text class="text" x="400" y="225">可变内存哈希表</text>
+  <text class="text" x="400" y="250">最快访问路径</text>
+
+  <!-- 决策点1：是否在MemTable找到 -->
+  <polygon class="diamond" points="490,260 530,280 490,300 450,280" />
+  <text class="text" x="490" y="285" text-anchor="middle">找到?</text>
+
+  <!-- 第2步：ImmutableMemTable查找 -->
+  <rect class="mem-box" x="380" y="340" width="220" height="80" rx="10" />
+  <text class="title" x="400" y="370">步骤2：ImmutableMemTable</text>
+  <text class="text" x="400" y="395">只读内存表</text>
+  <text class="text" x="400" y="420">等待flush的数据</text>
+
+  <!-- 决策点2：是否在ImmutableMemTable找到 -->
+  <polygon class="diamond" points="490,430 530,450 490,470 450,450" />
+  <text class="text" x="490" y="455" text-anchor="middle">找到?</text>
+
+  <!-- 第3步：L0逆序扫描 -->
+  <rect class="sstable-box" x="120" y="510" width="280" height="80" rx="10" />
+  <text class="title" x="140" y="540">步骤3：L0 SSTables</text>
+  <text class="text" x="140" y="565">逆序遍历（新→旧）</text>
+  <text class="text" x="140" y="590">L0文件可能重叠</text>
+
+  <!-- 第4步：L1+二分查找 -->
+  <rect class="sstable-box" x="580" y="510" width="280" height="80" rx="10" />
+  <text class="title" x="600" y="540">步骤4：L1+ SSTables</text>
+  <text class="text" x="600" y="565">二分查找</text>
+  <text class="text" x="600" y="590">文件有序不重叠</text>
+
+  <!-- 决策点3：是否在L0找到 -->
+  <polygon class="diamond" points="260,600 300,620 260,640 220,620" />
+  <text class="text" x="260" y="625" text-anchor="middle">找到?</text>
+
+  <!-- 决策点4：是否在L1+找到 -->
+  <polygon class="diamond" points="720,600 760,620 720,640 680,620" />
+  <text class="text" x="720" y="625" text-anchor="middle">找到?</text>
+
+  <!-- 返回结果 -->
+  <rect class="result-box" x="340" y="670" width="120" height="60" rx="10" />
+  <text class="title" x="400" y="700" text-anchor="middle">返回结果</text>
+
+  <!-- 返回KeyNotFound -->
+  <rect class="result-box" x="580" y="670" width="120" height="60" rx="10" />
+  <text class="title" x="640" y="700" text-anchor="middle">KeyNotFound</text>
+
+  <!-- 箭头连接 -->
+  <path class="arrow" d="M490 140 L490 170" />
+
+  <path class="arrow" d="M490 250 L490 260" />
+  <path class="arrow" d="M490 300 L490 340" />
+
+  <path class="arrow" d="M490 420 L490 430" />
+  <path class="arrow" d="M490 470 L490 510 L260 510" />
+
+  <path class="arrow" d="M490 470 L490 510 L720 510" />
+
+  <path class="arrow" d="M260 640 L260 670 L400 670" />
+  <path class="arrow" d="M720 640 L720 670 L640 670" />
+
+  <!-- "是"路径箭头 -->
+  <path class="arrow" d="M530 280 L620 280 L620 670 L460 670" stroke-dasharray="5,5" />
+  <path class="arrow" d="M530 450 L620 450 L620 510" stroke-dasharray="5,5" />
+
+  <!-- "是"路径标签 -->
+  <text class="text" x="570" y="275">是</text>
+  <text class="text" x="570" y="445">是</text>
+  <text class="text" x="240" y="615">是</text>
+  <text class="text" x="700" y="615">是</text>
+
+  <!-- "否"路径标签 -->
+  <text class="text" x="450" y="275">否</text>
+  <text class="text" x="450" y="445">否</text>
+  <text class="text" x="280" y="615">否</text>
+  <text class="text" x="740" y="615">否</text>
+
+  <!-- 设计说明 -->
+  <rect class="box" x="60" y="750" width="860" height="100" rx="10" />
+  <text class="title" x="80" y="780">读路径设计特点</text>
+  <text class="text" x="80" y="805">1. 内存优先：首先检查MemTable和ImmutableMemTable，内存访问最快</text>
+  <text class="text" x="80" y="830">2. L0逆序：由于L0文件可能键范围重叠，必须从最新文件开始查找以保证读到最新值</text>
+  <text class="text" x="80" y="855">3. L1+二分：L1及以上层级文件有序不重叠，可利用二分查找快速定位</text>
+
+  <!-- 性能优化标注 -->
+  <text class="title" x="490" y="20" text-anchor="middle" fill="#2f3b52">无锁读取：持有 Arc<Version> 快照，无需同步</text>
+</svg>

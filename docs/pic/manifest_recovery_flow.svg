@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="620" viewBox="0 0 980 620">
+  <defs>
+    <style>
+      .box { fill: #f5f7fb; stroke: #2f3b52; stroke-width: 2; }
+      .title { font: 700 16px sans-serif; fill: #1c2433; }
+      .text { font: 13px sans-serif; fill: #1c2433; }
+      .arrow { stroke: #2f3b52; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .recovery-box { fill: #f0f7f0; stroke: #2f3b52; stroke-width: 2; }
+      .file-box { fill: #e8f4f8; stroke: #2f3b52; stroke-width: 2; }
+      .data-box { fill: #f8f0f5; stroke: #2f3b52; stroke-width: 2; }
+      .check-box { fill: #fff8e8; stroke: #2f3b52; stroke-width: 2; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2f3b52" />
+    </marker>
+  </defs>
+
+  <!-- 标题 -->
+  <text class="title" x="490" y="40" text-anchor="middle">MANIFEST 恢复流程（崩溃恢复）</text>
+
+  <!-- 第1步：定位 MANIFEST 文件 -->
+  <rect class="recovery-box" x="60" y="80" width="280" height="100" rx="10" />
+  <text class="title" x="80" y="110">步骤1：定位 MANIFEST</text>
+  <text class="text" x="80" y="135">读取 CURRENT 文件</text>
+  <text class="text" x="80" y="160">获取最新 MANIFEST 路径</text>
+  <text class="text" x="80" y="185">示例：MANIFEST-42</text>
+
+  <!-- 第2步：顺序读取 VersionEdit -->
+  <rect class="recovery-box" x="380" y="80" width="280" height="100" rx="10" />
+  <text class="title" x="400" y="110">步骤2：顺序回放</text>
+  <text class="text" x="400" y="135">读取所有 VersionEdit 记录</text>
+  <text class="text" x="400" y="160">长度前缀 + 编码数据</text>
+  <text class="text" x="400" y="185">支持部分损坏安全截断</text>
+
+  <!-- 第3步：原地构建文件列表 -->
+  <rect class="recovery-box" x="700" y="80" width="220" height="100" rx="10" />
+  <text class="title" x="720" y="110">步骤3：原地构建</text>
+  <text class="text" x="720" y="135">应用 edits 到临时列表</text>
+  <text class="text" x="720" y="160">避免重复创建 Version</text>
+  <text class="text" x="720" y="185">O(E) 而非 O(E×F)</text>
+
+  <!-- 第4步：校验完整性 -->
+  <rect class="check-box" x="220" y="220" width="280" height="100" rx="10" />
+  <text class="title" x="240" y="250">步骤4：校验完整性</text>
+  <text class="text" x="240" y="275">确保 next_file_number</text>
+  <text class="text" x="240" y="300">大于最大文件编号</text>
+  <text class="text" x="240" y="325">防止文件编号冲突</text>
+
+  <!-- 第5步：重建 Version -->
+  <rect class="recovery-box" x="540" y="220" width="280" height="100" rx="10" />
+  <text class="title" x="560" y="250">步骤5：重建 Version</text>
+  <text class="text" x="560" y="275">一次性创建最终 Version</text>
+  <text class="text" x="560" y="300">设置 creation_seqno</text>
+  <text class="text" x="560" y="325">绑定 sstable_paths</text>
+
+  <!-- 第6步：重新打开 MANIFEST -->
+  <rect class="recovery-box" x="380" y="360" width="280" height="100" rx="10" />
+  <text class="title" x="400" y="390">步骤6：重新打开</text>
+  <text class="text" x="400" y="415">以追加模式打开 MANIFEST</text>
+  <text class="text" x="400" y="440">准备后续写入</text>
+  <text class="text" x="400" y="465">更新 manifest_writer</text>
+
+  <!-- 箭头连接流程 -->
+  <path class="arrow" d="M340 130 L380 130" />
+  <path class="arrow" d="M660 130 L700 130" />
+  <path class="arrow" d="M920 130 L920 180 L310 180 L310 220" />
+  <path class="arrow" d="M500 320 L540 270" />
+  <path class="arrow" d="M820 320 L820 350 L660 350 L660 360" />
+
+  <!-- 设计优势说明 -->
+  <rect class="box" x="60" y="480" width="860" height="120" rx="10" />
+  <text class="title" x="80" y="510">恢复流程设计优势</text>
+  <text class="text" x="80" y="535">1. 高效恢复：原地合并 edits，复杂度 O(E) 而非 O(E×F)，减少内存分配</text>
+  <text class="text" x="80" y="560">2. 状态一致：顺序回放与运行期行为一致，恢复结果可预测</text>
+  <text class="text" x="80" y="585">3. 容错处理：支持部分损坏的 MANIFEST 安全截断，避免数据丢失</text>
+
+  <!-- MANIFEST 文件格式说明 -->
+  <rect class="data-box" x="60" y="320" width="120" height="80" rx="10" />
+  <text class="title" x="80" y="345" text-anchor="middle">CURRENT</text>
+  <text class="text" x="80" y="370" text-anchor="middle">MANIFEST-42</text>
+
+  <rect class="data-box" x="200" y="320" width="120" height="80" rx="10" />
+  <text class="title" x="220" y="345" text-anchor="middle">MANIFEST-42</text>
+  <text class="text" x="220" y="370" text-anchor="middle">[长度][数据]...</text>
+
+  <!-- 文件连接箭头 -->
+  <path class="arrow" d="M180 360 L200 360" />
+  <path class="arrow" d="M320 360 L380 410" stroke-dasharray="5,5" />
+
+  <!-- 标注：恢复方向 -->
+  <text class="title" x="490" y="65" text-anchor="middle">恢复方向 →</text>
+  <line x1="60" y1="70" x2="920" y2="70" stroke="#2f3b52" stroke-width="1" />
+
+  <!-- VersionEdit 示例 -->
+  <rect class="file-box" x="700" y="360" width="220" height="80" rx="10" />
+  <text class="title" x="720" y="385">VersionEdit 示例</text>
+  <text class="text" x="720" y="410">- 新增 L0 文件</text>
+  <text class="text" x="720" y="435">- 删除旧文件</text>
+</svg>

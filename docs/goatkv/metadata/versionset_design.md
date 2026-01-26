@@ -2,725 +2,359 @@
 
 ## 概述
 
-VersionSet 是 GoatDB 的核心元数据管理组件，负责：
-- 维护数据库当前状态的完整视图（Version）
-- 应用增量变更（VersionEdit）
-- 持久化 MANIFEST 文件
-- 管理 SSTable 的生命周期
-- 支持崩溃恢复
+VersionSet 是 GoatDB 的核心元数据管理器，担任数据库的“真相来源”（Single Source of Truth）。它负责将 Flush 和 Compaction 操作产生的增量变更（VersionEdit）应用为新的不可变快照（Version），并通过 MANIFEST 日志持久化这些变更，确保崩溃恢复后状态一致性。
 
-## 核心数据结构
+本设计文档采用“结构图 + 流程图 + 关键不变量”的方式阐述实现原理，避免直接引用代码，聚焦于架构设计和决策理由。
 
-### 1. Version - 数据库快照
+## 核心组件与职责
 
-```rust
-/// 代表某一时刻数据库的完整状态
-pub struct Version {
-    /// 每层包含的 SSTable 文件元数据
-    /// files[level] = Vec<FileMetadata>
-    files: Vec<Vec<Arc<FileMetadata>>>,
+### Version（版本快照）
+- **不可变快照**：一旦创建永不修改，包含某一时刻数据库的完整元数据视图
+- **层级化文件列表**：存储每层 SSTable 的文件元数据（`files[level]`）
+- **层级大小统计**：记录每层 SSTable 的总字节数（`level_size_bytes`）
+- **创建序列号**：绑定到该版本的最新全局序列号（`creation_seqno`）
+- **路径管理器**：引用 `SstablePaths` 用于定位物理文件
 
-    /// 用于快速查找的索引
-    /// key -> (level, file_id) 映射，加速查找
-    file_index: HashMap<Vec<u8>, Vec<(usize, u64)>>,
+### VersionSet（版本集合）
+- **版本生命周期管理**：维护当前版本（`current`）和历史版本队列（`versions`）
+- **MANIFEST 持久化**：负责 VersionEdit 的追加写入与同步
+- **全局计数器推进**：管理 `log_number`、`next_file_number`、`last_sequence`
+- **元数据验证**：确保 VersionEdit 的合法性（文件存在性、层级合法性等）
+- **清理任务分发**：通过 `CleanupTask` 异步删除不再需要的文件
 
-    /// 每层的总大小（用于触发压缩）
-    level_size_bytes: Vec<u64>,
+### VersionEdit（版本编辑）
+- **增量变更描述**：仅记录“新增文件”、“删除文件”、“更新全局计数器”等操作
+- **序列化能力**：支持编码/解码，用于 MANIFEST 持久化
+- **轻量级结构**：不包含完整文件数据，只存储必要元数据
 
-    /// 该版本创建时的序列号
-    creation_seqno: u64,
-}
+### Manifest（元数据日志）
+- **追加写入**：采用 WAL（Write-Ahead Log）模式，先持久化再更新内存
+- **崩溃恢复**：通过顺序回放 VersionEdit 重建数据库状态
+- **长度前缀格式**：每条记录为 `[8字节长度] + [VersionEdit编码字节]`
 
-impl Version {
-    /// 查找包含指定 key 的 SSTable
-    pub fn get(&self, key: &[u8]) -> Option<(usize, Arc<FileMetadata>)>;
+### CleanupTask（清理任务）
+- **异步文件删除**：解耦物理删除与版本切换，避免阻塞关键路径
+- **类型化任务**：支持 `Sstable(u64)` 和 `Wal(u64)` 两种清理目标
+- **后台执行**：由专门的 `CleanupWorker` 线程处理
 
-    /// 获取指定层级的所有文件
-    pub fn get_files(&self, level: usize) -> &[Arc<FileMetadata>];
+## 关键不变量
 
-    /// 计算层级总大小
-    pub fn get_level_size(&self, level: usize) -> u64;
+### 1. L0 vs L1+ 文件组织策略
+- **L0 允许重叠**：MemTable flush 产生的 SSTable 可能键范围重叠
+- **L1+ 严格有序**：Compaction 后文件按键排序且互不重叠
+- **读取顺序优化**：L0 采用逆序遍历（新→旧），保证读到最新值
 
-    /// 检查是否需要压缩
-    pub fn needs_compaction(&self) -> bool;
-}
-```
+![L0 读取顺序](../../pic/l0_read_order.svg)
 
-**设计要点：**
-- **不可变性**：Version 一旦创建不再修改，保证并发读取安全
-- **多层级支持**：支持 Level 0-6，Level 0 文件可重叠，其他层不重叠
-- **快速查找**：通过 file_index 索引加速查询
-- **压缩决策**：基于层级大小触发自动压缩
+### 2. Version 不可变性
+- **创建后不修改**：任何元数据变更都通过创建新 Version 实现
+- **并发读友好**：读路径持 `Arc<Version>`，无需锁保护
+- **历史版本保留**：旧 Version 暂存于队列，支持延迟清理
 
-### 2. VersionSet - 版本管理器
+### 3. MANIFEST 追加写
+- **先持久化后更新**：VersionEdit 必须写入 MANIFEST 并同步后才更新内存
+- **顺序回放保证**：崩溃后可通过重放 MANIFEST 恢复一致状态
+- **长度前缀记录**：支持部分损坏时的安全截断
 
-```rust
-/// VersionSet 管理所有版本和增量变更
-pub struct VersionSet {
-    /// 当前活跃版本（读取操作的视图）
-    current: Arc<Version>,
+## VersionSet 内部结构
 
-    /// 历史版本列表（用于旧读取操作和压缩）
-    /// 保留最新 N 个版本
-    versions: Vec<Arc<Version>>,
+![VersionSet 结构总览](../../pic/versionset_structure.svg)
 
-    /// 增量变更列表（用于重放）
-    version_edits: Vec<VersionEdit>,
+### 核心字段说明
+| 字段名 | 类型 | 描述 |
+|--------|------|------|
+| `current` | `Arc<Version>` | 当前活动版本，读路径直接引用 |
+| `versions` | `VecDeque<Arc<Version>>` | 历史版本队列（大小受 `max_versions` 限制） |
+| `manifest_writer` | `Option<ManifestWriter>` | MANIFEST 文件写入器 |
+| `manifest_file_number` | `u64` | 当前 MANIFEST 文件编号 |
+| `log_number` | `u64` | 当前有效 WAL 日志编号 |
+| `next_file_number` | `u64` | 下一个可分配的文件编号 |
+| `last_sequence` | `u64` | 全局最大序列号（用于 MVCC） |
+| `obsolete_sender` | `Sender<CleanupTask>` | 清理任务发送通道 |
+| `options` | `VersionSetOptions` | 配置参数 |
 
-    /// MANIFEST 文件管理
-    manifest_file: Option<ManifestWriter>,
-    manifest_file_number: u64,
+## 全局计数器管理
 
-    /// 全局状态
-    log_number: u64,
-    next_file_number: u64,
-    last_sequence: u64,
-    comparator_name: String,
+### 1. Log Number（日志编号）
+- **作用**：标识当前有效的 WAL 日志文件
+- **更新时机**：创建新 WAL 文件时递增
+- **恢复保证**：崩溃后重放所有 `log_number` 之后的 WAL
 
-    /// SSTable 引用计数
-    /// file_id -> count，用于判断文件是否可删除
-    file_refs: HashMap<u64, usize>,
+### 2. Next File Number（下一个文件编号）
+- **作用**：分配唯一 SSTable/WAL 文件编号
+- **分配策略**：严格递增，永不重复
+- **恢复校验**：重启时确保大于磁盘上最大文件编号
 
-    /// 待删除的 SSTable 文件
-    obsolete_files: Vec<FileMetadata>,
+### 3. Last Sequence（最后序列号）
+- **作用**：全局 MVCC 版本控制
+- **单调递增**：每次写操作递增
+- **版本绑定**：每个 Version 记录创建时的 `last_sequence`
 
-    /// 配置选项
-    options: VersionSetOptions,
-}
+## 配置选项（VersionSetOptions）
 
-pub struct VersionSetOptions {
-    /// 保留的历史版本数量
-    pub max_versions: usize,
+| 配置项 | 类型 | 默认值 | 描述 |
+|--------|------|--------|------|
+| `max_versions` | `usize` | 10 | 保留的历史版本数量，避免内存无限增长 |
+| `manifest_max_size` | `u64` | 64MB | MANIFEST 文件大小限制，超过触发重写 |
+| `manifest_rewrite_edit_count` | `usize` | 1000 | 触发 MANIFEST 重写的版本编辑数量阈值 |
+| `num_levels` | `usize` | 7 | LSM 树层级数量，决定文件组织深度 |
 
-    /// MANIFEST 文件大小限制（超过则重写）
-    pub manifest_max_size: u64,
+## 全局计数器管理流程图
 
-    /// 触发 MANIFEST 重写的版本编辑数量
-    pub manifest_rewrite_edit_count: u64,
-}
-```
+![全局计数器管理流程](../../pic/global_counters_flow.svg)
 
-**核心职责：**
-1. **版本管理**：维护当前版本和历史版本
-2. **变更应用**：接收 VersionEdit 并生成新版本
-3. **持久化**：将变更写入 MANIFEST
-4. **文件清理**：跟踪文件引用，清理无用文件
-5. **压缩协调**：提供压缩所需的信息
+上图展示了 VersionSet 中三个全局计数器的管理机制：
 
-### 3. ManifestWriter - MANIFEST 文件写入器
+1. **log_number**：标识当前有效 WAL 日志文件，创建新 WAL 时递增
+2. **next_file_number**：分配唯一 SSTable/WAL 文件编号，分配文件时递增
+3. **last_sequence**：全局 MVCC 版本控制，每次写操作递增
 
-```rust
-pub struct ManifestWriter {
-    file: BufWriter<File>,
-    file_number: u64,
-    current_size: u64,
-}
+计数器更新遵循"先持久化后生效"原则：VersionEdit 写入 MANIFEST 后，计数器才在内存中更新。恢复流程从 MANIFEST 读取计数器值，确保崩溃后状态一致。
 
-impl ManifestWriter {
-    /// 追加一条 VersionEdit
-    pub fn append_edit(&mut self, edit: &VersionEdit) -> Result<()> {
-        let encoded = edit.encode_to_vec();
-        let len = encoded.len() as u64;
-        self.file.write_all(&len.to_be_bytes())?;
-        self.file.write_all(&encoded)?;
-        self.file.flush()?;
-        self.current_size += len;
-        Ok(())
-    }
+## VersionEdit 应用流程
 
-    /// 获取当前文件大小
-    pub fn size(&self) -> u64 {
-        self.current_size
-    }
-}
-```
+![VersionEdit 应用流程](../../pic/apply_edit_flow.svg)
 
-## VersionEdit 应用机制
+### 步骤详解
 
-### 应用流程
+1. **合法性验证**（`validate_edit`）
+   - 检查删除文件是否存在
+   - 验证新增文件层级合法性
+   - 防止重复文件或非法操作
 
-```mermaid
-graph TD
-    A[Flush/Compaction 产生 VersionEdit] --> B[VersionSet::apply_edit]
-    B --> C{验证合法性}
-    C -->|无效| D[返回错误]
-    C -->|有效| E[更新全局状态]
-    E --> F[生成新 Version]
-    F --> G[追加到 MANIFEST]
-    G --> H{文件大小超限?}
-    H -->|是| I[标记需要重写]
-    H -->|否| J[更新 current]
-    J --> K[清理旧版本]
-    K --> L[标记可删除文件]
-    L --> M[完成]
-```
+2. **MANIFEST 持久化**（`append_edit + sync`）
+   - 编码 VersionEdit 并写入 MANIFEST
+   - 执行 `fsync` 确保数据落盘
+   - **设计理由**：遵循 WAL 原则，先持久化再更新内存
 
-### 详细步骤
+3. **全局计数器更新**
+   - 原子更新 `log_number`、`next_file_number`、`last_sequence`
+   - **设计理由**：保持计数器与 edit 变更原子一致
 
-#### 1. 应用 VersionEdit
+4. **创建新 Version**（`create_new_version`）
+   - 复制当前版本文件列表（Copy-on-Write）
+   - 应用删除/新增文件操作
+   - 对 L1+ 文件重新排序（确保有序性）
+   - **设计理由**：通过 Arc 共享元数据，避免深层复制
 
-```rust
-impl VersionSet {
-    pub fn apply_edit(&mut self, edit: VersionEdit) -> Result<()> {
-        // 1. 验证 VersionEdit 的合法性
-        self.validate_edit(&edit)?;
+5. **版本切换**（原子替换）
+   - 将旧 Version 移入历史队列
+   - 设置新 Version 为 `current`
+   - **设计理由**：瞬间切换，读路径无感知
 
-        // 2. 更新全局状态
-        if let Some(log_num) = edit.log_number {
-            self.log_number = log_num;
-        }
-        if let Some(next_file) = edit.next_file_number {
-            self.next_file_number = next_file;
-        }
-        if let Some(last_seq) = edit.last_sequence {
-            self.last_sequence = last_seq;
-        }
+6. **异步清理**（发送 CleanupTask）
+   - 将被删除文件加入清理队列
+   - **设计理由**：延迟物理删除，避免阻塞读路径
 
-        // 3. 创建新 Version
-        let new_version = self.create_new_version(&edit)?;
+## 读路径如何使用 Version
 
-        // 4. 持久化到 MANIFEST
-        self.append_to_manifest(&edit)?;
+读操作通过 `VersionSet::current()` 获取最新快照后，按以下顺序查找数据：
 
-        // 5. 更新当前版本
-        let old_version = std::mem::replace(&mut self.current, new_version);
-        self.append_old_version(old_version);
+| 步骤 | 查找位置 | 策略 | 设计理由 |
+|------|----------|------|----------|
+| 1 | MemTable | 直接查找哈希表 | 内存最快，包含最新数据 |
+| 2 | ImmutableMemTable | 只读内存表查找 | 等待 flush 的已提交数据 |
+| 3 | L0 SSTables | 逆序遍历（新→旧） | L0 文件可能重叠，新文件包含更新数据 |
+| 4 | L1+ SSTables | 二分查找 | 文件有序不重叠，快速定位 |
+| 5 | 未找到 | 返回 KeyNotFound | 键不存在于数据库中 |
 
-        // 6. 清理和引用计数
-        self.update_file_refs(&edit);
-        self.mark_obsolete_files(&edit);
+![读路径查找流程](../../pic/read_path_lookup.svg)
 
-        // 7. 检查是否需要重写 MANIFEST
-        if self.should_rewrite_manifest() {
-            self.schedule_manifest_rewrite();
-        }
+上图展示了读路径的完整查找流程，采用多级查找策略：
+- **内存优先**：先检查 MemTable 和 ImmutableMemTable，内存访问最快
+- **L0逆序**：由于L0文件可能重叠，逆序遍历确保读到最新值
+- **L1+二分**：利用高层级文件有序性，二分查找提高效率
+- **无锁读取**：持有 `Arc<Version>` 快照，无需同步开销
 
-        Ok(())
-    }
-}
-```
+**查找流程说明**：
+1. 首先检查内存中的可变 MemTable，这是最快的访问路径
+2. 如果未找到，检查不可变 MemTable（等待写入磁盘的数据）
+3. 接着逆序遍历 L0 层 SSTable 文件，由于 L0 文件可能键范围重叠，必须从最新文件开始查找
+4. 对于 L1 及更高层级的文件，利用其有序不重叠的特性进行二分查找
+5. 如果所有层级都未找到，则确认键不存在
 
-#### 2. 创建新 Version
+此策略确保在 L0 文件重叠时优先返回最新值，同时利用高层级文件的有序性提高查找效率。
 
-```rust
-impl VersionSet {
-    fn create_new_version(&self, edit: &VersionEdit) -> Result<Arc<Version>> {
-        // 复制当前版本的所有文件
-        let mut new_files = self.current.files.clone();
+## 恢复流程（MANIFEST 回放）
 
-        // 应用删除的文件
-        for (level, file_num) in &edit.deleted_files {
-            if let Some(files) = new_files.get_mut(*level) {
-                files.retain(|f| f.file_id != *file_num);
-            }
-        }
+![MANIFEST 恢复流程](../../pic/manifest_recovery_flow.svg)
 
-        // 应用新增的文件
-        for (level, meta) in &edit.new_files {
-            if new_files.len() <= *level {
-                new_files.resize(*level + 1, Vec::new());
-            }
-            new_files[*level].push(Arc::new(meta.clone()));
-        }
+上图详细展示了崩溃恢复时 MANIFEST 文件的完整处理流程，共分为六个关键步骤：
 
-        // 对 Level 0 以外的层级排序（保证不重叠且有序）
-        for level_files in new_files.iter_mut().skip(1) {
-            level_files.sort_by_key(|f| &f.smallest_key);
-        }
+### 恢复步骤
+1. **定位 MANIFEST**：读取 `CURRENT` 文件获取最新 MANIFEST 路径
+2. **顺序回放**：读取所有 VersionEdit 记录
+3. **原地构建**：应用 edits 到临时文件列表（避免重复创建 Version）
+4. **校验完整性**：确保 `next_file_number` 大于最大文件编号
+5. **重建 Version**：一次性创建最终 Version
+6. **重新打开**：以追加模式打开 MANIFEST 准备后续写入
 
-        // 构建索引
-        let file_index = self.build_file_index(&new_files);
+### 设计优势
+- **高效恢复**：原地合并 edits，O(E) 复杂度而非 O(E×F)
+- **状态一致**：回放结果与崩溃前状态完全一致
+- **容错处理**：支持部分损坏的 MANIFEST 安全截断
 
-        // 计算层级大小
-        let level_size_bytes = new_files.iter()
-            .map(|files| files.iter().map(|f| f.file_size).sum())
-            .collect();
+## 文件清理机制
 
-        Ok(Arc::new(Version {
-            files: new_files,
-            file_index,
-            level_size_bytes,
-            creation_seqno: self.last_sequence,
-        }))
-    }
-}
-```
+![文件清理流程](../../pic/file_cleanup_flow.svg)
 
-#### 3. 文件引用计数
+上图展示了异步文件清理的设计架构：
 
-```rust
-impl VersionSet {
-    fn update_file_refs(&mut self, edit: &VersionEdit) {
-        // 增加新文件的引用
-        for (level, meta) in &edit.new_files {
-            *self.file_refs.entry(meta.file_id).or_insert(0) += 1;
-        }
-
-        // 减少删除文件的引用
-        for (level, file_num) in &edit.deleted_files {
-            if let Some(count) = self.file_refs.get_mut(file_num) {
-                *count -= 1;
-                if *count == 0 {
-                    // 引用计数为 0，标记为可删除
-                    self.obsolete_files.push(/* 文件信息 */);
-                    self.file_refs.remove(file_num);
-                }
-            }
-        }
-
-        // 更新历史版本的引用计数
-        self.cleanup_old_versions();
-    }
-
-    fn cleanup_old_versions(&mut self) {
-        // 保留最新 max_versions 个版本
-        while self.versions.len() > self.options.max_versions {
-            let old = self.versions.remove(0);
-            // 减少该版本中所有文件的引用计数
-            for files in old.files.iter() {
-                for file in files.iter() {
-                    if let Some(count) = self.file_refs.get_mut(&file.file_id) {
-                        *count -= 1;
-                        if *count == 0 {
-                            self.obsolete_files.push(file.as_ref().clone());
-                            self.file_refs.remove(&file.file_id);
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-```
-
-## SSTable 自动清理机制
+- **同步关键路径**：VersionEdit 验证、MANIFEST 写入、版本切换等关键操作同步执行
+- **异步清理路径**：物理文件删除通过 CleanupTask 通道交由后台 CleanupWorker 处理
+- **通道通信**：使用 mpsc（多生产者单消费者）通道传递 CleanupTask
+- **类型化任务**：支持 `Sstable(file_id: u64)` 和 `Wal(log_number: u64)` 两种清理目标
 
 ### 清理策略
-
-```rust
-impl VersionSet {
-    /// 后台清理任务，定期调用
-    pub fn purge_obsolete_files(
-        &mut self,
-        sstable_paths: &SstablePaths,
-        manifest_paths: &ManifestPaths,
-    ) -> Result<()> {
-        let mut deleted = Vec::new();
-
-        for file_meta in &self.obsolete_files {
-            let path = sstable_paths.sstable_path(
-                /* 推断 level 和 file_num */
-            );
-
-            // 删除物理文件
-            if let Err(e) = std::fs::remove_file(&path) {
-                eprintln!("Failed to delete {}: {}", path.display(), e);
-                continue;
-            }
-
-            deleted.push(file_meta.file_id);
-        }
-
-        // 从列表中移除已删除的文件
-        self.obsolete_files.retain(|f| !deleted.contains(&f.file_id));
-
-        // 清理旧的 MANIFEST 文件
-        self.cleanup_old_manifests(manifest_paths)?;
-
-        Ok(())
-    }
-
-    fn cleanup_old_manifests(&self, manifest_paths: &ManifestPaths) -> Result<()> {
-        // 保留最新的 MANIFEST 文件
-        // 删除所有 .manifest-old 文件
-        let manifest_dir = manifest_paths.data_dir();
-        for entry in std::fs::read_dir(manifest_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.extension().and_then(|s| s.to_str()) == Some("old") {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-        Ok(())
-    }
-}
-```
-
-### 清理触发时机
-
-1. **每次应用 VersionEdit 后**：检查是否有文件引用计数归零
-2. **定期后台任务**：每 N 秒执行一次 `purge_obsolete_files`
-3. **压缩完成时**：压缩后立即清理旧文件
-4. **MANIFEST 重写后**：清理旧的 MANIFEST 文件
-
-## MANIFEST 文件管理
-
-### MANIFEST 格式
-
-```
-[Manifest Header]
-- MAGIC_NUMBER (8 bytes)
-- FORMAT_VERSION (4 bytes)
-
-[Manifest Body] (重复 N 次)
-- Record Length (8 bytes, big-endian)
-- VersionEdit (varint encoded)
-
-[Manifest Footer]
-- Checksum (4 bytes)
-```
-
-### MANIFEST 重写机制
-
-当 MANIFEST 文件过大时，需要重写：
-
-```rust
-impl VersionSet {
-    fn rewrite_manifest(&mut self) -> Result<()> {
-        // 1. 创建新的 MANIFEST 文件
-        let new_manifest_num = self.next_file_number;
-        self.next_file_number += 1;
-
-        let new_path = self.path_manager.manifest_path(new_manifest_num);
-        let mut new_writer = ManifestWriter::create(&new_path)?;
-
-        // 2. 写入当前状态的快照
-        let snapshot_edit = self.create_snapshot_edit();
-        new_writer.append_edit(&snapshot_edit)?;
-
-        // 3. 切换到新的 MANIFEST
-        let old_writer = std::mem::replace(&mut self.manifest_file, Some(new_writer));
-        self.manifest_file_number = new_manifest_num;
-
-        // 4. 重命名旧 MANIFEST 为 .old
-        if let Some(old) = old_writer {
-            let old_path = self.path_manager.manifest_path(old.file_number);
-            let backup_path = format!("{}.old", old_path);
-            std::fs::rename(&old_path, &backup_path)?;
-        }
-
-        // 5. CURRENT 文件指向新的 MANIFEST
-        self.update_current_file(new_manifest_num)?;
-
-        Ok(())
-    }
-
-    /// 创建表示当前完整状态的 VersionEdit
-    fn create_snapshot_edit(&self) -> VersionEdit {
-        let mut edit = VersionEdit {
-            log_number: Some(self.log_number),
-            next_file_number: Some(self.next_file_number),
-            last_sequence: Some(self.last_sequence),
-            comparator_name: Some(self.comparator_name.clone()),
-            ..Default::default()
-        };
-
-        // 添加所有现有文件
-        for (level, files) in self.current.files.iter().enumerate() {
-            for file in files.iter() {
-                edit.new_files.push((level, file.as_ref().clone()));
-            }
-        }
-
-        edit
-    }
-}
-```
-
-### CURRENT 文件
-
-`CURRENT` 文件包含当前使用的 MANIFEST 文件名：
-
-```
-MANIFEST-00123
-```
-
-每次切换到新 MANIFEST 时原子性地更新此文件。
-
-## 崩溃恢复流程
-
-### 启动时恢复
-
-```rust
-impl VersionSet {
-    pub fn recover(options: &KvEngineOptions) -> Result<Self> {
-        let (_wal_paths, _sstable_paths, manifest_paths) =
-            KvEngine::init_db_paths(&options.data_dir)?;
-
-        // 1. 读取 CURRENT 文件，获取最新的 MANIFEST
-        let manifest_num = self.read_current_file(&manifest_paths)?;
-
-        // 2. 读取并重放 MANIFEST 中的所有 VersionEdit
-        let manifest_path = manifest_paths.data_dir().join(manifest_num);
-        let edits = self.read_manifest_edits(&manifest_path)?;
-
-        // 3. 重放所有编辑，构建当前状态
-        let mut version_set = Self::new_empty(options);
-        for edit in edits {
-            version_set.apply_edit_during_recovery(edit)?;
-        }
-
-        // 4. 验证恢复状态
-        version_set.validate_recovery()?;
-
-        // 5. 重新打开 MANIFEST 用于追加
-        let manifest_file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&manifest_path)?;
-        version_set.manifest_file = Some(ManifestWriter::from_file(manifest_file, manifest_num));
-
-        Ok(version_set)
-    }
-
-    fn validate_recovery(&self) -> Result<()> {
-        // 检查所有 SSTable 文件是否存在
-        // 检查文件大小是否匹配
-        // 检查 key 范围是否合法
-        Ok(())
-    }
-}
-```
-
-### 恢复验证
-
-1. **文件完整性**：检查所有记录的 SSTable 文件是否存在
-2. **大小一致性**：验证文件实际大小与记录是否匹配
-3. **Key 范围验证**：
-   - Level 1-6: 同层级文件不应重叠
-   - 每个文件的 smallest_key <= largest_key
-4. **序列号单调性**：last_sequence 应该单调递增
-
-## 与现有组件集成
-
-### 1. Flush Worker 集成
-
-```rust
-// 在 flush_worker.rs 中
-
-impl FlushWorker {
-    fn flush_memtable(&mut self, memtable: ImmutableMemTable) -> Result<FileMetadata> {
-        // 1. 构建 SSTable
-        let (meta, reader) = self.build_sstable(memtable)?;
-
-        // 2. 创建 VersionEdit
-        let mut edit = VersionEdit::default();
-        edit.new_files.push((0, meta.clone()));
-
-        // 3. 应用到 VersionSet
-        self.version_set.lock().unwrap().apply_edit(edit)?;
-
-        Ok(meta)
-    }
-}
-```
-
-### 2. KvEngine 集成
-
-```rust
-// 在 kv_engine.rs 中
-
-pub struct KvEngine {
-    // ... 现有字段
-    version_set: Arc<RwLock<VersionSet>>,
-}
-
-impl KvEngine {
-    pub fn new(options: KvEngineOptions) -> Result<Self> {
-        // 1. 恢复或创建 VersionSet
-        let version_set = if options.recover_from_wal {
-            VersionSet::recover(&options)?
-        } else {
-            VersionSet::new_empty(&options)
-        };
-
-        // 2. 启动后台任务
-        let version_set = Arc::new(RwLock::new(version_set));
-        self.spawn_background_tasks(version_set.clone());
-
-        Ok(Self {
-            version_set,
-            // ...
-        })
-    }
-
-    fn spawn_background_tasks(&self, version_set: Arc<RwLock<VersionSet>>) {
-        // 文件清理任务
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                let mut vs = version_set.write().await;
-                let _ = vs.purge_obsolete_files(&self.path_manager);
-            }
-        });
-
-        // 压缩任务（后续实现）
-        // ...
-    }
-}
-```
-
-### 3. 读取路径集成
-
-```rust
-impl KvEngine {
-    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        // 1. 读取当前版本
-        let version = self.version_set.read().unwrap().current();
-
-        // 2. 首先查找 MemTable
-        if let Some(value) = self.memtable.get(key) {
-            return Ok(value);
-        }
-
-        // 3. 按照 Version 的层级顺序查找 SSTable
-        for level in 0..version.files.len() {
-            if let Some((_, file)) = version.get(key) {
-                let reader = self.sstable_cache.get(&file.file_id)?;
-                if let Some(value) = reader.get(key)? {
-                    return Ok(Some(value));
-                }
-            }
-        }
-
-        Ok(None)
-    }
-}
-```
-
-## 配置参数
-
-### 推荐配置
-
-```rust
-impl Default for VersionSetOptions {
-    fn default() -> Self {
-        Self {
-            // 保留 10 个历史版本
-            // 足够支持后台压缩和旧读取操作
-            max_versions: 10,
-
-            // MANIFEST 超过 32MB 时重写
-            // 平衡重写频率和启动恢复时间
-            manifest_max_size: 32 * 1024 * 1024,
-
-            // 或每 10000 次 VersionEdit 后重写
-            manifest_rewrite_edit_count: 10000,
-        }
-    }
-}
-```
-
-### 层级大小目标（为压缩做准备）
-
-```rust
-pub const LEVEL_TARGET_SIZE: [u64; 7] = [
-    8 * 1024 * 1024,    // Level 0: 8MB (不强制)
-    64 * 1024 * 1024,   // Level 1: 64MB
-    512 * 1024 * 1024,  // Level 2: 512MB
-    4 * 1024 * 1024 * 1024,    // Level 3: 4GB
-    32 * 1024 * 1024 * 1024,   // Level 4: 32GB
-    256 * 1024 * 1024 * 1024,  // Level 5: 256GB
-    1024 * 1024 * 1024 * 1024, // Level 6: 1TB
-];
-
-pub const LEVEL_COMPACTION_TRIGGER: [usize; 7] = [
-    4,   // Level 0: 文件数超过 4
-    1,   // Level 1-6: 大小超过目标
-    1,
-    1,
-    1,
-    1,
-    1,
-];
-```
-
-## 实现优先级
-
-### Phase 1: 核心功能
-1. ✅ VersionEdit 结构和序列化（已完成）
-2. ⬜ Version 结构实现
-3. ⬜ VersionSet 基础实现
-4. ⬜ MANIFEST 读写
-
-### Phase 2: 集成
-5. ⬜ Flush Worker 生成 VersionEdit
-6. ⬜ KvEngine 集成 VersionSet
-7. ⬜ 读取路径使用 Version
-
-### Phase 3: 高级功能
-8. ⬜ 崩溃恢复
-9. ⬜ 文件清理
-10. ⬜ MANIFEST 重写
-
-### Phase 4: 压缩支持
-11. ⬜ 多层级 SSTable 组织
-12. ⬜ 压缩调度器（后续版本）
-
-## 关键设计决策
-
-### 1. 为什么使用不可变 Version？
-- **并发安全**：读取操作无需加锁
-- **一致性**：读取看到一致的快照视图
-- **简化逻辑**：避免复杂的锁机制
-
-### 2. 为什么需要文件引用计数？
-- **安全删除**：确保没有旧版本引用文件
-- **支持压缩**：压缩过程中引用旧文件
-- **增量清理**：避免一次性大量删除
-
-### 3. 为什么 MANIFEST 需要重写？
-- **启动性能**：避免重放过多增量编辑
-- **空间回收**：删除文件的编辑不再需要
-- **简化恢复**：快照 + 少量增量
-
-### 4. 为什么保留多个历史版本？
-- **后台压缩**：压缩过程中需要旧版本
-- **长读取**：长时间运行的读取需要一致视图
-- **增量应用**：快速切换到新版本
-
-## 测试策略
-
-### 单元测试
-- VersionEdit 序列化/反序列化
-- Version 查找逻辑
-- 引用计数更新
-- 文件清理逻辑
-
-### 集成测试
-- Flush 产生 VersionEdit
-- 完整应用流程
-- MANIFEST 持久化
-- 崩溃恢复
-
-### 压力测试
-- 高并发 VersionEdit 应用
-- 大量版本切换
-- MANIFEST 重写性能
-- 文件清理效率
+- **异步执行**：通过 `CleanupWorker` 后台线程处理
+- **延迟删除**：旧 Version 可能仍被读路径引用，需等待释放
+- **类型化任务**：区分 SSTable 和 WAL 文件清理
+
+### 清理时机
+| 文件类型 | 清理触发条件 | 清理保证 |
+|----------|--------------|----------|
+| SSTable | Compaction 后旧文件不再被任何 Version 引用 | 确保无读操作引用被删文件 |
+| WAL | MemTable 成功 flush 后对应的 WAL 可安全删除 | 数据已持久化到 SSTable |
+| MANIFEST | 旧 MANIFEST 文件在重写后删除 | 新 MANIFEST 包含完整历史 |
+
+### 设计理由
+- **避免阻塞**：物理 I/O 不阻塞 flush/compaction 关键路径
+- **引用安全**：确保无读操作引用被删文件
+- **资源回收**：及时释放磁盘空间
+
+## MANIFEST 记录格式
+
+### 二进制编码
+每条 MANIFEST 记录包含两个部分：
+1. **长度前缀**：8 字节大端序无符号整数，表示后续数据的长度
+2. **VersionEdit 编码字节**：变长编码的 VersionEdit 序列化数据
+
+### VersionEdit 编码内容
+| 字段类型 | 标签 | 编码内容 | 用途 |
+|----------|------|----------|------|
+| Comparator | 1 | 字符串长度 + 比较器名称 | 兼容性校验 |
+| Log Number | 2 | 变长编码的 u64 | 当前有效 WAL 编号 |
+| Next File Number | 3 | 变长编码的 u64 | 下一个可用文件编号 |
+| Last Sequence | 4 | 变长编码的 u64 | 全局最大序列号 |
+| Compact Pointers | 5 | 层级 + 键数据 | 各层压缩起始键 |
+| Deleted Files | 6 | 层级 + 文件编号 | 待删除文件列表 |
+| New Files | 7 | 层级 + 文件元数据 | 新增文件信息 |
+
+### 文件命名
+- **初始文件**：`MANIFEST-0`
+- **后续文件**：`MANIFEST-N`（N 递增）
+- **当前指针**：`CURRENT` 文件存储最新 MANIFEST 路径
+
+## 模块间协作关系
+
+![VersionSet 模块协作关系](../../pic/version_set_collaboration.svg)
+
+上图展示了 VersionSet 与其他核心模块的协作关系：
+
+### 与 FlushWorker 交互
+- **输入**：MemTable flush 产生的 L0 SSTable
+- **输出**：新增 L0 文件的 VersionEdit
+- **协作模式**：FlushWorker 生成 SSTable → 构造 VersionEdit → 提交 VersionSet
+
+### 与 KvEngine 交互
+- **读路径**：`engine.get()` → `VersionSet.current()` → `Version.get()`
+- **写路径**：`engine.put()` → WAL 写入 → MemTable 更新 → 触发 flush
+- **状态同步**：KvEngine 持有 VersionSet 引用，统一元数据视图
+
+### 与 Compaction 模块交互
+- **输入**：需要压缩的层级和文件范围
+- **输出**：新文件生成 + 旧文件删除的 VersionEdit
+- **原子性**：Compaction 成功后才提交 VersionEdit
+
+## 设计取舍说明
+
+### 1. 为什么 L0 采用逆序读取？
+- **背景**：L0 文件由并发 flush 产生，键范围可能重叠
+- **方案**：新文件包含更新数据，逆序保证读到最新值
+- **代价**：最坏情况需扫描全部 L0 文件
+- **优化**：限制 L0 文件数量，触发 Compaction
+
+### 2. 为什么 Version 不可变？
+- **并发优势**：读路径无锁，性能可预测
+- **简化设计**：无需复杂同步机制
+- **内存开销**：历史版本保留有限时间，Arc 共享元数据降低复制成本
+
+### 3. 为什么 MANIFEST 追加写？
+- **写入性能**：顺序追加远快于随机更新
+- **崩溃安全**：任何时刻都可通过重放恢复
+- **空间放大**：定期重写合并冗余记录
+
+### 4. 为什么异步清理？
+- **响应时间**：物理删除可能耗时，不应阻塞版本切换
+- **引用安全**：确保读操作完成后再删除文件
+- **资源隔离**：I/O 压力与元数据操作解耦
+
+## 当前实现状态
+
+### 已实现功能
+| 功能模块 | 状态 | 说明 |
+|----------|------|------|
+| Version/VersionSet 基础结构 | ✅ 完成 | 支持不可变版本和版本切换 |
+| MANIFEST 追加写与恢复 | ✅ 完成 | WAL 风格持久化与崩溃恢复 |
+| L0 逆序读取策略 | ✅ 完成 | 保证重叠文件读取最新值 |
+| 异步清理框架 | ✅ 完成 | CleanupWorker 后台线程 |
+| 全局计数器管理 | ✅ 完成 | log_number, next_file_number, last_sequence |
+| 配置选项支持 | ✅ 完成 | VersionSetOptions 可配置参数 |
+
+### 待实现功能
+| 功能模块 | 优先级 | 说明 |
+|----------|--------|------|
+| 完整 Compaction 流程 | 高 | 层级间文件合并与重写 |
+| MANIFEST 重写与压缩 | 中 | 定期合并冗余编辑记录 |
+| 精细文件引用计数 | 中 | 精确跟踪文件被引用情况 |
+| 层级大小动态调整 | 低 | 基于负载自动调整层级目标大小 |
+| 跨版本增量统计 | 低 | 统计各版本间变化量 |
 
 ## 性能考虑
 
-### 内存优化
-- Version 使用 Arc 共享 FileMetadata
-- 限制历史版本数量
-- 文件索引使用 HashMap 加速查找
+### 内存开销
+| 内存消耗项 | 估算大小 | 优化措施 |
+|------------|----------|----------|
+| 文件元数据 | 每个 SSTable 约 200-500 字节 | 压缩键范围，共享路径 |
+| 版本历史 | 每版本约数 KB（取决于文件数） | 限制 `max_versions` |
+| 路径管理 | 共享 `Arc<SstablePaths>` | 避免重复存储路径信息 |
 
-### 磁盘优化
-- MANIFEST 批量 flush
-- Varint 编码减少空间
-- 异步删除旧文件
+### 磁盘 I/O
+| I/O 操作 | 频率 | 优化方向 |
+|----------|------|----------|
+| MANIFEST 写入 | 每次 flush/compaction | 批量写入，减少 `fsync` |
+| 同步开销 | 每次版本切换 | 异步提交，合并同步 |
+| 恢复时间 | 启动时一次 | 定期重写 MANIFEST 减少长度 |
 
-### 并发优化
-- 读取无锁（不可变 Version）
-- 写入使用 RwLock
-- 后台任务异步执行
+### 并发特性
+| 并发场景 | 同步机制 | 性能影响 |
+|----------|----------|----------|
+| 读路径 | 无锁（`Arc<Version>`） | 零竞争，高性能 |
+| 写路径（版本切换） | 独占 VersionSet | 短暂独占，影响有限 |
+| 后台操作 | 异步执行 | 不阻塞前台读写 |
 
-## 未来扩展
+## 扩展性与演进
 
-1. **压缩调度器**：基于 Version 信息调度压缩
-2. **统计信息**：每个文件的读取/写入统计
-3. **布隆过滤器**：集成到 FileMetadata
-4. **快照功能**：支持用户创建时间点快照
-5. **增量备份**：基于 VersionEdit 的增量备份
+### 短期优化
+1. **MANIFEST 批量同步**：合并多个 VersionEdit 减少 `fsync` 调用
+2. **版本引用计数**：精确跟踪文件被引用情况，优化清理时机
+3. **预热缓存**：恢复时预加载频繁访问的 SSTable 元数据
+
+### 长期演进
+1. **分层 MANIFEST**：分离频繁变更的 L0 元数据与稳定层级元数据
+2. **增量快照**：仅记录相对于基线的变更，减少恢复数据量
+3. **分布式扩展**：支持跨节点版本同步与一致性协议
+
+## 总结
+
+VersionSet 作为 GoatDB 的元数据核心，通过不可变 Version 快照、增量 VersionEdit 日志、异步清理机制的组合，在保证数据一致性和崩溃恢复能力的同时，提供了高效的并发读取性能。其设计充分考虑了 LSM 树的特性，特别是 L0 与 L1+ 的不同处理策略，为上层存储引擎提供了可靠的元数据管理基础。
+
+**核心价值**：在复杂性与性能之间找到平衡点，通过精心设计的不变量和异步机制，实现高吞吐、低延迟的元数据管理。
+
+**设计哲学**：
+1. **简单性优先**：通过不可变数据和追加写日志简化并发控制
+2. **崩溃安全第一**：所有元数据变更先持久化后生效
+3. **读优化导向**：确保读路径无锁、可预测的性能表现
+4. **异步化处理**：将耗时操作移至后台，保持前台响应速度
+
+通过上述设计，VersionSet 为 GoatDB 提供了一个坚固、高效、可扩展的元数据管理框架，为构建高性能键值存储引擎奠定了坚实基础。

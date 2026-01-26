@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="520" viewBox="0 0 980 520">
+  <defs>
+    <style>
+      .box { fill: #f5f7fb; stroke: #2f3b52; stroke-width: 2; }
+      .title { font: 700 16px sans-serif; fill: #1c2433; }
+      .text { font: 13px sans-serif; fill: #1c2433; }
+      .arrow { stroke: #2f3b52; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .center-box { fill: #e8f4f8; stroke: #2f3b52; stroke-width: 2; }
+      .module-box { fill: #f0f7f0; stroke: #2f3b52; stroke-width: 2; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2f3b52" />
+    </marker>
+  </defs>
+
+  <!-- 标题 -->
+  <text class="title" x="490" y="40" text-anchor="middle">VersionSet 模块协作关系</text>
+
+  <!-- 中心：VersionSet -->
+  <rect class="center-box" x="360" y="100" width="260" height="120" rx="10" />
+  <text class="title" x="380" y="130">VersionSet</text>
+  <text class="text" x="380" y="155">元数据管理器</text>
+  <text class="text" x="380" y="180">- 维护版本历史</text>
+  <text class="text" x="380" y="205">- 持久化 MANIFEST</text>
+
+  <!-- 左侧：FlushWorker -->
+  <rect class="module-box" x="60" y="200" width="220" height="100" rx="10" />
+  <text class="title" x="80" y="230">FlushWorker</text>
+  <text class="text" x="80" y="255">负责 MemTable flush</text>
+  <text class="text" x="80" y="280">生成 L0 SSTable</text>
+  <text class="text" x="80" y="305">构造 VersionEdit</text>
+
+  <!-- 顶部：KvEngine -->
+  <rect class="module-box" x="380" y="20" width="220" height="80" rx="10" />
+  <text class="title" x="400" y="50">KvEngine</text>
+  <text class="text" x="400" y="75">存储引擎主入口</text>
+  <text class="text" x="400" y="100">协调读写操作</text>
+
+  <!-- 右侧：Compaction -->
+  <rect class="module-box" x="700" y="200" width="220" height="100" rx="10" />
+  <text class="title" x="720" y="230">Compaction</text>
+  <text class="text" x="720" y="255">层级文件合并</text>
+  <text class="text" x="720" y="280">生成新文件</text>
+  <text class="text" x="720" y="305">删除旧文件</text>
+
+  <!-- 底部：CleanupWorker -->
+  <rect class="module-box" x="380" y="340" width="220" height="80" rx="10" />
+  <text class="title" x="400" y="370">CleanupWorker</text>
+  <text class="text" x="400" y="395">后台清理线程</text>
+  <text class="text" x="400" y="420">异步删除文件</text>
+
+  <!-- 数据流向箭头 -->
+
+  <!-- FlushWorker -> VersionSet (提交VersionEdit) -->
+  <path class="arrow" d="M280 250 L360 190" />
+  <text class="text" x="320" y="230" text-anchor="middle">提交 VersionEdit</text>
+
+  <!-- Compaction -> VersionSet (提交VersionEdit) -->
+  <path class="arrow" d="M700 250 L620 190" />
+  <text class="text" x="660" y="230" text-anchor="middle">提交 VersionEdit</text>
+
+  <!-- VersionSet -> KvEngine (提供current版本) -->
+  <path class="arrow" d="M490 220 L490 100" />
+  <text class="text" x="490" y="115" text-anchor="middle">提供 current()</text>
+
+  <!-- KvEngine -> FlushWorker (触发flush) -->
+  <path class="arrow" d="M490 100 L490 150 L170 150 L170 200" stroke-dasharray="5,5" />
+  <text class="text" x="330" y="140" text-anchor="middle">触发 flush</text>
+
+  <!-- KvEngine -> Compaction (触发compaction) -->
+  <path class="arrow" d="M490 100 L490 150 L810 150 L810 200" stroke-dasharray="5,5" />
+  <text class="text" x="650" y="140" text-anchor="middle">触发 compaction</text>
+
+  <!-- VersionSet -> CleanupWorker (发送清理任务) -->
+  <path class="arrow" d="M490 340 L490 320" />
+  <text class="text" x="490" y="335" text-anchor="middle">发送 CleanupTask</text>
+
+  <!-- 交互说明框 -->
+  <rect class="box" x="60" y="420" width="860" height="80" rx="10" />
+  <text class="title" x="80" y="450">协作模式说明</text>
+  <text class="text" x="80" y="475">1. 写路径：KvEngine → WAL → MemTable → flush → VersionSet</text>
+  <text class="text" x="80" y="500">2. 读路径：KvEngine → VersionSet.current() → Version.get()</text>
+  <text class="text" x="80" y="525">3. 压缩路径：Compaction → 新文件+删除旧文件 → VersionEdit → VersionSet</text>
+
+  <!-- 关键设计原则 -->
+  <rect class="box" x="60" y="460" width="860" height="40" rx="10" opacity="0.8" />
+  <text class="title" x="80" y="485" fill="#2f3b52">设计原则：先持久化后生效，异步清理，无锁读取</text>
+
+  <!-- 流程方向标注 -->
+  <text class="text" x="170" y="190" text-anchor="middle" fill="#2f3b52">生产者</text>
+  <text class="text" x="810" y="190" text-anchor="middle" fill="#2f3b52">生产者</text>
+  <text class="text" x="490" y="80" text-anchor="middle" fill="#2f3b52">消费者/调用者</text>
+  <text class="text" x="490" y="380" text-anchor="middle" fill="#2f3b52">异步消费者</text>
+</svg>
