@@ -2,7 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::PathBuf;
 
-use crate::goatkv::encoding::internal_key::InternalKey;
+use crate::goatkv::format::internal_key::InternalKey;
 
 use super::error::{WalError, WalResult};
 use super::format::{read_record, PartialStage, RecordRead};

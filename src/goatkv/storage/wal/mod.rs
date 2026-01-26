@@ -15,7 +15,7 @@ pub use writer::WalWriter;
 mod tests {
     use super::format::checksum_for;
     use super::{WalReader, WalWriter};
-    use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
+    use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
     use std::fs;
     use tempfile::NamedTempFile;
 

@@ -1,6 +1,6 @@
 // 声明子模块
 pub mod core;
-pub mod encoding;
+pub mod format;
 pub mod metadata;
 pub mod storage;
 pub mod utils;

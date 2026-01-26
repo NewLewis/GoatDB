@@ -35,7 +35,7 @@
 ///
 /// # 示例
 /// ```
-/// use goat_db::goatkv::encoding::coding;
+/// use goat_db::goatkv::format::coding;
 ///
 /// assert_eq!(coding::encode_varint64(0), vec![0x00]);
 /// assert_eq!(coding::encode_varint64(1), vec![0x01]);
@@ -82,7 +82,7 @@ pub fn put_varint64(buf: &mut Vec<u8>, mut value: u64) {
 ///
 /// # 示例
 /// ```
-/// use goat_db::goatkv::encoding::coding;
+/// use goat_db::goatkv::format::coding;
 ///
 /// assert_eq!(coding::decode_varint64(&[0x00]), Ok(0));
 /// assert_eq!(coding::decode_varint64(&[0x01]), Ok(1));
@@ -107,7 +107,7 @@ pub fn decode_varint64(bytes: &[u8]) -> Result<u64, &'static str> {
 ///
 /// # 示例
 /// ```
-/// use goat_db::goatkv::encoding::coding;
+/// use goat_db::goatkv::format::coding;
 ///
 /// assert_eq!(coding::decode_varint64_with_length(&[0x00]), Ok((0, 1)));
 /// assert_eq!(coding::decode_varint64_with_length(&[0x01]), Ok((1, 1)));

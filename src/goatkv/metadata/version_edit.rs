@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::goatkv::encoding::coding;
+use crate::goatkv::format::coding;
 use crate::goatkv::metadata::file_metadata::TableProperties;
 
 // 类型别名，增加代码可读性

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::goatkv::encoding::internal_key::InternalKey;
+use crate::goatkv::format::internal_key::InternalKey;
 use crate::goatkv::metadata::file_metadata::FileMetadata;
 use crate::goatkv::storage::sstable::SSTableReader;
 use crate::goatkv::utils::paths::SstablePaths;

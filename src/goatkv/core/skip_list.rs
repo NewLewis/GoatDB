@@ -488,7 +488,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
+    use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
 
     fn make_key(key: &[u8], seq: u64) -> InternalKey {
         InternalKey::new(key.to_vec(), seq, InternalKeyKind::Put)

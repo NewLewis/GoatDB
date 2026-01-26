@@ -1,4 +1,4 @@
-use crate::goatkv::encoding::coding;
+use crate::goatkv::format::coding;
 
 /// Block的最大大小限制
 /// 当Block的大小达到此值时，应该调用finish()结束当前Block

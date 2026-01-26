@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use crate::goatkv::encoding::coding;
+use crate::goatkv::format::coding;
 
 /// SSTable块读取器，用于解码BlockBuilder创建的块
 #[derive(Debug)]

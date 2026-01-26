@@ -2,7 +2,7 @@ use std::io::{self, Read};
 
 use crc32fast::Hasher;
 
-use crate::goatkv::encoding::internal_key::InternalKey;
+use crate::goatkv::format::internal_key::InternalKey;
 use crate::goatkv::utils::io_helpers::{read_exact_or_eof, ReadOutcome};
 
 /// Write-ahead log record format.

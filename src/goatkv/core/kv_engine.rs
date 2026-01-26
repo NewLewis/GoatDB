@@ -9,7 +9,7 @@ use crate::goatkv::core::lsm_state::{ImmutableMemTableEntry, LSMState};
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
 use crate::goatkv::core::sequence_number::SequenceNumber;
 use crate::goatkv::core::wal_handle::WalHandle;
-use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
+use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
 use crate::goatkv::metadata::version_set::{VersionSet, VersionSetOptions};
 use crate::goatkv::storage::wal::WalPaths;
 use crate::goatkv::storage::wal::{replay_wal_file, WalReplayStats, WalWriter};

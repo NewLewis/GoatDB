@@ -2,7 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use crate::goatkv::encoding::internal_key::InternalKey;
+use crate::goatkv::format::internal_key::InternalKey;
 use tracing::debug;
 
 use super::format::checksum_for;

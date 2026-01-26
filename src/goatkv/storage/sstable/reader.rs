@@ -4,8 +4,8 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use super::block_reader::BlockReader;
-use crate::goatkv::encoding::coding;
-use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind, SEQUENCE_NUMBER_MAX};
+use crate::goatkv::format::coding;
+use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind, SEQUENCE_NUMBER_MAX};
 
 /// SSTable 文件的 Magic Number
 const MAGIC_NUMBER: u64 = 0x706A725F676F6174;
@@ -389,7 +389,7 @@ impl SSTableReader {
 mod tests {
     use super::*;
     use crate::goatkv::core::kv_engine::KvEngine;
-    use crate::goatkv::encoding::internal_key::{InternalKey, InternalKeyKind};
+    use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
     use crate::goatkv::storage::sstable::SSTableBuilder;
     use std::io::Write;
     use std::path::PathBuf;

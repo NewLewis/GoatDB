@@ -27,10 +27,10 @@ fn recovery_handles_truncated_wal_tail() {
     // 写入一个完整记录
     {
         let mut wal = WalWriter::new(wal_path(0, &wal_paths), false).unwrap();
-        let key = goat_db::goatkv::encoding::internal_key::InternalKey::new(
+        let key = goat_db::goatkv::format::internal_key::InternalKey::new(
             b"ok".to_vec(),
             1,
-            goat_db::goatkv::encoding::internal_key::InternalKeyKind::Put,
+            goat_db::goatkv::format::internal_key::InternalKeyKind::Put,
         );
         wal.write(&key, b"v1").unwrap();
     }
@@ -69,10 +69,10 @@ fn recovery_replays_multiple_wals_in_order() {
     // WAL 0
     {
         let mut wal = WalWriter::new(wal_path(0, &wal_paths), false).unwrap();
-        let key = goat_db::goatkv::encoding::internal_key::InternalKey::new(
+        let key = goat_db::goatkv::format::internal_key::InternalKey::new(
             b"a".to_vec(),
             1,
-            goat_db::goatkv::encoding::internal_key::InternalKeyKind::Put,
+            goat_db::goatkv::format::internal_key::InternalKeyKind::Put,
         );
         wal.write(&key, b"va").unwrap();
     }
@@ -80,10 +80,10 @@ fn recovery_replays_multiple_wals_in_order() {
     // WAL 1
     {
         let mut wal = WalWriter::new(wal_path(1, &wal_paths), false).unwrap();
-        let key = goat_db::goatkv::encoding::internal_key::InternalKey::new(
+        let key = goat_db::goatkv::format::internal_key::InternalKey::new(
             b"b".to_vec(),
             2,
-            goat_db::goatkv::encoding::internal_key::InternalKeyKind::Put,
+            goat_db::goatkv::format::internal_key::InternalKeyKind::Put,
         );
         wal.write(&key, b"vb").unwrap();
     }
@@ -260,10 +260,10 @@ fn recovery_replays_wal_if_flush_never_completed() {
     // WAL 1 写入一条记录
     {
         let mut wal = WalWriter::new(wal_path(1, &wal_paths), false).unwrap();
-        let key = goat_db::goatkv::encoding::internal_key::InternalKey::new(
+        let key = goat_db::goatkv::format::internal_key::InternalKey::new(
             b"k".to_vec(),
             1,
-            goat_db::goatkv::encoding::internal_key::InternalKeyKind::Put,
+            goat_db::goatkv::format::internal_key::InternalKeyKind::Put,
         );
         wal.write(&key, b"v").unwrap();
     }

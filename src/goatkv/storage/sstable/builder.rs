@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use super::block_builder::BlockBuilder;
 use super::bloom::BloomBuilder;
-use crate::goatkv::encoding::coding;
-use crate::goatkv::encoding::internal_key::InternalKey;
+use crate::goatkv::format::coding;
+use crate::goatkv::format::internal_key::InternalKey;
 use crate::goatkv::metadata::file_metadata::TableProperties;
 use crate::goatkv::utils::paths::SstablePaths;
 
