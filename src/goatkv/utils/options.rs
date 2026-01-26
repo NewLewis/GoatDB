@@ -143,9 +143,15 @@ impl KvEngineOptions {
     #[cfg(test)]
     pub fn for_test() -> Self {
         use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
 
         // Create a temporary directory for testing
-        let temp_dir = env::temp_dir().join("goatdb_test");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos();
+        let temp_dir =
+            env::temp_dir().join(format!("goatdb_test_{}_{}", std::process::id(), nanos));
         if !temp_dir.exists() {
             fs::create_dir_all(&temp_dir).expect("Failed to create test directory");
         }
@@ -216,7 +222,12 @@ mod tests {
     #[test]
     fn test_for_test() {
         let options = KvEngineOptions::for_test();
-        assert!(options.data_dir.ends_with("goatdb_test"));
+        let dir_name = options
+            .data_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        assert!(dir_name.starts_with("goatdb_test_"));
         assert_eq!(options.mem_table_size, 1024 * 1024);
         assert!(!options.recover_from_wal);
         assert!(!options.wal_sync);
