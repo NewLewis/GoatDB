@@ -105,7 +105,7 @@ impl FlushWorker {
                     let mut vs = version_set.write().unwrap();
                     if let Err(e) = vs.apply_edit(version_edit) {
                         error!("Failed to apply VersionEdit: {}", e);
-                        continue; // 不 pop_front，等待后续重试
+                        continue; // 不重试，直接退出
                     }
                     vs.current()
                 };
@@ -143,7 +143,7 @@ impl FlushWorker {
                 Ok(meta) => meta,
                 Err(e) => {
                     error!("Failed to finish SSTable {}: {}", file_id, e);
-                    continue; // 保持队列状态不变，稍后重试
+                    continue; // 不重试，直接退出
                 }
             };
 
