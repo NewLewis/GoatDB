@@ -520,7 +520,6 @@ impl SSTableBuilder {
     }
 }
 
-#[cfg(unix)]
 fn sync_dir(path: &Path) -> io::Result<()> {
     let dir = File::open(path)?;
     dir.sync_all()
