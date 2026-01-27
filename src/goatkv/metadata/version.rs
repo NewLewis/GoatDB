@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::goatkv::format::internal_key::InternalKey;
 use crate::goatkv::metadata::file_metadata::FileMetadata;
-use crate::goatkv::storage::sstable::SSTableReader;
+use crate::goatkv::storage::sstable::TableCache;
 use crate::goatkv::utils::paths::SstablePaths;
 use tracing::warn;
 
@@ -57,8 +57,7 @@ impl Version {
 
     /// 查找包含指定 key 的 SSTable
     /// 返回 (level, file_meta) 如果找到
-    // todo table cache
-    pub fn get(&self, key: &[u8]) -> Option<(InternalKey, Vec<u8>)> {
+    pub fn get(&self, key: &[u8], table_cache: &TableCache) -> Option<(InternalKey, Vec<u8>)> {
         // 先检查 Level 0
         // Level 0 文件可能重叠，必须从最新的 SSTable 开始查找，避免返回旧值
         for file in self.files[0].iter().rev() {
@@ -67,8 +66,9 @@ impl Version {
             if key >= file.smallest_user_key() && key <= file.largest_user_key() {
                 // key在文件范围中，说明该文件中可能包含key
                 let sstable_path = self.sstable_paths.sstable_path_by_id(file.file_id);
-                match SSTableReader::open(&sstable_path) {
-                    Ok(mut reader) => {
+                match table_cache.get_or_open(file.file_id, file.file_size(), &sstable_path) {
+                    Ok(handle) => {
+                        let mut reader = handle.lock();
                         match reader.get(key) {
                             Ok(Some(result)) => return Some(result),
                             Ok(None) => continue, // Not found in this sstable, check next
@@ -90,8 +90,9 @@ impl Version {
         for level in 1..self.files.len() {
             if let Some(file) = self.search_level(level, key) {
                 let sstable_path = self.sstable_paths.sstable_path_by_id(file.file_id);
-                match SSTableReader::open(&sstable_path) {
-                    Ok(mut reader) => {
+                match table_cache.get_or_open(file.file_id, file.file_size(), &sstable_path) {
+                    Ok(handle) => {
+                        let mut reader = handle.lock();
                         match reader.get(key) {
                             Ok(Some(result)) => return Some(result),
                             Ok(None) => return None, // Not found in this sstable, check next

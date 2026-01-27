@@ -11,6 +11,7 @@ use crate::goatkv::core::sequence_number::SequenceNumber;
 use crate::goatkv::core::wal_handle::WalHandle;
 use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
 use crate::goatkv::metadata::version_set::{VersionSet, VersionSetOptions};
+use crate::goatkv::storage::sstable::TableCache;
 use crate::goatkv::storage::wal::WalPaths;
 use crate::goatkv::storage::wal::{replay_wal_file, WalReplayStats, WalWriter};
 use crate::goatkv::utils::cleanup_task::CleanupTask;
@@ -37,6 +38,8 @@ pub struct KvEngine {
     version_set: Arc<RwLock<VersionSet>>,
     /// 配置选项
     options: Arc<KvEngineOptions>,
+    /// SSTable 表缓存
+    table_cache: Arc<TableCache>,
     /// WAL 路径集合
     wal_paths: Arc<WalPaths>,
     /// SSTable 路径集合
@@ -178,6 +181,8 @@ impl KvEngine {
         // 创建序列号生成器（从最后序列号继续）
         let sequence_number = Arc::new(SequenceNumber::with_start(last_sequence + 1));
 
+        let table_cache = Arc::new(TableCache::new(options.table_cache.clone()));
+
         let engine = Self {
             wal_writer: Arc::new(Mutex::new(wal_writer)),
             sequence_number,
@@ -186,6 +191,7 @@ impl KvEngine {
             cleanup_sender: cleanup_sender.clone(),
             cleanup_enabled: cleanup_enabled.clone(),
             options: Arc::new(options),
+            table_cache,
             flush_worker: FlushWorker::new(
                 lsm_state.clone(),
                 version_set.clone(),
@@ -398,7 +404,7 @@ impl KvEngine {
         }
 
         // Then check SSTables via version snapshot
-        if let Some((internal_key, value)) = version.get(key) {
+        if let Some((internal_key, value)) = version.get(key, &self.table_cache) {
             if internal_key.kind() != InternalKeyKind::Delete {
                 return Some(value);
             } else {

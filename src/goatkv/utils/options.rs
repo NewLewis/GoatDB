@@ -1,6 +1,8 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+use crate::goatkv::storage::sstable::TableCacheOptions;
+
 /// Configuration options for creating a KvEngine
 ///
 /// # Examples
@@ -61,6 +63,10 @@ pub struct KvEngineOptions {
     /// LSM 层级数量
     /// Default: 7
     pub num_levels: usize,
+
+    /// SSTable TableCache 配置
+    /// Default: TableCacheOptions::default()
+    pub table_cache: TableCacheOptions,
 }
 
 impl Default for KvEngineOptions {
@@ -78,6 +84,7 @@ impl Default for KvEngineOptions {
             manifest_max_size: 32 * 1024 * 1024, // 32MB
             manifest_rewrite_edit_count: 10000,
             num_levels: 7,
+            table_cache: TableCacheOptions::default(),
         }
     }
 }
@@ -136,6 +143,65 @@ impl KvEngineOptions {
         self
     }
 
+    /// Sets the table cache options
+    pub fn with_table_cache_options(mut self, table_cache: TableCacheOptions) -> Self {
+        self.table_cache = table_cache;
+        self
+    }
+
+    /// Sets the table cache max entries
+    pub fn with_table_cache_max_entries(mut self, max_entries: usize) -> Self {
+        self.table_cache = self.table_cache.with_max_entries(max_entries);
+        self
+    }
+
+    /// Sets the table cache max charge (bytes)
+    pub fn with_table_cache_max_charge(mut self, max_charge: usize) -> Self {
+        self.table_cache = self.table_cache.with_max_charge(max_charge);
+        self
+    }
+
+    /// Disables table cache max charge
+    pub fn without_table_cache_max_charge(mut self) -> Self {
+        self.table_cache = self.table_cache.without_max_charge();
+        self
+    }
+
+    /// Sets the table cache shards
+    pub fn with_table_cache_shards(mut self, shards: usize) -> Self {
+        self.table_cache = self.table_cache.with_shards(shards);
+        self
+    }
+
+    /// Sets promote-on-get for table cache
+    pub fn with_table_cache_promote_on_get(mut self, promote_on_get: bool) -> Self {
+        self.table_cache = self.table_cache.with_promote_on_get(promote_on_get);
+        self
+    }
+
+    /// Sets the table cache hash capacity
+    pub fn with_table_cache_hash_capacity(mut self, hash_capacity: usize) -> Self {
+        self.table_cache = self.table_cache.with_hash_capacity(hash_capacity);
+        self
+    }
+
+    /// Sets metrics options for table cache
+    pub fn with_table_cache_metrics(
+        mut self,
+        metrics: crate::goatkv::utils::SharedLruMetricsOptions,
+    ) -> Self {
+        self.table_cache = self.table_cache.with_metrics(metrics);
+        self
+    }
+
+    /// Sets whether to charge by file size for table cache
+    pub fn with_table_cache_charge_by_file_size(mut self, charge_by_file_size: bool) -> Self {
+        self.table_cache = self
+            .table_cache
+            .with_charge_by_file_size(charge_by_file_size);
+        self
+    }
+
     /// Creates options suitable for testing
     ///
     /// This creates a KvEngineOptions with a temporary data directory
@@ -166,6 +232,7 @@ impl KvEngineOptions {
             manifest_max_size: 32 * 1024 * 1024, // 32MB
             manifest_rewrite_edit_count: 10000,
             num_levels: 7,
+            table_cache: TableCacheOptions::default(),
         }
     }
 }

@@ -36,7 +36,6 @@ pub struct SharedLruMetrics {
     pub removals: u64,
 }
 
-#[derive(Clone)]
 pub struct SharedLruOptions<K, V> {
     pub max_entries: usize,
     pub max_charge: Option<usize>,
@@ -46,6 +45,21 @@ pub struct SharedLruOptions<K, V> {
     pub weigher: Option<Arc<dyn Fn(&K, &V) -> usize + Send + Sync>>,
     pub metrics: SharedLruMetricsOptions,
     pub evict_hook: Option<Arc<dyn Fn(&K, &V) + Send + Sync>>,
+}
+
+impl<K, V> Clone for SharedLruOptions<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            max_entries: self.max_entries,
+            max_charge: self.max_charge,
+            promote_on_get: self.promote_on_get,
+            hash_capacity: self.hash_capacity,
+            shards: self.shards,
+            weigher: self.weigher.clone(),
+            metrics: self.metrics.clone(),
+            evict_hook: self.evict_hook.clone(),
+        }
+    }
 }
 
 impl<K, V> Default for SharedLruOptions<K, V> {
@@ -144,8 +158,8 @@ where
             shard_options.max_charge = options
                 .max_charge
                 .map(|max_charge| split_quota(max_charge, shard_idx, shard_count));
-            shard_options.hash_capacity = split_quota(options.hash_capacity, shard_idx, shard_count)
-                .max(1);
+            shard_options.hash_capacity =
+                split_quota(options.hash_capacity, shard_idx, shard_count).max(1);
             let inner = LruInner::new(shard_options.hash_capacity);
             shards.push(LruShard {
                 options: shard_options,
@@ -351,7 +365,10 @@ where
             let old_value = std::mem::replace(&mut node.value, value);
             let old_charge = node.charge;
             node.charge = charge;
-            self.charge = self.charge.saturating_sub(old_charge).saturating_add(charge);
+            self.charge = self
+                .charge
+                .saturating_sub(old_charge)
+                .saturating_add(charge);
             if options.metrics.updates {
                 self.metrics.updates += 1;
             }
@@ -532,7 +549,11 @@ mod tests {
 
     #[test]
     fn shared_lru_basic_insert_get() {
-        let cache = SharedLruCache::new(SharedLruOptions::default().with_max_entries(2).with_shards(1));
+        let cache = SharedLruCache::new(
+            SharedLruOptions::default()
+                .with_max_entries(2)
+                .with_shards(1),
+        );
         cache.insert("a", 10);
         cache.insert("b", 20);
 
@@ -543,7 +564,11 @@ mod tests {
 
     #[test]
     fn shared_lru_evicts_lru_entry() {
-        let cache = SharedLruCache::new(SharedLruOptions::default().with_max_entries(2).with_shards(1));
+        let cache = SharedLruCache::new(
+            SharedLruOptions::default()
+                .with_max_entries(2)
+                .with_shards(1),
+        );
         cache.insert("a", 10);
         cache.insert("b", 20);
         cache.get(&"a");
