@@ -37,6 +37,10 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = EngineKind::Goatkv)]
     engine: EngineKind,
 
+    /// GoatKV shard count
+    #[arg(long, default_value_t = 16, global = true)]
+    shards: usize,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -348,6 +352,10 @@ fn main() {
         tracing::error!("threads must be >= 1");
         return;
     }
+    if cli.shards == 0 {
+        tracing::error!("shards must be >= 1");
+        return;
+    }
 
     let engines: Vec<EngineKind> = match cli.engine {
         EngineKind::Both => vec![EngineKind::Goatkv, EngineKind::Rocksdb],
@@ -375,7 +383,8 @@ fn main() {
                     EngineKind::Goatkv => {
                         let options = KvEngineOptions::default()
                             .with_data_dir(&base_dir)
-                            .with_wal_sync(cli.wal_sync);
+                            .with_wal_sync(cli.wal_sync)
+                            .with_shard_count(cli.shards);
                         let engine =
                             Arc::new(KvEngine::new_with_options(options).expect("open engine"));
                         let begin = Instant::now();
@@ -432,7 +441,8 @@ fn main() {
                     EngineKind::Goatkv => {
                         let options = KvEngineOptions::default()
                             .with_data_dir(&base_dir)
-                            .with_wal_sync(cli.wal_sync);
+                            .with_wal_sync(cli.wal_sync)
+                            .with_shard_count(cli.shards);
                         let engine =
                             Arc::new(KvEngine::new_with_options(options).expect("open engine"));
                         let begin = Instant::now();
