@@ -33,6 +33,10 @@ pub struct KvEngineOptions {
     /// Default: current directory joined with "goatdb_data"
     pub data_dir: PathBuf,
 
+    /// Number of shards (shared engines) to use
+    /// Default: 16
+    pub shard_count: usize,
+
     /// Maximum size of the mutable memtable in bytes
     /// Default: 1MB (1024 * 1024 bytes)
     pub mem_table_size: usize,
@@ -70,6 +74,7 @@ impl Default for KvEngineOptions {
 
         Self {
             data_dir: default_data_dir,
+            shard_count: 16,
             mem_table_size: 1024 * 1024, // 1MB
             recover_from_wal: true,
             wal_sync: true,
@@ -91,6 +96,12 @@ impl KvEngineOptions {
     /// Sets the data directory path
     pub fn with_data_dir<P: AsRef<Path>>(mut self, data_dir: P) -> Self {
         self.data_dir = data_dir.as_ref().to_path_buf();
+        self
+    }
+
+    /// Sets the number of shards
+    pub fn with_shard_count(mut self, shard_count: usize) -> Self {
+        self.shard_count = shard_count;
         self
     }
 
@@ -158,6 +169,7 @@ impl KvEngineOptions {
 
         Self {
             data_dir: temp_dir,
+            shard_count: 16,
             mem_table_size: 1024 * 1024, // 1MB
             recover_from_wal: false,     // Don't recover in tests
             wal_sync: false,             // Don't sync in tests for speed
@@ -178,6 +190,7 @@ mod tests {
     fn test_default_options() {
         let options = KvEngineOptions::default();
         assert!(options.data_dir.ends_with("goatdb_data"));
+        assert_eq!(options.shard_count, 16);
         assert_eq!(options.mem_table_size, 1024 * 1024);
         assert!(options.recover_from_wal);
         assert!(options.wal_sync);

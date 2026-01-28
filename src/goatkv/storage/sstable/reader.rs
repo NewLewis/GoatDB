@@ -388,7 +388,7 @@ impl SSTableReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::goatkv::core::kv_engine::KvEngine;
+    use crate::goatkv::core::shard;
     use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
     use crate::goatkv::storage::sstable::SSTableBuilder;
     use std::io::Write;
@@ -400,7 +400,7 @@ mod tests {
     /// 返回 (TempDir, SSTable路径)
     fn create_test_sstable() -> (TempDir, PathBuf) {
         let temp_dir = TempDir::new().unwrap();
-        let (_, sstable_paths, _) = KvEngine::init_db_paths(temp_dir.path()).unwrap();
+        let (_, sstable_paths, _) = shard::Shard::init_db_paths(temp_dir.path()).unwrap();
 
         let mut builder = SSTableBuilder::new_with_manager(1, &sstable_paths).unwrap();
 
@@ -436,7 +436,7 @@ mod tests {
     fn test_sstable_iter_all_data() {
         // 创建200条数据并测试完整迭代
         let temp_dir = TempDir::new().unwrap();
-        let (_, sstable_paths, _) = KvEngine::init_db_paths(temp_dir.path()).unwrap();
+        let (_, sstable_paths, _) = shard::Shard::init_db_paths(temp_dir.path()).unwrap();
         let mut builder = SSTableBuilder::new_with_manager(1, &sstable_paths).unwrap();
 
         let mut test_data = Vec::new();

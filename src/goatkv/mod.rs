@@ -6,5 +6,5 @@ pub mod storage;
 pub mod utils;
 
 // 重新导出公共接口
-pub use core::KvEngine;
+pub use core::kv_engine::KvEngine;
 pub use utils::KvEngineOptions;
