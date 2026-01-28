@@ -46,6 +46,7 @@ fn recovery_handles_truncated_wal_tail() {
 
     let options = KvEngineOptions::default()
         .with_data_dir(tmp.path())
+        .with_shard_count(1)
         .with_mem_table_size(64 * 1024)
         .with_wal_sync(false)
         .with_recover_from_wal(true);
@@ -90,6 +91,7 @@ fn recovery_replays_multiple_wals_in_order() {
 
     let options = KvEngineOptions::default()
         .with_data_dir(tmp.path())
+        .with_shard_count(1)
         .with_mem_table_size(8 * 1024) // 小一些，便于触发 flush
         .with_wal_sync(false)
         .with_recover_from_wal(true);
@@ -135,6 +137,7 @@ fn recovery_advances_log_number_past_existing_wals() {
 
     let options = KvEngineOptions::default()
         .with_data_dir(tmp.path())
+        .with_shard_count(1)
         .with_mem_table_size(64 * 1024)
         .with_wal_sync(false)
         .with_recover_from_wal(true);
@@ -192,6 +195,7 @@ fn recovery_truncates_manifest_tail() {
 
     let options = KvEngineOptions::default()
         .with_data_dir(tmp.path())
+        .with_shard_count(1)
         .with_mem_table_size(64 * 1024)
         .with_wal_sync(false)
         .with_recover_from_wal(true);
@@ -234,6 +238,7 @@ fn recovery_errors_on_corrupted_manifest_edit() {
 
     let options = KvEngineOptions::default()
         .with_data_dir(tmp.path())
+        .with_shard_count(1)
         .with_mem_table_size(64 * 1024)
         .with_wal_sync(false)
         .with_recover_from_wal(true);
@@ -278,6 +283,7 @@ fn recovery_replays_wal_if_flush_never_completed() {
 
     let options = KvEngineOptions::default()
         .with_data_dir(tmp.path())
+        .with_shard_count(1)
         .with_mem_table_size(64 * 1024)
         .with_wal_sync(false)
         .with_recover_from_wal(true);
@@ -297,6 +303,7 @@ fn recovery_replays_wal_if_flush_never_completed() {
     // 再次启动：如果没有不安全的 log_number 推进，应当能 replay WAL 1
     let options = KvEngineOptions::default()
         .with_data_dir(tmp.path())
+        .with_shard_count(1)
         .with_mem_table_size(64 * 1024)
         .with_wal_sync(false)
         .with_recover_from_wal(true);

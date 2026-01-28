@@ -55,14 +55,37 @@ impl Default for Shard {
 }
 
 impl Shard {
-    pub fn init_db_paths<P: AsRef<Path>>(base_dir: P) -> Result<DbPaths, std::io::Error> {
-        let base_dir = base_dir.as_ref().to_path_buf();
-        let data_dir = base_dir.join("data");
-        let wal_dir = base_dir.join("wal");
-        let log_dir = base_dir.join("log");
-        let tmp_dir = base_dir.join("tmp");
+    #[cfg(test)]
+    pub(crate) fn init_db_paths<P: AsRef<Path>>(base_dir: P) -> Result<DbPaths, std::io::Error> {
+        Self::init_db_paths_with_shard(base_dir, None)
+    }
 
-        let dirs = [&base_dir, &data_dir, &wal_dir, &log_dir, &tmp_dir];
+    pub(crate) fn init_db_paths_with_shard<P: AsRef<Path>>(
+        base_dir: P,
+        shard_name: Option<&str>,
+    ) -> Result<DbPaths, std::io::Error> {
+        let base_dir = base_dir.as_ref().to_path_buf();
+        let (data_dir, wal_dir, log_dir, tmp_dir, manifest_base) = match shard_name {
+            Some(name) => {
+                let shard_base = base_dir.join(name);
+                let data_dir = shard_base.join("data");
+                let wal_dir = shard_base.join("wal");
+                let log_dir = shard_base.join("log");
+                let tmp_dir = shard_base.join("tmp");
+                let manifest_base = shard_base.clone();
+                (data_dir, wal_dir, log_dir, tmp_dir, manifest_base)
+            }
+            None => {
+                let data_dir = base_dir.join("data");
+                let wal_dir = base_dir.join("wal");
+                let log_dir = base_dir.join("log");
+                let tmp_dir = base_dir.join("tmp");
+                let manifest_base = base_dir.clone();
+                (data_dir, wal_dir, log_dir, tmp_dir, manifest_base)
+            }
+        };
+
+        let dirs = [&manifest_base, &data_dir, &wal_dir, &log_dir, &tmp_dir];
         for dir in dirs {
             if !dir.exists() {
                 fs::create_dir_all(dir)?;
@@ -71,7 +94,7 @@ impl Shard {
 
         let wal_paths = Arc::new(WalPaths::new(wal_dir));
         let sstable_paths = Arc::new(SstablePaths::new(data_dir.clone(), tmp_dir));
-        let manifest_paths = Arc::new(ManifestPaths::new(base_dir, data_dir));
+        let manifest_paths = Arc::new(ManifestPaths::new(manifest_base, data_dir));
 
         Ok((wal_paths, sstable_paths, manifest_paths))
     }
@@ -91,7 +114,16 @@ impl Shard {
     /// - `Ok(Shard)`: 创建成功
     /// - `Err(std::io::Error)`: 创建目录或初始化失败
     pub fn new_with_options(options: KvEngineOptions) -> Result<Self, std::io::Error> {
-        let (wal_paths, sstable_paths, manifest_paths) = Self::init_db_paths(&options.data_dir)?;
+        Self::new_with_options_and_shard(options, None, None)
+    }
+
+    pub(crate) fn new_with_options_and_shard(
+        options: KvEngineOptions,
+        shard_name: Option<&str>,
+        shared_sequence_number: Option<Arc<SequenceNumber>>,
+    ) -> Result<Self, std::io::Error> {
+        let (wal_paths, sstable_paths, manifest_paths) =
+            Self::init_db_paths_with_shard(&options.data_dir, shard_name)?;
         let _ = sstable_paths.cleanup_tmp_dir();
 
         let (cleanup_worker, cleanup_sender) =
@@ -172,7 +204,13 @@ impl Shard {
         };
 
         // 创建序列号生成器（从最后序列号继续）
-        let sequence_number = Arc::new(SequenceNumber::with_start(last_sequence + 1));
+        let sequence_number = match shared_sequence_number {
+            Some(sequence_number) => {
+                sequence_number.ensure_at_least(last_sequence + 1);
+                sequence_number
+            }
+            None => Arc::new(SequenceNumber::with_start(last_sequence + 1)),
+        };
 
         let engine = Self {
             wal_writer: Arc::new(Mutex::new(wal_writer)),

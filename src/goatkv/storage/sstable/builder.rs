@@ -70,7 +70,7 @@ const MAGIC_NUMBER: u64 = 0x706A725F676F6174;
 ///
 /// # 示例
 /// ```no_run
-/// # use goat_db::goatkv::core::KvEngine;
+/// # use goat_db::goatkv::KvEngine;
 /// # use goat_db::goatkv::storage::sstable::SSTableBuilder;
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let (_wal_paths, sstable_paths, _manifest_paths) = KvEngine::init_db_paths("./data")?;
@@ -136,10 +136,10 @@ impl SSTableBuilder {
     /// # 示例
     /// ```no_run
     /// # use goat_db::goatkv::storage::sstable::SSTableBuilder;
-    /// # use goat_db::goatkv::core::KvEngine;
+    /// # use goat_db::goatkv::KvEngine;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let (_wal_paths, sstable_paths, _manifest_paths) =
-    ///     goat_db::goatkv::core::KvEngine::init_db_paths("./data")?;
+    ///     KvEngine::init_db_paths("./data")?;
     /// let builder = SSTableBuilder::new(1, &sstable_paths)?;
     /// // 创建文件 ./data/000001.sst
     /// # Ok(())
@@ -208,7 +208,7 @@ impl SSTableBuilder {
     ///
     /// # 示例
     /// ```no_run
-    /// # use goat_db::goatkv::core::KvEngine;
+    /// # use goat_db::goatkv::KvEngine;
     /// # use goat_db::goatkv::storage::sstable::SSTableBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let (_wal_paths, sstable_paths, _manifest_paths) = KvEngine::init_db_paths("./data")?;
@@ -325,7 +325,7 @@ impl SSTableBuilder {
     ///
     /// # 示例
     /// ```no_run
-    /// # use goat_db::goatkv::core::KvEngine;
+    /// # use goat_db::goatkv::KvEngine;
     /// # use goat_db::goatkv::storage::sstable::SSTableBuilder;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let (_wal_paths, sstable_paths, _manifest_paths) = KvEngine::init_db_paths("./data")?;

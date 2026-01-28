@@ -3,6 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::goatkv::core::sequence_number::SequenceNumber;
 use crate::goatkv::core::shard::Shard;
 use crate::goatkv::storage::wal::WalPaths;
 use crate::goatkv::utils::options::KvEngineOptions;
@@ -25,7 +26,7 @@ impl Default for KvEngine {
 
 impl KvEngine {
     pub fn init_db_paths<P: AsRef<Path>>(base_dir: P) -> Result<DbPaths, std::io::Error> {
-        Shard::init_db_paths(base_dir)
+        Shard::init_db_paths_with_shard(base_dir, Some("shard0"))
     }
 
     /// 创建新的 KvEngine，使用默认数据目录（当前目录下的 goatdb_data）
@@ -51,11 +52,16 @@ impl KvEngine {
         }
 
         let mut shards = Vec::with_capacity(options.shard_count);
+        let sequence_number = Arc::new(SequenceNumber::with_start(1));
         for shard_index in 0..options.shard_count {
             let mut shard_options = options.clone();
-            shard_options.data_dir = options.data_dir.join(format!("shard_{:02}", shard_index));
             shard_options.shard_count = 1;
-            let shard = Shard::new_with_options(shard_options)?;
+            let shard_name = format!("shard{}", shard_index);
+            let shard = Shard::new_with_options_and_shard(
+                shard_options,
+                Some(&shard_name),
+                Some(sequence_number.clone()),
+            )?;
             shards.push(Arc::new(shard));
         }
 
