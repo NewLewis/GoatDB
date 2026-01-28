@@ -389,6 +389,11 @@ impl Shard {
         version.get_files(level).len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn mem_table_size(&self) -> usize {
+        self.options.mem_table_size
+    }
+
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         let (mem_table, immutable_mem_tables, version) = {
             let lsm_state = self.lsm_state.read().unwrap();

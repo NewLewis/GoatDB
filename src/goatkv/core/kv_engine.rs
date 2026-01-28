@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::goatkv::core::sequence_number::SequenceNumber;
 use crate::goatkv::core::shard::Shard;
 use crate::goatkv::storage::wal::WalPaths;
+use crate::goatkv::utils::db_meta::{ensure_db_meta, HASH_SEED};
 use crate::goatkv::utils::options::KvEngineOptions;
 use crate::goatkv::utils::paths::{ManifestPaths, SstablePaths};
 use twox_hash::XxHash64;
@@ -51,11 +52,27 @@ impl KvEngine {
             ));
         }
 
+        let per_shard_mem_table_size = match options.mem_table_budget {
+            Some(budget) => {
+                if budget < options.shard_count {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "mem_table_budget too small for shard_count",
+                    ));
+                }
+                budget / options.shard_count
+            }
+            None => options.mem_table_size,
+        };
+
+        ensure_db_meta(&options.data_dir, options.shard_count)?;
+
         let mut shards = Vec::with_capacity(options.shard_count);
         let sequence_number = Arc::new(SequenceNumber::with_start(1));
         for shard_index in 0..options.shard_count {
             let mut shard_options = options.clone();
             shard_options.shard_count = 1;
+            shard_options.mem_table_size = per_shard_mem_table_size;
             let shard_name = format!("shard{}", shard_index);
             let shard = Shard::new_with_options_and_shard(
                 shard_options,
@@ -80,7 +97,7 @@ impl KvEngine {
     }
 
     fn shard_index(&self, key: &[u8]) -> usize {
-        let mut hasher = XxHash64::with_seed(0);
+        let mut hasher = XxHash64::with_seed(HASH_SEED);
         hasher.write(key);
         (hasher.finish() as usize) % self.shard_count
     }
@@ -195,5 +212,120 @@ mod tests {
         let shard = &engine.shards[0];
         assert!(shard.is_mem_state_empty());
         assert_eq!(shard.level_file_count(0), 0);
+    }
+
+    #[test]
+    fn test_mem_table_budget_distributed() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let options = KvEngineOptions::default()
+            .with_data_dir(tmp.path())
+            .with_shard_count(4)
+            .with_mem_table_budget(4 * 64 * 1024)
+            .with_wal_sync(false)
+            .with_recover_from_wal(false);
+
+        let engine = KvEngine::new_with_options(options).expect("create engine");
+        for shard in &engine.shards {
+            assert_eq!(shard.mem_table_size(), 64 * 1024);
+        }
+    }
+
+    #[test]
+    fn test_mem_table_budget_too_small() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let options = KvEngineOptions::default()
+            .with_data_dir(tmp.path())
+            .with_shard_count(4)
+            .with_mem_table_budget(3)
+            .with_wal_sync(false)
+            .with_recover_from_wal(false);
+
+        let err = KvEngine::new_with_options(options).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err
+            .to_string()
+            .contains("mem_table_budget too small"));
+    }
+
+    #[test]
+    fn test_mem_table_budget_overrides_mem_table_size() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let options = KvEngineOptions::default()
+            .with_data_dir(tmp.path())
+            .with_shard_count(2)
+            .with_mem_table_size(128 * 1024)
+            .with_mem_table_budget(3 * 1024)
+            .with_wal_sync(false)
+            .with_recover_from_wal(false);
+
+        let engine = KvEngine::new_with_options(options).expect("create engine");
+        for shard in &engine.shards {
+            assert_eq!(shard.mem_table_size(), 1536);
+        }
+    }
+
+    #[test]
+    fn test_mem_table_budget_non_divisible() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let options = KvEngineOptions::default()
+            .with_data_dir(tmp.path())
+            .with_shard_count(3)
+            .with_mem_table_budget(1000)
+            .with_wal_sync(false)
+            .with_recover_from_wal(false);
+
+        let engine = KvEngine::new_with_options(options).expect("create engine");
+        for shard in &engine.shards {
+            assert_eq!(shard.mem_table_size(), 333);
+        }
+    }
+
+    #[test]
+    fn test_mem_table_budget_equals_shard_count() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let options = KvEngineOptions::default()
+            .with_data_dir(tmp.path())
+            .with_shard_count(4)
+            .with_mem_table_budget(4)
+            .with_wal_sync(false)
+            .with_recover_from_wal(false);
+
+        let engine = KvEngine::new_with_options(options).expect("create engine");
+        for shard in &engine.shards {
+            assert_eq!(shard.mem_table_size(), 1);
+        }
+    }
+
+    #[test]
+    fn test_mem_table_budget_zero_is_invalid() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let options = KvEngineOptions::default()
+            .with_data_dir(tmp.path())
+            .with_shard_count(1)
+            .with_mem_table_budget(0)
+            .with_wal_sync(false)
+            .with_recover_from_wal(false);
+
+        let err = KvEngine::new_with_options(options).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err
+            .to_string()
+            .contains("mem_table_budget too small"));
+    }
+
+    #[test]
+    fn test_mem_table_size_used_when_budget_missing() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let options = KvEngineOptions::default()
+            .with_data_dir(tmp.path())
+            .with_shard_count(2)
+            .with_mem_table_size(96 * 1024)
+            .with_wal_sync(false)
+            .with_recover_from_wal(false);
+
+        let engine = KvEngine::new_with_options(options).expect("create engine");
+        for shard in &engine.shards {
+            assert_eq!(shard.mem_table_size(), 96 * 1024);
+        }
     }
 }
