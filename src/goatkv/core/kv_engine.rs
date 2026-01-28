@@ -1,5 +1,4 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -8,6 +7,7 @@ use crate::goatkv::core::shard::Shard;
 use crate::goatkv::storage::wal::WalPaths;
 use crate::goatkv::utils::options::KvEngineOptions;
 use crate::goatkv::utils::paths::{ManifestPaths, SstablePaths};
+use twox_hash::XxHash64;
 
 type DbPaths = (Arc<WalPaths>, Arc<SstablePaths>, Arc<ManifestPaths>);
 
@@ -80,8 +80,8 @@ impl KvEngine {
     }
 
     fn shard_index(&self, key: &[u8]) -> usize {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
+        let mut hasher = XxHash64::with_seed(0);
+        hasher.write(key);
         (hasher.finish() as usize) % self.shard_count
     }
 

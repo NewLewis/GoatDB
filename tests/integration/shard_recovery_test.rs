@@ -1,11 +1,11 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 
 use goat_db::goatkv::{KvEngine, KvEngineOptions};
+use twox_hash::XxHash64;
 
 fn shard_index(key: &[u8], shard_count: usize) -> usize {
-    let mut hasher = DefaultHasher::new();
-    key.hash(&mut hasher);
+    let mut hasher = XxHash64::with_seed(0);
+    hasher.write(key);
     (hasher.finish() as usize) % shard_count
 }
 
