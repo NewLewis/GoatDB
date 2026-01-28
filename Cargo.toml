@@ -77,6 +77,16 @@ name = "integration_recovery"
 path = "tests/integration/recovery_test.rs"
 harness = true
 
+[[test]]
+name = "integration_shard_basic"
+path = "tests/integration/shard_basic_test.rs"
+harness = true
+
+[[test]]
+name = "integration_shard_recovery"
+path = "tests/integration/shard_recovery_test.rs"
+harness = true
+
 # ========== Integration Tests ==========
 # Component-level integration tests
 # Uncomment and add more as needed:
