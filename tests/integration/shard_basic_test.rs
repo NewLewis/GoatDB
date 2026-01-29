@@ -137,3 +137,51 @@ fn shard_single_crud_and_dirs() {
         shard_base.join("tmp")
     );
 }
+
+#[test]
+fn shard_meta_allows_existing_shards_and_creates_meta() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let shard_count = 2;
+    for shard_idx in 0..shard_count {
+        let shard_base = tmp.path().join(format!("shard{}", shard_idx));
+        std::fs::create_dir_all(&shard_base).expect("create shard base");
+    }
+
+    let options = KvEngineOptions::default()
+        .with_data_dir(tmp.path())
+        .with_shard_count(shard_count)
+        .with_mem_table_size(64 * 1024)
+        .with_wal_sync(false)
+        .with_recover_from_wal(false);
+    let _engine = KvEngine::new_with_options(options).expect("create engine");
+
+    let meta_path = tmp.path().join("GOATDB_META");
+    let content = std::fs::read_to_string(&meta_path).expect("read meta");
+    assert!(content.contains("shard_count=2"));
+}
+
+#[test]
+fn shard_meta_rejects_mismatched_shard_count() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let options = KvEngineOptions::default()
+        .with_data_dir(tmp.path())
+        .with_shard_count(2)
+        .with_mem_table_size(64 * 1024)
+        .with_wal_sync(false)
+        .with_recover_from_wal(false);
+    {
+        let _engine = KvEngine::new_with_options(options).expect("create engine");
+    }
+
+    let options = KvEngineOptions::default()
+        .with_data_dir(tmp.path())
+        .with_shard_count(3)
+        .with_mem_table_size(64 * 1024)
+        .with_wal_sync(false)
+        .with_recover_from_wal(false);
+    let err = KvEngine::new_with_options(options).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(err
+        .to_string()
+        .contains("shard_count mismatch"));
+}

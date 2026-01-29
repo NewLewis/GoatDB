@@ -41,6 +41,10 @@ pub struct KvEngineOptions {
     /// Default: 1MB (1024 * 1024 bytes)
     pub mem_table_size: usize,
 
+    /// Total memtable budget across all shards in bytes (optional).
+    /// When set, per-shard memtable size = budget / shard_count.
+    pub mem_table_budget: Option<usize>,
+
     /// Whether to attempt recovery from WAL on startup
     /// Default: true
     pub recover_from_wal: bool,
@@ -76,6 +80,7 @@ impl Default for KvEngineOptions {
             data_dir: default_data_dir,
             shard_count: 16,
             mem_table_size: 1024 * 1024, // 1MB
+            mem_table_budget: None,
             recover_from_wal: true,
             wal_sync: true,
             // VersionSet defaults
@@ -108,6 +113,12 @@ impl KvEngineOptions {
     /// Sets the maximum memtable size in bytes
     pub fn with_mem_table_size(mut self, size: usize) -> Self {
         self.mem_table_size = size;
+        self
+    }
+
+    /// Sets the total memtable budget across all shards in bytes.
+    pub fn with_mem_table_budget(mut self, budget: usize) -> Self {
+        self.mem_table_budget = Some(budget);
         self
     }
 
@@ -171,6 +182,7 @@ impl KvEngineOptions {
             data_dir: temp_dir,
             shard_count: 16,
             mem_table_size: 1024 * 1024, // 1MB
+            mem_table_budget: None,
             recover_from_wal: false,     // Don't recover in tests
             wal_sync: false,             // Don't sync in tests for speed
             // VersionSet defaults (use same defaults as production)
@@ -192,6 +204,7 @@ mod tests {
         assert!(options.data_dir.ends_with("goatdb_data"));
         assert_eq!(options.shard_count, 16);
         assert_eq!(options.mem_table_size, 1024 * 1024);
+        assert_eq!(options.mem_table_budget, None);
         assert!(options.recover_from_wal);
         assert!(options.wal_sync);
     }
@@ -209,6 +222,12 @@ mod tests {
     fn test_with_mem_table_size() {
         let options = KvEngineOptions::default().with_mem_table_size(2048 * 1024);
         assert_eq!(options.mem_table_size, 2048 * 1024);
+    }
+
+    #[test]
+    fn test_with_mem_table_budget() {
+        let options = KvEngineOptions::default().with_mem_table_budget(8 * 1024 * 1024);
+        assert_eq!(options.mem_table_budget, Some(8 * 1024 * 1024));
     }
 
     #[test]
@@ -242,6 +261,7 @@ mod tests {
             .unwrap_or_default();
         assert!(dir_name.starts_with("goatdb_test_"));
         assert_eq!(options.mem_table_size, 1024 * 1024);
+        assert_eq!(options.mem_table_budget, None);
         assert!(!options.recover_from_wal);
         assert!(!options.wal_sync);
     }
