@@ -28,6 +28,10 @@ impl SequenceNumber {
         self.counter.fetch_add(1, Ordering::SeqCst)
     }
 
+    pub fn allocate_range(&self, count: u64) -> u64 {
+        self.counter.fetch_add(count, Ordering::SeqCst)
+    }
+
     pub fn set(&self, value: u64) {
         self.counter.store(value, Ordering::SeqCst);
     }

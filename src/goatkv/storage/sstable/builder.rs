@@ -224,7 +224,15 @@ impl SSTableBuilder {
         if self.smallest_key.is_none() {
             self.smallest_key = Some(key.to_vec());
         }
-        self.largest_key = Some(key.to_vec());
+        match self.largest_key.as_mut() {
+            Some(buf) => {
+                buf.clear();
+                buf.extend_from_slice(key);
+            }
+            None => {
+                self.largest_key = Some(key.to_vec());
+            }
+        }
 
         // 检查当前数据块是否已满（>= 4KB）
         if self.data_block_builder.should_finish() {

@@ -45,6 +45,18 @@ pub struct KvEngineOptions {
     /// Default: true (safer but slower)
     pub wal_sync: bool,
 
+    /// WAL sync interval in milliseconds
+    /// Default: 10ms
+    pub wal_sync_interval_ms: u64,
+
+    /// WAL sync threshold in bytes
+    /// Default: 1MB
+    pub wal_sync_bytes: usize,
+
+    /// Maximum WAL buffer size in bytes
+    /// Default: 64MB
+    pub wal_max_buffer_bytes: usize,
+
     // ===== VersionSet Options =====
     /// 保留的历史版本数量
     /// Default: 10
@@ -73,6 +85,9 @@ impl Default for KvEngineOptions {
             mem_table_size: 1024 * 1024, // 1MB
             recover_from_wal: true,
             wal_sync: true,
+            wal_sync_interval_ms: 10,
+            wal_sync_bytes: 1024 * 1024,
+            wal_max_buffer_bytes: 64 * 1024 * 1024,
             // VersionSet defaults
             max_versions: 10,
             manifest_max_size: 32 * 1024 * 1024, // 32MB
@@ -109,6 +124,24 @@ impl KvEngineOptions {
     /// Sets whether to synchronize WAL writes to disk
     pub fn with_wal_sync(mut self, sync: bool) -> Self {
         self.wal_sync = sync;
+        self
+    }
+
+    /// Sets the WAL sync interval in milliseconds
+    pub fn with_wal_sync_interval_ms(mut self, interval_ms: u64) -> Self {
+        self.wal_sync_interval_ms = interval_ms;
+        self
+    }
+
+    /// Sets the WAL sync threshold in bytes
+    pub fn with_wal_sync_bytes(mut self, bytes: usize) -> Self {
+        self.wal_sync_bytes = bytes;
+        self
+    }
+
+    /// Sets the WAL max buffer size in bytes
+    pub fn with_wal_max_buffer_bytes(mut self, bytes: usize) -> Self {
+        self.wal_max_buffer_bytes = bytes;
         self
     }
 
@@ -161,6 +194,9 @@ impl KvEngineOptions {
             mem_table_size: 1024 * 1024, // 1MB
             recover_from_wal: false,     // Don't recover in tests
             wal_sync: false,             // Don't sync in tests for speed
+            wal_sync_interval_ms: 10,
+            wal_sync_bytes: 1024 * 1024,
+            wal_max_buffer_bytes: 64 * 1024 * 1024,
             // VersionSet defaults (use same defaults as production)
             max_versions: 10,
             manifest_max_size: 32 * 1024 * 1024, // 32MB

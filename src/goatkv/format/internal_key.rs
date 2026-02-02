@@ -94,6 +94,13 @@ impl InternalKey {
 
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.user_key.len() + 8);
+        self.serialize_into(&mut buf);
+        buf
+    }
+
+    pub fn serialize_into(&self, buf: &mut Vec<u8>) {
+        buf.clear();
+        buf.reserve(self.user_key.len() + 8);
         buf.extend_from_slice(self.user_key());
         // 关键修正：使用 Big Endian 并取反 (!seq)
         // 原因：
@@ -105,7 +112,6 @@ impl InternalKey {
         // Seq 200 (Encoded) -> !200 -> Small Value -> Small Bytes -> First in SSTable
         // Seq 100 (Encoded) -> !100 -> Large Value -> Large Bytes -> Later in SSTable
         buf.extend_from_slice(&(!self.encoded_sequence_number).to_be_bytes());
-        buf
     }
 
     /// Create an InternalKey from raw encoded value.
@@ -123,6 +129,11 @@ impl InternalKey {
     /// Get the user key.
     pub fn user_key(&self) -> &[u8] {
         &self.user_key
+    }
+
+    /// Get the user key as Bytes (cheap clone).
+    pub fn user_key_bytes(&self) -> Bytes {
+        self.user_key.clone()
     }
 
     /// Get the sequence number (56 bits).

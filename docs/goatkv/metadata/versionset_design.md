@@ -67,7 +67,7 @@ VersionSet 是 GoatDB 的核心元数据管理器，担任数据库的“真相�
 | `versions` | `VecDeque<Arc<Version>>` | 历史版本队列（大小受 `max_versions` 限制） |
 | `manifest_writer` | `Option<ManifestWriter>` | MANIFEST 文件写入器 |
 | `manifest_file_number` | `u64` | 当前 MANIFEST 文件编号 |
-| `log_number` | `u64` | 当前有效 WAL 日志编号 |
+| `log_number` | `u64` | 已持久化的 WAL 边界编号 |
 | `next_file_number` | `u64` | 下一个可分配的文件编号 |
 | `last_sequence` | `u64` | 全局最大序列号（用于 MVCC） |
 | `obsolete_sender` | `Sender<CleanupTask>` | 清理任务发送通道 |
@@ -76,9 +76,9 @@ VersionSet 是 GoatDB 的核心元数据管理器，担任数据库的“真相�
 ## 全局计数器管理
 
 ### 1. Log Number（日志编号）
-- **作用**：标识当前有效的 WAL 日志文件
-- **更新时机**：创建新 WAL 文件时递增
-- **恢复保证**：崩溃后重放所有 `log_number` 之后的 WAL
+- **作用**：标识已持久化的 WAL 边界（小于该编号的 WAL 可忽略）
+- **更新时机**：flush 完成并写入 MANIFEST 后更新（由 FlushWorker 提交 VersionEdit）
+- **恢复保证**：崩溃后回放所有编号 ≥ `log_number` 的 WAL（`log_number == 0` 时包含历史主 WAL）
 
 ### 2. Next File Number（下一个文件编号）
 - **作用**：分配唯一 SSTable/WAL 文件编号
@@ -95,8 +95,8 @@ VersionSet 是 GoatDB 的核心元数据管理器，担任数据库的“真相�
 | 配置项 | 类型 | 默认值 | 描述 |
 |--------|------|--------|------|
 | `max_versions` | `usize` | 10 | 保留的历史版本数量，避免内存无限增长 |
-| `manifest_max_size` | `u64` | 64MB | MANIFEST 文件大小限制，超过触发重写 |
-| `manifest_rewrite_edit_count` | `usize` | 1000 | 触发 MANIFEST 重写的版本编辑数量阈值 |
+| `manifest_max_size` | `u64` | 32MB | MANIFEST 文件大小限制，超过触发重写 |
+| `manifest_rewrite_edit_count` | `usize` | 10000 | 触发 MANIFEST 重写的版本编辑数量阈值 |
 | `num_levels` | `usize` | 7 | LSM 树层级数量，决定文件组织深度 |
 
 ## 全局计数器管理流程图
@@ -105,7 +105,7 @@ VersionSet 是 GoatDB 的核心元数据管理器，担任数据库的“真相�
 
 上图展示了 VersionSet 中三个全局计数器的管理机制：
 
-1. **log_number**：标识当前有效 WAL 日志文件，创建新 WAL 时递增
+1. **log_number**：标识已持久化的 WAL 边界，flush 完成并写入 MANIFEST 后更新
 2. **next_file_number**：分配唯一 SSTable/WAL 文件编号，分配文件时递增
 3. **last_sequence**：全局 MVCC 版本控制，每次写操作递增
 
@@ -233,7 +233,7 @@ VersionSet 是 GoatDB 的核心元数据管理器，担任数据库的“真相�
 | 字段类型 | 标签 | 编码内容 | 用途 |
 |----------|------|----------|------|
 | Comparator | 1 | 字符串长度 + 比较器名称 | 兼容性校验 |
-| Log Number | 2 | 变长编码的 u64 | 当前有效 WAL 编号 |
+| Log Number | 2 | 变长编码的 u64 | 已持久化的 WAL 边界编号 |
 | Next File Number | 3 | 变长编码的 u64 | 下一个可用文件编号 |
 | Last Sequence | 4 | 变长编码的 u64 | 全局最大序列号 |
 | Compact Pointers | 5 | 层级 + 键数据 | 各层压缩起始键 |

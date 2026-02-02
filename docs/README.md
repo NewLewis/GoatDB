@@ -8,6 +8,7 @@
 |------|------|------|
 | **跳表（Skip List）实现详解** | 详细说明了 GoatDB 中跳表数据结构的实现原理、内存布局、核心算法和性能特性。跳表被用作 MemTable 的核心数据结构。 | [`goatkv/core/skip_list_implementation.md`](goatkv/core/skip_list_implementation.md) |
 | **SSTable 格式规范** | 定义了 GoatDB 中 Sorted String Table（SSTable）的文件格式，包括数据块、布隆过滤器、索引块和页脚的结构，以及编码细节和性能特性。 | [`goatkv/storage/sstable_format.md`](goatkv/storage/sstable_format.md) |
+| **Write-Ahead Log (WAL) 设计与实现** | 详细说明了 GoatDB 中写前日志的设计原理、记录格式、同步/异步写入路径、崩溃恢复机制和性能优化策略。 | [`goatkv/storage/wal_design.md`](goatkv/storage/wal_design.md) |
 
 ## 🎯 文档目的
 
@@ -27,11 +28,11 @@ docs/
     ├── core/
     │   └── skip_list_implementation.md
     └── storage/
-        └── sstable_format.md
+        ├── sstable_format.md
+        └── wal_design.md
 ```
 
 文档目录结构镜像了源码的模块结构，便于查找相关设计文档。
-
 ## 🔧 使用说明
 
 - 阅读文档时，建议同时查看对应的源码实现以获得完整理解。

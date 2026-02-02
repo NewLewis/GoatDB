@@ -64,7 +64,7 @@ graph LR
 1. **CRC32 校验和** (u32, little-endian)：覆盖除自身外的所有字段
 2. **InternalKey 总长度** (u32, little-endian)：用户键长度 + 8字节序列号
 3. **用户键字节**：原始用户键数据
-4. **编码后的序列号** (u64, little-endian)：低8位为操作类型（Put/Delete/Tombstone）
+4. **编码后的序列号** (u64, little-endian)：低8位为操作类型（Put/Delete）
 5. **值长度** (u32, little-endian)
 6. **值字节**：原始值数据
 
@@ -84,25 +84,27 @@ sequenceDiagram
     Client->>WAL: 1. Put/Delete 操作
     WAL->>MemTable: 2. 写入可变MemTable
     Note over MemTable: 3. 检查大小阈值
-    MemTable->>MemTable: 4. 达到阈值，变为immutable
-    MemTable->>FlushWorker: 5. 提交flush任务
-    FlushWorker->>SSTable: 6. 写入SSTable文件
-    FlushWorker->>MANIFEST: 7. 生成VersionEdit
-    MANIFEST->>WAL: 8. 更新log_number
-    WAL->>WAL: 9. 清理旧WAL文件
+    MemTable->>WAL: 4. 触发WAL轮转
+    WAL->>WAL: 5. 切换新WAL文件
+    MemTable->>MemTable: 6. 达到阈值，变为immutable
+    MemTable->>FlushWorker: 7. 提交flush任务
+    FlushWorker->>SSTable: 8. 写入SSTable文件
+    FlushWorker->>MANIFEST: 9. 生成VersionEdit并更新log_number
+    WAL->>WAL: 10. 旧WAL满足条件后清理
 ```
 
 **详细步骤：**
 1. **客户端写入**：发起 Put/Delete 操作
-2. **WAL 记录**：先写入 WAL 文件（`wal_sync` 选项控制是否立即 fsync）
+2. **WAL 记录**：先进入 WAL 写入路径（`wal_sync=true` 时等待 flush+sync，可能批量合并；`wal_sync=false` 则先进入缓冲并由后台刷盘）
 3. **MemTable 更新**：写入可变 MemTable（线程安全的 SkipList）
 4. **MemTable 切换**：当 MemTable 达到 `mem_table_size` 阈值时：
+   - 先请求 WAL 轮转，切换到新 WAL 文件
    - 当前 MemTable 标记为 immutable
    - 创建新的可变 MemTable
    - 提交后台 flush 任务
 5. **SSTable 生成**：后台 `FlushWorker` 将 immutable MemTable 写入 SSTable 文件
-6. **MANIFEST 更新**：SSTable 写入完成后生成 `VersionEdit` 并追加到 MANIFEST
-7. **WAL 清理**：依赖该 WAL 的所有 MemTable 都 flush 完成后，WAL 文件可安全删除
+6. **MANIFEST 更新**：SSTable 写入完成后生成 `VersionEdit` 并追加到 MANIFEST（同时更新 `log_number`）
+7. **WAL 清理**：依赖该 WAL 的所有 MemTable 都 flush 完成后，由 `WalHandle` 触发清理
 
 ## 5. 恢复入口点
 
@@ -188,7 +190,7 @@ flowchart TD
 | Tag | 字段 | 说明 |
 |-----|------|------|
 | 1 | `comparator_name` | 比较器名称（兼容性检查） |
-| 2 | `log_number` | 当前有效的WAL日志编号 |
+| 2 | `log_number` | 已持久化的 WAL 边界编号 |
 | 3 | `next_file_number` | 下一个可用文件编号 |
 | 4 | `last_sequence` | 全局最大序列号 |
 | 5 | `compact_pointers` | 各级压缩指针 |
@@ -236,7 +238,7 @@ flowchart TD
     N -->|否| I
     
     O --> P{MemTable达到阈值?}
-    P -->|是| Q[封存为immutable<br/>记录wal_log_number]
+    P -->|是| Q[封存为immutable<br/>绑定WalHandle]
     P -->|否| G
     
     Q --> R[创建新MemTable]
@@ -262,7 +264,7 @@ flowchart TD
 3. **MemTable 管理**：
    - 将记录写入当前可变 MemTable
    - 当 MemTable 达到大小时，封存为 immutable MemTable
-   - 记录该 immutable MemTable 对应的 WAL 编号 (`wal_log_number`)
+   - 若 WAL 编号 > 0，为该 immutable 绑定 `WalHandle`
 
 ## 8. 新 WAL 编号选择策略
 
@@ -387,7 +389,7 @@ flowchart TD
 
 | 配置选项 | 默认值 | 说明 | 崩溃保证 |
 |---------|--------|------|----------|
-| `wal_sync` | `false` | 是否每次写入后执行 fsync | `true`: 强持久性<br/>`false`: 依赖OS刷新 |
+| `wal_sync` | `true` | 是否等待 WAL flush + sync | `true`: 强持久性（可批量）<br/>`false`: 后台刷盘 |
 | `recover_from_wal` | `true` | 启动时是否尝试恢复 | `true`: 启用恢复机制 |
 
 ### 11.2 原子性保证
@@ -404,7 +406,7 @@ flowchart TD
 
 ### 12.1 已知限制
 1. **内存使用无硬上限**：损坏的 WAL/MANIFEST 文件可能导致 OOM（缺少最大长度检查）
-2. **Level 0 读取顺序**：未明确优先最新文件，可能影响读取正确性
+2. **WAL 回放单线程**：按文件顺序串行回放，未做并行化
 3. **压缩指针未持久化**：`compact_pointers` 字段在当前实现中未使用
 4. **恢复性能**：回放大量 WAL 记录时可能较慢，缺少批量优化
 

@@ -1,7 +1,9 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
+use std::{io, mem};
 
 use crate::goatkv::core::cleanup_worker::CleanupWorker;
 use crate::goatkv::core::flush_worker::{FlushTask, FlushWorker};
@@ -12,19 +14,90 @@ use crate::goatkv::core::wal_handle::WalHandle;
 use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
 use crate::goatkv::metadata::version_set::{VersionSet, VersionSetOptions};
 use crate::goatkv::storage::wal::WalPaths;
-use crate::goatkv::storage::wal::{replay_wal_file, WalReplayStats, WalWriter};
+use crate::goatkv::storage::wal::{replay_wal_file, WalManager, WalManagerConfig, WalReplayStats};
 use crate::goatkv::utils::cleanup_task::CleanupTask;
 use crate::goatkv::utils::options::KvEngineOptions;
 use crate::goatkv::utils::paths::{ManifestPaths, SstablePaths};
+use bytes::Bytes;
 use tracing::{error, warn};
 
 type DbPaths = (Arc<WalPaths>, Arc<SstablePaths>, Arc<ManifestPaths>);
+
+const MAX_WRITE_GROUP_OPS: usize = 4096;
+
+#[derive(Debug)]
+enum WriteOp {
+    Put(Vec<u8>, Vec<u8>),
+    Delete(Vec<u8>),
+}
+
+#[derive(Debug)]
+struct WriteRequest {
+    ops: Mutex<Vec<WriteOp>>,
+    ops_len: usize,
+    approx_bytes: usize,
+    result: Mutex<Option<Result<(), String>>>,
+    cv: Condvar,
+}
+
+impl WriteRequest {
+    fn new(ops: Vec<WriteOp>) -> Self {
+        let ops_len = ops.len();
+        let mut approx_bytes = 0usize;
+        for op in &ops {
+            match op {
+                WriteOp::Put(key, value) => {
+                    approx_bytes = approx_bytes.saturating_add(key.len() + value.len() + 20);
+                }
+                WriteOp::Delete(key) => {
+                    approx_bytes = approx_bytes.saturating_add(key.len() + 20);
+                }
+            }
+        }
+        Self {
+            ops: Mutex::new(ops),
+            ops_len,
+            approx_bytes,
+            result: Mutex::new(None),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn take_ops(&self) -> Vec<WriteOp> {
+        let mut guard = self.ops.lock().unwrap();
+        mem::take(&mut *guard)
+    }
+
+    fn complete(&self, result: Result<(), String>) {
+        let mut guard = self.result.lock().unwrap();
+        *guard = Some(result);
+        self.cv.notify_one();
+    }
+
+    fn wait(&self) -> io::Result<()> {
+        let mut guard = self.result.lock().unwrap();
+        while guard.is_none() {
+            guard = self.cv.wait(guard).unwrap();
+        }
+        match guard.take().unwrap() {
+            Ok(()) => Ok(()),
+            Err(msg) => Err(io::Error::other(msg)),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WriteState {
+    queue: VecDeque<Arc<WriteRequest>>,
+    leader_active: bool,
+    closed: bool,
+}
 
 /// LSM-Tree 键值存储引擎
 #[derive(Debug)]
 pub struct KvEngine {
     /// WAL 写入器，负责写前日志
-    wal_writer: Arc<Mutex<WalWriter>>,
+    wal_manager: Arc<WalManager>,
     /// 序列号生成器
     sequence_number: Arc<SequenceNumber>,
     /// 清理任务发送端
@@ -33,6 +106,10 @@ pub struct KvEngine {
     cleanup_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// LSM 状态管理器（memtables + current version）
     lsm_state: Arc<RwLock<LSMState>>,
+    /// 写入与 flush 的全局门闩，确保 WAL 与 memtable 边界一致
+    write_gate: RwLock<()>,
+    /// 写入队列与写组提交状态
+    write_state: Mutex<WriteState>,
     /// VersionSet 管理 manifest 与版本演进
     version_set: Arc<RwLock<VersionSet>>,
     /// 配置选项
@@ -148,6 +225,12 @@ impl KvEngine {
             )
         };
 
+        let min_log_number = {
+            let vs_guard = version_set.read().unwrap();
+            vs_guard.log_number()
+        };
+        Self::cleanup_obsolete_wals(&wal_paths, min_log_number);
+
         if wal_stats.truncated {
             warn!("WAL replay truncated due to corruption or partial record.");
         }
@@ -167,8 +250,16 @@ impl KvEngine {
         };
 
         let wal_path = wal_paths.wal_path_by_id(current_log_number);
-        let wal_writer = WalWriter::new(wal_path, options.wal_sync)
-            .map_err(|e| std::io::Error::other(format!("Failed to open WAL file: {}", e)))?;
+        let wal_manager = WalManager::new(
+            wal_path,
+            WalManagerConfig {
+                wal_sync: options.wal_sync,
+                sync_interval_ms: options.wal_sync_interval_ms,
+                sync_bytes: options.wal_sync_bytes,
+                max_buffer_bytes: options.wal_max_buffer_bytes,
+            },
+        )
+        .map_err(|e| std::io::Error::other(format!("Failed to open WAL manager: {}", e)))?;
 
         let last_sequence = {
             let vs_guard = version_set.read().unwrap();
@@ -179,12 +270,18 @@ impl KvEngine {
         let sequence_number = Arc::new(SequenceNumber::with_start(last_sequence + 1));
 
         let engine = Self {
-            wal_writer: Arc::new(Mutex::new(wal_writer)),
+            wal_manager: Arc::new(wal_manager),
             sequence_number,
             lsm_state: lsm_state.clone(),
             version_set: version_set.clone(),
             cleanup_sender: cleanup_sender.clone(),
             cleanup_enabled: cleanup_enabled.clone(),
+            write_gate: RwLock::new(()),
+            write_state: Mutex::new(WriteState {
+                queue: VecDeque::new(),
+                leader_active: false,
+                closed: false,
+            }),
             options: Arc::new(options),
             flush_worker: FlushWorker::new(
                 lsm_state.clone(),
@@ -343,6 +440,43 @@ impl KvEngine {
 
         Ok(wal_files)
     }
+
+    fn cleanup_obsolete_wals(wal_paths: &WalPaths, min_log_number: u64) {
+        if min_log_number == 0 {
+            return;
+        }
+        let wal_dir = wal_paths.wal_dir();
+        if !wal_dir.exists() {
+            return;
+        }
+        let entries = match std::fs::read_dir(wal_dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("wal") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Ok(number) = stem.parse::<u64>() else {
+                continue;
+            };
+            if number >= min_log_number {
+                continue;
+            }
+            if let Err(e) = std::fs::remove_file(&path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!("Failed to delete obsolete WAL {:?}: {}", path, e);
+                }
+            }
+        }
+    }
 }
 
 impl Drop for KvEngine {
@@ -411,59 +545,156 @@ impl KvEngine {
     }
 
     pub fn put(&self, key: Vec<u8>, value: Vec<u8>) {
-        // 构造InternalKey
-        let internal_key = InternalKey::new(key, self.sequence_number.next(), InternalKeyKind::Put);
-
-        // 先写入wal
-        self.wal_writer
-            .lock()
-            .unwrap()
-            .write(&internal_key, &value)
+        self.submit_write(vec![WriteOp::Put(key, value)])
             .expect("Failed to write to WAL");
+    }
 
-        // 再写入memtable
-        let needs_flush = {
-            let guard = self.lsm_state.read().unwrap();
-            guard.mem_table.put(internal_key, value.into());
-            guard.mem_table.should_flush()
-        };
-
-        // 判断memtable是否已达到容量限制，
-        // 达到容量限制则转换成immutable_mem_tables
-        if needs_flush {
-            self.flush();
+    pub fn put_batch(&self, entries: Vec<(Vec<u8>, Vec<u8>)>) {
+        if entries.is_empty() {
+            return;
         }
+        let ops = entries
+            .into_iter()
+            .map(|(key, value)| WriteOp::Put(key, value))
+            .collect();
+        self.submit_write(ops)
+            .expect("Failed to write batch to WAL");
     }
 
     pub fn delete(&self, key: Vec<u8>) {
-        // 先构造InternalKey
-        let internal_key =
-            InternalKey::new(key, self.sequence_number.next(), InternalKeyKind::Delete);
-
-        // 先写入wal
-        self.wal_writer
-            .lock()
-            .unwrap()
-            .write(&internal_key, &[][..])
+        self.submit_write(vec![WriteOp::Delete(key)])
             .expect("Failed to write to WAL");
+    }
 
-        // 再写入memtable
-        let needs_flush = {
-            let guard = self.lsm_state.read().unwrap();
-            guard.mem_table.put(internal_key, vec![].into());
-            guard.mem_table.should_flush()
-        };
+    fn submit_write(&self, ops: Vec<WriteOp>) -> io::Result<()> {
+        let request = Arc::new(WriteRequest::new(ops));
+        let mut is_leader = false;
+        {
+            let mut state = self.write_state.lock().unwrap();
+            if state.closed {
+                return Err(io::Error::other("write coordinator closed"));
+            }
+            state.queue.push_back(request.clone());
+            if !state.leader_active {
+                state.leader_active = true;
+                is_leader = true;
+            }
+        }
 
-        // 判断memtable是否已达到容量限制，
-        // 达到容量限制则转换成immutable_mem_tables
-        if needs_flush {
-            self.flush();
+        if is_leader {
+            self.process_write_groups();
+        }
+
+        request.wait()
+    }
+
+    fn process_write_groups(&self) {
+        loop {
+            let group = {
+                let mut state = self.write_state.lock().unwrap();
+                if state.queue.is_empty() {
+                    state.leader_active = false;
+                    return;
+                }
+                let max_ops = MAX_WRITE_GROUP_OPS;
+                let max_bytes = self.options.wal_max_buffer_bytes;
+                let mut group = Vec::new();
+                let mut ops_total = 0usize;
+                let mut bytes_total = 0usize;
+                while let Some(req) = state.queue.front() {
+                    let req_ops = req.ops_len;
+                    let req_bytes = req.approx_bytes;
+                    if group.is_empty()
+                        || (ops_total + req_ops <= max_ops && bytes_total + req_bytes <= max_bytes)
+                    {
+                        let req = state.queue.pop_front().unwrap();
+                        ops_total = ops_total.saturating_add(req_ops);
+                        bytes_total = bytes_total.saturating_add(req_bytes);
+                        group.push(req);
+                        continue;
+                    }
+                    break;
+                }
+                group
+            };
+
+            let result = self.apply_write_group(&group);
+            let result_msg = result.as_ref().err().map(|e| e.to_string());
+            for req in &group {
+                match &result_msg {
+                    Some(msg) => req.complete(Err(msg.clone())),
+                    None => req.complete(Ok(())),
+                }
+            }
+
+            if let Some(msg) = result_msg {
+                let remaining = {
+                    let mut state = self.write_state.lock().unwrap();
+                    state.closed = true;
+                    let drained = state.queue.drain(..).collect::<Vec<_>>();
+                    state.leader_active = false;
+                    drained
+                };
+                for req in remaining {
+                    req.complete(Err(msg.clone()));
+                }
+                return;
+            }
         }
     }
 
+    fn apply_write_group(&self, group: &[Arc<WriteRequest>]) -> io::Result<()> {
+        let _gate = self.write_gate.read().unwrap();
+
+        let mut ops_groups = Vec::with_capacity(group.len());
+        let mut total_ops = 0u64;
+        for req in group {
+            let ops = req.take_ops();
+            total_ops += ops.len() as u64;
+            ops_groups.push(ops);
+        }
+        if total_ops == 0 {
+            return Ok(());
+        }
+
+        let mut records = Vec::with_capacity(total_ops as usize);
+        let mut seq = self.sequence_number.allocate_range(total_ops);
+        for ops in ops_groups {
+            for op in ops {
+                match op {
+                    WriteOp::Put(key, value) => {
+                        let internal_key = InternalKey::new(key, seq, InternalKeyKind::Put);
+                        records.push((internal_key, Bytes::from(value)));
+                    }
+                    WriteOp::Delete(key) => {
+                        let internal_key = InternalKey::new(key, seq, InternalKeyKind::Delete);
+                        records.push((internal_key, Bytes::new()));
+                    }
+                }
+                seq = seq.saturating_add(1);
+            }
+        }
+
+        self.wal_manager.append_batch(&records)?;
+
+        let needs_flush = {
+            let guard = self.lsm_state.read().unwrap();
+            for (internal_key, value) in records {
+                guard.mem_table.put(internal_key, value);
+            }
+            guard.mem_table.should_flush()
+        };
+        drop(_gate);
+
+        if needs_flush {
+            self.flush();
+        }
+        Ok(())
+    }
+
     pub fn flush(&self) {
+        let _gate = self.write_gate.write().unwrap();
         let (immutable_mem_table, new_log_number, rotation_succeeded) = {
-            let mut wal_guard = self.wal_writer.lock().unwrap();
             let candidate_log_number = {
                 let vs = self.version_set.read().unwrap();
                 let vs_next = vs.log_number().saturating_add(1);
@@ -475,20 +706,18 @@ impl KvEngine {
             };
             let old_log_number = self.current_log_number.load(Ordering::SeqCst);
             let new_wal_path = self.wal_paths.wal_path_by_id(candidate_log_number);
-            let (new_log_number, rotation_succeeded) =
-                match WalWriter::new(new_wal_path, self.options.wal_sync) {
-                    Ok(new_manager) => {
-                        *wal_guard = new_manager;
-                        let new_log_number = candidate_log_number;
-                        self.current_log_number
-                            .store(new_log_number, Ordering::SeqCst);
-                        (new_log_number, true)
-                    }
-                    Err(e) => {
-                        error!("Failed to rotate WAL: {}", e);
-                        (old_log_number, false)
-                    }
-                };
+            let (new_log_number, rotation_succeeded) = match self.wal_manager.rotate(new_wal_path) {
+                Ok(()) => {
+                    let new_log_number = candidate_log_number;
+                    self.current_log_number
+                        .store(new_log_number, Ordering::SeqCst);
+                    (new_log_number, true)
+                }
+                Err(e) => {
+                    error!("Failed to rotate WAL: {}", e);
+                    (old_log_number, false)
+                }
+            };
             let wal_handle = if rotation_succeeded && old_log_number > 0 {
                 Some(Arc::new(WalHandle::new(
                     old_log_number,

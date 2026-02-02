@@ -125,6 +125,13 @@ impl BlockBuilder {
             unshared = key.len() as u32 - shared;
         }
 
+        let entry_reserve = Self::varint_len(shared as u64)
+            + Self::varint_len(unshared as u64)
+            + Self::varint_len(value.len() as u64)
+            + unshared as usize
+            + value.len();
+        self.buffer.reserve(entry_reserve);
+
         // 编码条目数据到buffer
         // 格式：[shared(varint)][unshared(varint)][value_len(varint)][key_non_shared][value]
         coding::put_varint64(&mut self.buffer, shared as u64);
@@ -148,8 +155,9 @@ impl BlockBuilder {
                 .extend_from_slice(&(self.buffer.len() as u32).to_le_bytes());
         }
 
-        // 保存当前key作为下一次计算的基准
-        self.last_key = key.to_vec();
+        // 保存当前key作为下一次计算的基准，复用缓冲区减少分配
+        self.last_key.clear();
+        self.last_key.extend_from_slice(key);
     }
 
     /// 完成当前Block的构建，返回编码后的数据和最后一个key
@@ -231,6 +239,15 @@ impl BlockBuilder {
         }
 
         shared
+    }
+
+    fn varint_len(mut value: u64) -> usize {
+        let mut len = 1;
+        while value >= 0x80 {
+            value >>= 7;
+            len += 1;
+        }
+        len
     }
 
     /// 获取当前buffer的长度

@@ -3,12 +3,14 @@ mod format;
 // WalPaths moved to utils/paths.rs
 mod reader;
 mod recovery;
+mod wal_manager;
 mod writer;
 
 pub use crate::goatkv::utils::paths::WalPaths;
 pub use error::{WalError, WalResult};
 pub use reader::WalReader;
 pub use recovery::{replay_wal_file, WalReplayStats};
+pub use wal_manager::{WalManager, WalManagerConfig};
 pub use writer::WalWriter;
 
 #[cfg(test)]
