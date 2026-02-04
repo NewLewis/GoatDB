@@ -73,6 +73,18 @@ pub struct KvEngineOptions {
     /// LSM 层级数量
     /// Default: 7
     pub num_levels: usize,
+
+    /// Level 0 文件数触发压缩阈值
+    /// Default: 4
+    pub level0_file_num_compaction_trigger: usize,
+
+    /// Level 基础大小（Level 1）
+    /// Default: 4MB
+    pub level_base_size_bytes: u64,
+
+    /// 每层大小倍增系数
+    /// Default: 10
+    pub level_size_multiplier: u64,
 }
 
 impl Default for KvEngineOptions {
@@ -93,6 +105,9 @@ impl Default for KvEngineOptions {
             manifest_max_size: 32 * 1024 * 1024, // 32MB
             manifest_rewrite_edit_count: 10000,
             num_levels: 7,
+            level0_file_num_compaction_trigger: 4,
+            level_base_size_bytes: 4 * 1024 * 1024,
+            level_size_multiplier: 10,
         }
     }
 }
@@ -169,6 +184,24 @@ impl KvEngineOptions {
         self
     }
 
+    /// Sets the Level 0 file count compaction trigger
+    pub fn with_level0_file_num_compaction_trigger(mut self, trigger: usize) -> Self {
+        self.level0_file_num_compaction_trigger = trigger;
+        self
+    }
+
+    /// Sets the base level size in bytes
+    pub fn with_level_base_size_bytes(mut self, bytes: u64) -> Self {
+        self.level_base_size_bytes = bytes;
+        self
+    }
+
+    /// Sets the level size multiplier
+    pub fn with_level_size_multiplier(mut self, multiplier: u64) -> Self {
+        self.level_size_multiplier = multiplier;
+        self
+    }
+
     /// Creates options suitable for testing
     ///
     /// This creates a KvEngineOptions with a temporary data directory
@@ -202,6 +235,9 @@ impl KvEngineOptions {
             manifest_max_size: 32 * 1024 * 1024, // 32MB
             manifest_rewrite_edit_count: 10000,
             num_levels: 7,
+            level0_file_num_compaction_trigger: 4,
+            level_base_size_bytes: 4 * 1024 * 1024,
+            level_size_multiplier: 10,
         }
     }
 }

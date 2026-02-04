@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
@@ -84,6 +85,7 @@ pub struct VersionSet {
     /// - 删除由后台异步执行，避免阻塞写路径；
     /// - 读路径可能仍持有旧版本，延迟删除避免读到缺失文件。
     obsolete_sender: Sender<CleanupTask>,
+    cleanup_enabled: Arc<AtomicBool>,
 
     // ---------------- 环境配置 ----------------
     manifest_paths: Arc<ManifestPaths>,
@@ -135,9 +137,16 @@ impl VersionSet {
         manifest_paths: Arc<ManifestPaths>,
         sstable_paths: Arc<SstablePaths>,
         obsolete_sender: Sender<CleanupTask>,
+        cleanup_enabled: Arc<AtomicBool>,
     ) -> Result<Self, std::io::Error> {
         let options = VersionSetOptions::default();
-        Self::new_with_options(manifest_paths, sstable_paths, options, obsolete_sender)
+        Self::new_with_options(
+            manifest_paths,
+            sstable_paths,
+            options,
+            obsolete_sender,
+            cleanup_enabled,
+        )
     }
 
     /// 使用指定选项创建 VersionSet
@@ -146,6 +155,7 @@ impl VersionSet {
         sstable_paths: Arc<SstablePaths>,
         options: VersionSetOptions,
         obsolete_sender: Sender<CleanupTask>,
+        cleanup_enabled: Arc<AtomicBool>,
     ) -> Result<Self, std::io::Error> {
         // 创建空的当前版本：没有任何 SSTable
         let current = Arc::new(Version::new(options.num_levels, sstable_paths.clone()));
@@ -159,6 +169,7 @@ impl VersionSet {
             next_file_number: 1,
             last_sequence: 0,
             obsolete_sender,
+            cleanup_enabled,
             manifest_paths,
             sstable_paths,
             options: Arc::new(options),
@@ -171,14 +182,20 @@ impl VersionSet {
         sstable_paths: Arc<SstablePaths>,
         options: VersionSetOptions,
         obsolete_sender: Sender<CleanupTask>,
+        cleanup_enabled: Arc<AtomicBool>,
     ) -> Result<Self, std::io::Error> {
         // 先创建空 VersionSet，再通过 MANIFEST 恢复到最新状态
         //
         // 设计理由：
         // - 统一恢复入口，避免分散在多个模块；
         // - 通过 replay edits 复原 current，保证与历史行为一致。
-        let mut version_set =
-            Self::new_with_options(manifest_paths, sstable_paths, options, obsolete_sender)?;
+        let mut version_set = Self::new_with_options(
+            manifest_paths,
+            sstable_paths,
+            options,
+            obsolete_sender,
+            cleanup_enabled,
+        )?;
         version_set.recover_manifest()?;
         // 恢复后做一致性校验，避免使用损坏或不完整的元数据
         version_set.validate_recovery()?;
@@ -635,6 +652,7 @@ impl VersionSet {
             new_files[*level].push(Arc::new(FileMetadata::from_new_file(
                 new_file.clone(),
                 self.obsolete_sender.clone(),
+                self.cleanup_enabled.clone(),
             )));
         }
 
@@ -694,6 +712,7 @@ impl VersionSet {
             files[level].push(Arc::new(FileMetadata::from_new_file(
                 new_file,
                 self.obsolete_sender.clone(),
+                self.cleanup_enabled.clone(),
             )));
         }
 

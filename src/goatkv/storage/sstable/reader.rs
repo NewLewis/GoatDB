@@ -383,6 +383,26 @@ impl SSTableReader {
     pub fn index_entry_count(&self) -> usize {
         self.index_entries.len()
     }
+
+    /// Iterate all entries in the SSTable in key order.
+    pub fn iter_all(&mut self) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut entries = Vec::new();
+        for entry in &self.index_entries {
+            self.file.seek(SeekFrom::Start(entry.block_offset))?;
+            let mut block_data = vec![0u8; entry.block_size as usize];
+            self.file.read_exact(&mut block_data)?;
+            let block_reader = BlockReader::new(&block_data).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Failed to parse data block: {}", e),
+                )
+            })?;
+            for (key, value) in block_reader.iter() {
+                entries.push((key, value));
+            }
+        }
+        Ok(entries)
+    }
 }
 
 #[cfg(test)]
@@ -568,6 +588,14 @@ mod tests {
         // 对不存在的key可能返回true或false（允许误报）
         // 我们只验证方法调用不会panic
         let _ = reader.may_contain(b"nonexistent");
+    }
+
+    #[test]
+    fn test_sstable_reader_iter_all() {
+        let (_temp_dir, sst_path) = create_test_sstable();
+        let mut reader = SSTableReader::open(&sst_path).unwrap();
+        let entries = reader.iter_all().unwrap();
+        assert!(!entries.is_empty());
     }
 
     #[test]
