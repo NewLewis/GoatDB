@@ -1,6 +1,7 @@
 use std::sync::{mpsc, Arc, RwLock};
 use std::thread;
 
+use crate::goatkv::core::compaction_worker::{CompactionTask, CompactionWorker};
 use crate::goatkv::core::lsm_state::LSMState;
 use crate::goatkv::core::mem_table::ImmutableMemTable;
 use crate::goatkv::metadata::version_edit::{NewFile, VersionEdit};
@@ -40,11 +41,12 @@ impl FlushWorker {
         lsm_state: Arc<RwLock<LSMState>>,
         version_set: Arc<RwLock<VersionSet>>,
         sstable_paths: Arc<SstablePaths>,
+        compaction_worker: Arc<CompactionWorker>,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
 
         let handle = thread::spawn(move || {
-            Self::run_loop(rx, lsm_state, version_set, sstable_paths);
+            Self::run_loop(rx, lsm_state, version_set, sstable_paths, compaction_worker);
         });
 
         Self {
@@ -77,6 +79,7 @@ impl FlushWorker {
         lsm_state: Arc<RwLock<LSMState>>,
         version_set: Arc<RwLock<VersionSet>>,
         sstable_paths: Arc<SstablePaths>,
+        compaction_worker: Arc<CompactionWorker>,
     ) {
         while let Ok(task) = rx.recv() {
             // 从任务中获取要刷盘的 immutable memtable
@@ -112,6 +115,7 @@ impl FlushWorker {
                     lsm_state_guard.version = current_version;
                     lsm_state_guard.immutable_mem_tables.pop_front();
                 }
+                let _ = compaction_worker.submit_task(CompactionTask::Maybe);
                 continue;
             }
 
@@ -182,6 +186,7 @@ impl FlushWorker {
                 lsm_state_guard.version = current_version;
                 lsm_state_guard.immutable_mem_tables.pop_front();
             }
+            let _ = compaction_worker.submit_task(CompactionTask::Maybe);
         }
     }
 }

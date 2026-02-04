@@ -192,9 +192,13 @@ impl Version {
 
     /// 检查是否需要压缩
     /// 简单实现：如果 Level 0 文件数超过 4，或者其他层超过目标大小
-    pub fn needs_compaction(&self, level_targets: &[u64]) -> bool {
+    pub fn needs_compaction(
+        &self,
+        level_targets: &[u64],
+        level0_file_num_compaction_trigger: usize,
+    ) -> bool {
         // Level 0: 检查文件数量
-        if self.files[0].len() > 4 {
+        if self.files[0].len() > level0_file_num_compaction_trigger {
             return true;
         }
 

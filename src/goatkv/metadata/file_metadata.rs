@@ -1,4 +1,6 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 
 use crate::goatkv::metadata::version_edit::NewFile;
 use crate::goatkv::utils::cleanup_task::CleanupTask;
@@ -40,6 +42,7 @@ pub struct FileMetadata {
     pub file_id: u64,
     pub props: TableProperties,
     pub obsolete_sender: Sender<CleanupTask>,
+    pub cleanup_enabled: Arc<AtomicBool>,
 }
 
 impl FileMetadata {
@@ -47,19 +50,26 @@ impl FileMetadata {
         file_id: u64,
         props: TableProperties,
         obsolete_sender: Sender<CleanupTask>,
+        cleanup_enabled: Arc<AtomicBool>,
     ) -> Self {
         FileMetadata {
             file_id,
             props,
             obsolete_sender,
+            cleanup_enabled,
         }
     }
 
-    pub fn from_new_file(new_file: NewFile, obsolete_sender: Sender<CleanupTask>) -> Self {
+    pub fn from_new_file(
+        new_file: NewFile,
+        obsolete_sender: Sender<CleanupTask>,
+        cleanup_enabled: Arc<AtomicBool>,
+    ) -> Self {
         FileMetadata {
             file_id: new_file.file_id,
             props: new_file.props,
             obsolete_sender,
+            cleanup_enabled,
         }
     }
 
@@ -90,7 +100,18 @@ impl From<FileMetadata> for NewFile {
     fn from(metadata: FileMetadata) -> Self {
         NewFile {
             file_id: metadata.file_id,
-            props: metadata.props,
+            props: metadata.props.clone(),
         }
+    }
+}
+
+impl Drop for FileMetadata {
+    fn drop(&mut self) {
+        if !self.cleanup_enabled.load(Ordering::SeqCst) {
+            return;
+        }
+        let _ = self
+            .obsolete_sender
+            .send(CleanupTask::Sstable(self.file_id));
     }
 }

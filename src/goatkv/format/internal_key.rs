@@ -126,6 +126,20 @@ impl InternalKey {
         }
     }
 
+    /// Parse an InternalKey from serialized bytes (user_key + inverted encoded seq).
+    pub fn parse_from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < 8 {
+            return None;
+        }
+        let split = data.len() - 8;
+        let user_key = data[..split].to_vec();
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&data[split..]);
+        let inverted = u64::from_be_bytes(buf);
+        let encoded = !inverted;
+        Some(Self::from_encoded(user_key, encoded))
+    }
+
     /// Get the user key.
     pub fn user_key(&self) -> &[u8] {
         &self.user_key
@@ -302,5 +316,17 @@ mod tests {
 
         let empty_key = InternalKey::new(vec![], 456, InternalKeyKind::Delete);
         assert_eq!(empty_key.serialized_size(), 8);
+    }
+
+    #[test]
+    fn test_parse_from_bytes_roundtrip() {
+        let key = InternalKey::new(b"roundtrip".to_vec(), 42, InternalKeyKind::Put);
+        let serialized = key.serialize();
+        let parsed = InternalKey::parse_from_bytes(&serialized).expect("parse failed");
+        assert_eq!(parsed.user_key(), key.user_key());
+        assert_eq!(
+            parsed.encoded_sequence_number(),
+            key.encoded_sequence_number()
+        );
     }
 }

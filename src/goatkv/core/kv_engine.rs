@@ -6,6 +6,7 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
 use std::{io, mem};
 
 use crate::goatkv::core::cleanup_worker::CleanupWorker;
+use crate::goatkv::core::compaction_worker::CompactionWorker;
 use crate::goatkv::core::flush_worker::{FlushTask, FlushWorker};
 use crate::goatkv::core::lsm_state::{ImmutableMemTableEntry, LSMState};
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
@@ -122,6 +123,9 @@ pub struct KvEngine {
     manifest_paths: Arc<ManifestPaths>,
     /// 后台刷盘 Worker
     flush_worker: FlushWorker,
+    /// 后台压缩 Worker
+    #[allow(dead_code)] // 持有以保持压缩线程存活
+    compaction_worker: Arc<CompactionWorker>,
     /// 后台清理 Worker
     #[allow(dead_code)] // 持有以保持清理线程存活
     cleanup_worker: CleanupWorker,
@@ -173,6 +177,7 @@ impl KvEngine {
     /// - `Err(std::io::Error)`: 创建目录或初始化失败
     pub fn new_with_options(options: KvEngineOptions) -> Result<Self, std::io::Error> {
         let (wal_paths, sstable_paths, manifest_paths) = Self::init_db_paths(&options.data_dir)?;
+        let options = Arc::new(options);
         let _ = sstable_paths.cleanup_tmp_dir();
 
         let (cleanup_worker, cleanup_sender) =
@@ -182,12 +187,13 @@ impl KvEngine {
         let mem_table = Arc::new(MemTable::new(options.mem_table_size));
 
         // 创建 VersionSet 并获取当前版本快照
-        let vs_options = VersionSetOptions::from(&options);
+        let vs_options = VersionSetOptions::from(options.as_ref());
         let version_set = VersionSet::open(
             manifest_paths.clone(),
             sstable_paths.clone(),
             vs_options,
             cleanup_sender.clone(),
+            cleanup_enabled.clone(),
         )?;
         let version_set = Arc::new(RwLock::new(version_set));
         let current_version = {
@@ -269,6 +275,13 @@ impl KvEngine {
         // 创建序列号生成器（从最后序列号继续）
         let sequence_number = Arc::new(SequenceNumber::with_start(last_sequence + 1));
 
+        let compaction_worker = Arc::new(CompactionWorker::new(
+            lsm_state.clone(),
+            version_set.clone(),
+            sstable_paths.clone(),
+            options.clone(),
+        ));
+
         let engine = Self {
             wal_manager: Arc::new(wal_manager),
             sequence_number,
@@ -282,11 +295,13 @@ impl KvEngine {
                 leader_active: false,
                 closed: false,
             }),
-            options: Arc::new(options),
+            options: options.clone(),
+            compaction_worker: compaction_worker.clone(),
             flush_worker: FlushWorker::new(
                 lsm_state.clone(),
                 version_set.clone(),
                 sstable_paths.clone(),
+                compaction_worker,
             ),
             cleanup_worker,
             current_log_number: AtomicU64::new(current_log_number),
