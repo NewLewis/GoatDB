@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -544,6 +544,76 @@ impl KvEngine {
         None
     }
 
+    pub fn range_get(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        if start >= end {
+            return Vec::new();
+        }
+
+        let (mem_table, immutable_mem_tables, version) = {
+            let lsm_state = self.lsm_state.read().unwrap();
+            let mem_table = lsm_state.mem_table.clone();
+            let immutable_mem_tables = lsm_state.immutable_mem_tables.clone();
+            let version = lsm_state.version.clone();
+            (mem_table, immutable_mem_tables, version)
+        };
+
+        struct LatestEntry {
+            seq: u64,
+            kind: InternalKeyKind,
+            value: Option<Vec<u8>>,
+        }
+
+        let mut latest: BTreeMap<Vec<u8>, LatestEntry> = BTreeMap::new();
+
+        let mut update = |internal_key: InternalKey, value: Vec<u8>| {
+            let user_key = internal_key.user_key().to_vec();
+            if user_key < start || user_key >= end {
+                return;
+            }
+            let seq = internal_key.sequence_number();
+            let kind = internal_key.kind();
+            let should_replace = match latest.get(&user_key) {
+                None => true,
+                Some(existing) => {
+                    seq > existing.seq
+                        || (seq == existing.seq
+                            && kind == InternalKeyKind::Delete
+                            && existing.kind != InternalKeyKind::Delete)
+                }
+            };
+            if should_replace {
+                let value = match kind {
+                    InternalKeyKind::Put => Some(value),
+                    InternalKeyKind::Delete => None,
+                };
+                latest.insert(user_key, LatestEntry { seq, kind, value });
+            }
+        };
+
+        for (internal_key, value) in mem_table.range(start, end) {
+            update(internal_key, value.to_vec());
+        }
+
+        for entry in immutable_mem_tables.iter().rev() {
+            for (internal_key, value) in entry.table.range(start, end) {
+                update(internal_key, value.to_vec());
+            }
+        }
+
+        for (internal_key, value) in version.range(start, end) {
+            update(internal_key, value);
+        }
+
+        let mut results = Vec::new();
+        for (key, entry) in latest {
+            if let Some(value) = entry.value {
+                results.push((key, value));
+            }
+        }
+
+        results
+    }
+
     pub fn put(&self, key: Vec<u8>, value: Vec<u8>) {
         self.submit_write(vec![WriteOp::Put(key, value)])
             .expect("Failed to write to WAL");
@@ -841,6 +911,29 @@ mod tests {
         assert_eq!(engine.get(b"key1"), None);
         assert_eq!(engine.get(b"key2"), Some(b"updated_value2".to_vec()));
         assert_eq!(engine.get(b"key3"), Some(b"value3".to_vec()));
+    }
+
+    #[test]
+    fn test_range_get() {
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"apple".to_vec(), b"value1".to_vec());
+        engine.put(b"banana".to_vec(), b"value2".to_vec());
+        engine.put(b"carrot".to_vec(), b"value3".to_vec());
+        engine.put(b"banana".to_vec(), b"value2_updated".to_vec());
+        engine.delete(b"carrot".to_vec());
+
+        let results = engine.range_get(b"apple", b"carrot");
+        assert_eq!(
+            results,
+            vec![
+                (b"apple".to_vec(), b"value1".to_vec()),
+                (b"banana".to_vec(), b"value2_updated".to_vec()),
+            ]
+        );
+
+        let empty_results = engine.range_get(b"banana", b"banana");
+        assert!(empty_results.is_empty());
     }
 
     #[test]

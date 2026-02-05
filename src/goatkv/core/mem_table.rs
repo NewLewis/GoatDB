@@ -2,7 +2,7 @@ use bytes::Bytes;
 use ouroboros::self_referencing;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
-use crate::goatkv::core::skip_list::{Iter, SkipList};
+use crate::goatkv::core::skip_list::{Iter, RangeIter, SkipList};
 use crate::goatkv::format::internal_key::InternalKey;
 
 // ==================== LSM MemTable 封装 ====================
@@ -59,6 +59,24 @@ impl MemTableInner {
         .build()
     }
 
+    pub fn range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+    ) -> impl Iterator<Item = (InternalKey, Bytes)> + '_ {
+        let start_key = InternalKey::new_separator(start.to_vec());
+        let end_key = InternalKey::new_separator(end.to_vec());
+        let guard = self.skiplist.read().unwrap();
+
+        MemTableRangeIterBuilder {
+            start: start_key,
+            end: end_key,
+            guard,
+            iter_builder: |guard, start, end| guard.range(start, end),
+        }
+        .build()
+    }
+
     /// 是否需要 flush 到 immutable memtable
     pub fn should_flush(&self) -> bool {
         self.skiplist.read().unwrap().memory_usage() >= self.size_limit
@@ -86,6 +104,24 @@ struct MemTableIter<'a> {
 }
 
 impl<'a> Iterator for MemTableIter<'a> {
+    type Item = (InternalKey, Bytes);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.with_iter_mut(|iter| iter.next())
+    }
+}
+
+#[self_referencing]
+struct MemTableRangeIter<'a> {
+    start: InternalKey,
+    end: InternalKey,
+    guard: RwLockReadGuard<'a, SkipList<InternalKey>>,
+    #[borrows(guard, start, end)]
+    #[covariant]
+    iter: RangeIter<'this, InternalKey>,
+}
+
+impl<'a> Iterator for MemTableRangeIter<'a> {
     type Item = (InternalKey, Bytes);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -141,6 +177,14 @@ impl MemTable {
     pub fn inner(&self) -> Arc<MemTableInner> {
         self.inner.clone()
     }
+
+    pub fn range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+    ) -> impl Iterator<Item = (InternalKey, Bytes)> + '_ {
+        self.inner.range(start, end)
+    }
 }
 
 #[derive(Debug)]
@@ -173,6 +217,14 @@ impl ImmutableMemTable {
 
     pub fn iter(&self) -> impl Iterator<Item = (InternalKey, Bytes)> + '_ {
         self.inner.iter()
+    }
+
+    pub fn range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+    ) -> impl Iterator<Item = (InternalKey, Bytes)> + '_ {
+        self.inner.range(start, end)
     }
 }
 
