@@ -103,6 +103,13 @@ enum Commands {
         /// 键
         key: String,
     },
+    /// 扫描范围内的键值对
+    Scan {
+        /// 起始键（包含）
+        start_key: String,
+        /// 结束键（不包含）
+        end_key: String,
+    },
     /// 手动触发 flush
     Flush,
 }
@@ -113,7 +120,9 @@ async fn run_interactive(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("GoatDB Interactive Client");
     println!("Connected to server successfully!");
-    println!("Commands: put <key> <value>, get <key>, update <key> <value>, delete <key>, exit");
+    println!(
+        "Commands: put <key> <value>, get <key>, update <key> <value>, delete <key>, scan <start> <end>, exit"
+    );
     println!("Use Tab for auto-completion, ↑↓ for history, Ctrl+C to exit");
 
     let mut rl = DefaultEditor::new()?;
@@ -159,6 +168,7 @@ async fn run_interactive(
                             "get" => handle_get(&mut client, &args_refs[1..]).await,
                             "update" => handle_update(&mut client, &args_refs[1..]).await,
                             "delete" => handle_delete(&mut client, &args_refs[1..]).await,
+                            "scan" => handle_scan(&mut client, &args_refs[1..]).await,
                             "flush" => handle_flush(&mut client).await,
                             _ => {
                                 println!(
@@ -202,6 +212,7 @@ fn print_help() {
     println!("  get <key>           - Get the value of a key");
     println!("  update <key> <value> - Update an existing key's value");
     println!("  delete <key>        - Delete a key-value pair");
+    println!("  scan <start> <end>  - Scan keys in [start, end)");
     println!("  flush               - Manually trigger flush");
     println!("  exit, quit, :q      - Exit the client");
     println!("  help, :help         - Show this help message");
@@ -210,6 +221,7 @@ fn print_help() {
     println!("  put \"key with spaces\" \"value with spaces\"");
     println!("  get my_key");
     println!("  delete \"key with spaces\"");
+    println!("  scan apple carrot");
     println!("  flush");
 }
 
@@ -329,6 +341,40 @@ async fn handle_flush(
     Ok(())
 }
 
+/// 处理 scan 命令
+async fn handle_scan(
+    client: &mut GoatKvServiceClient<Channel>,
+    args: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if args.len() < 2 {
+        return Err("Usage: scan <start_key> <end_key>".into());
+    }
+
+    let start_key = args[0].as_bytes().to_vec();
+    let end_key = args[1].as_bytes().to_vec();
+
+    let request = tonic::Request::new(goatkv::ScanRequest { start_key, end_key });
+    let response = client.scan(request).await?;
+    let resp_data = response.into_inner();
+
+    if resp_data.success {
+        println!("✓ Success: {}", resp_data.message);
+        if resp_data.entries.is_empty() {
+            println!("(empty)");
+        } else {
+            for entry in resp_data.entries {
+                let key = String::from_utf8_lossy(&entry.key);
+                let value = String::from_utf8_lossy(&entry.value);
+                println!("{} = {}", key, value);
+            }
+        }
+    } else {
+        println!("✗ Failed: {}", resp_data.message);
+    }
+
+    Ok(())
+}
+
 /// 执行单次命令
 async fn execute_command(
     mut client: GoatKvServiceClient<Channel>,
@@ -350,6 +396,10 @@ async fn execute_command(
         Commands::Delete { key } => {
             let args = vec![key.as_str()];
             handle_delete(&mut client, &args).await
+        }
+        Commands::Scan { start_key, end_key } => {
+            let args = vec![start_key.as_str(), end_key.as_str()];
+            handle_scan(&mut client, &args).await
         }
         Commands::Flush => handle_flush(&mut client).await,
     }

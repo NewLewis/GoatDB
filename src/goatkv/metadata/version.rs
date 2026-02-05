@@ -112,6 +112,40 @@ impl Version {
         None
     }
 
+    pub fn range(&self, start: &[u8], end: &[u8]) -> Vec<(InternalKey, Vec<u8>)> {
+        if start >= end {
+            return Vec::new();
+        }
+
+        let mut entries = Vec::new();
+
+        for level_files in &self.files {
+            for file in level_files {
+                if start >= file.largest_user_key() || end <= file.smallest_user_key() {
+                    continue;
+                }
+
+                let sstable_path = self.sstable_paths.sstable_path_by_id(file.file_id);
+                match SSTableReader::open(&sstable_path) {
+                    Ok(mut reader) => match reader.scan_range(start, end) {
+                        Ok(mut data) => entries.append(&mut data),
+                        Err(e) => {
+                            warn!(
+                                "Failed to read range from sstable {:?}: {}",
+                                sstable_path, e
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Failed to open sstable {:?}: {}", sstable_path, e);
+                    }
+                }
+            }
+        }
+
+        entries
+    }
+
     /// 在指定层级（非 Level 0）中查找包含 key 的文件
     /// 使用二分查找，因为该层级的文件按键有序且不重叠
     fn search_level(&self, level: usize, key: &[u8]) -> Option<Arc<FileMetadata>> {

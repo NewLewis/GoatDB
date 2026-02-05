@@ -296,37 +296,17 @@ impl SSTableReader {
 
         // Iterate block looking for UserKey match
         for (k, v) in block_reader.iter() {
-            // k is InternalKey bytes.
-            if k.len() < 8 {
+            let Some(internal_key) = Self::decode_internal_key(&k) else {
                 continue;
-            }
-            let user_key_part = &k[..k.len() - 8];
+            };
+            let user_key_part = internal_key.user_key();
 
-            // Compare User Key
             match user_key_part.cmp(key) {
                 Ordering::Less => continue, // Keep looking
                 Ordering::Equal => {
                     // Found match! First match is newest version.
                     // Check kind
-                    let be_bytes = [
-                        k[k.len() - 8],
-                        k[k.len() - 7],
-                        k[k.len() - 6],
-                        k[k.len() - 5],
-                        k[k.len() - 4],
-                        k[k.len() - 3],
-                        k[k.len() - 2],
-                        k[k.len() - 1],
-                    ];
-                    // 1. Decode Big Endian
-                    let inverted_seq = u64::from_be_bytes(be_bytes);
-                    // 2. Invert back to get real encoded seq
-                    let encoded_seq = !inverted_seq;
-
-                    return Ok(Some((
-                        InternalKey::from_encoded(user_key_part.to_vec(), encoded_seq),
-                        v,
-                    )));
+                    return Ok(Some((internal_key, v)));
                 }
                 Ordering::Greater => {
                     // Moved past target user key
@@ -336,6 +316,70 @@ impl SSTableReader {
         }
 
         Ok(None)
+    }
+
+    pub fn scan_range(
+        &mut self,
+        start: &[u8],
+        end: &[u8],
+    ) -> io::Result<Vec<(InternalKey, Vec<u8>)>> {
+        if start >= end {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::new();
+        let mut should_stop = false;
+
+        for entry in &self.index_entries {
+            if should_stop {
+                break;
+            }
+
+            self.file.seek(SeekFrom::Start(entry.block_offset))?;
+            let mut block_data = vec![0u8; entry.block_size as usize];
+            self.file.read_exact(&mut block_data)?;
+
+            let block_reader = match BlockReader::new(&block_data) {
+                Ok(reader) => reader,
+                Err(e) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Failed to parse data block: {}", e),
+                    ));
+                }
+            };
+
+            for (k, v) in block_reader.iter() {
+                let Some(internal_key) = Self::decode_internal_key(&k) else {
+                    continue;
+                };
+                let user_key = internal_key.user_key();
+                if user_key < start {
+                    continue;
+                }
+                if user_key >= end {
+                    should_stop = true;
+                    break;
+                }
+                results.push((internal_key, v));
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn decode_internal_key(raw_key: &[u8]) -> Option<InternalKey> {
+        if raw_key.len() < 8 {
+            return None;
+        }
+        let user_key_part = &raw_key[..raw_key.len() - 8];
+        let be_bytes = raw_key[raw_key.len() - 8..].try_into().ok()?;
+        let inverted_seq = u64::from_be_bytes(be_bytes);
+        let encoded_seq = !inverted_seq;
+        Some(InternalKey::from_encoded(
+            user_key_part.to_vec(),
+            encoded_seq,
+        ))
     }
 
     /// 查找包含指定 key 的数据块

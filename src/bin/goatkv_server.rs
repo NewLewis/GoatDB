@@ -5,8 +5,8 @@ use goat_db::goatkv::core::kv_engine::KvEngine;
 use goat_db::goatkv::utils::{init_logging, KvEngineOptions};
 use goatkv::{
     goat_kv_service_server::{GoatKvService, GoatKvServiceServer},
-    DeleteRequest, DeleteResponse, FlushRequest, FlushResponse, GetRequest, GetResponse,
-    UpdateRequest, UpdateResponse, WriteRequest, WriteResponse,
+    DeleteRequest, DeleteResponse, FlushRequest, FlushResponse, GetRequest, GetResponse, KeyValue,
+    ScanRequest, ScanResponse, UpdateRequest, UpdateResponse, WriteRequest, WriteResponse,
 };
 use tonic::{transport::Server, Request, Response, Status};
 use tracing::{debug, info};
@@ -163,6 +163,37 @@ impl GoatKvService for GoatKVServiceImpl {
         let reply = FlushResponse {
             success: true,
             message: "Flush triggered successfully".to_string(),
+        };
+
+        Ok(Response::new(reply))
+    }
+
+    async fn scan(&self, request: Request<ScanRequest>) -> Result<Response<ScanResponse>, Status> {
+        let req = request.into_inner();
+
+        debug!(
+            "Received scan request - start_len: {}, end_len: {}",
+            req.start_key.len(),
+            req.end_key.len()
+        );
+
+        if req.start_key.is_empty() || req.end_key.is_empty() {
+            return Err(Status::invalid_argument(
+                "Start key and end key cannot be empty",
+            ));
+        }
+
+        let entries = self
+            .engine
+            .range_get(&req.start_key, &req.end_key)
+            .into_iter()
+            .map(|(key, value)| KeyValue { key, value })
+            .collect();
+
+        let reply = ScanResponse {
+            success: true,
+            message: "Scan completed successfully".to_string(),
+            entries,
         };
 
         Ok(Response::new(reply))
