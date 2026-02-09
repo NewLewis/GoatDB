@@ -6,6 +6,7 @@ use goat_db::goatkv::core::kv_engine::KvEngine;
 use goat_db::goatkv::metadata::current;
 use goat_db::goatkv::metadata::manifest::{ManifestWriter, INIT_MANIFEST_FILE_NAME};
 use goat_db::goatkv::metadata::version_edit::VersionEdit;
+use goat_db::goatkv::storage::wal::WalCodec;
 use goat_db::goatkv::storage::wal::WalPaths;
 use goat_db::goatkv::storage::wal::WalWriter;
 use goat_db::goatkv::utils::options::KvEngineOptions;
@@ -26,13 +27,15 @@ fn recovery_handles_truncated_wal_tail() {
 
     // 写入一个完整记录
     {
-        let mut wal = WalWriter::new(wal_path(0, &wal_paths), false).unwrap();
+        let mut wal = WalWriter::new(wal_path(0, &wal_paths)).unwrap();
         let key = goat_db::goatkv::format::internal_key::InternalKey::new(
             b"ok".to_vec(),
             1,
             goat_db::goatkv::format::internal_key::InternalKeyKind::Put,
         );
-        wal.write(&key, b"v1").unwrap();
+        let record = WalCodec::encode_record(&key, b"v1");
+        wal.write_bytes(&record).unwrap();
+        wal.flush().unwrap();
     }
     // 追加半条记录，制造尾部截断
     {
@@ -55,7 +58,7 @@ fn recovery_handles_truncated_wal_tail() {
     assert_eq!(engine.get(b"ok"), Some(b"v1".to_vec()));
 
     // 截断应已发生：文件现在能被重新打开且尾部无多余无效记录（无法精确比对长度，但能重新打开 WalWriter）
-    WalWriter::new(wal_path(0, &wal_paths), false).expect("truncated WAL should be openable");
+    WalWriter::new(wal_path(0, &wal_paths)).expect("truncated WAL should be openable");
 
     drop(engine);
 }
@@ -68,24 +71,28 @@ fn recovery_replays_multiple_wals_in_order() {
 
     // WAL 0
     {
-        let mut wal = WalWriter::new(wal_path(0, &wal_paths), false).unwrap();
+        let mut wal = WalWriter::new(wal_path(0, &wal_paths)).unwrap();
         let key = goat_db::goatkv::format::internal_key::InternalKey::new(
             b"a".to_vec(),
             1,
             goat_db::goatkv::format::internal_key::InternalKeyKind::Put,
         );
-        wal.write(&key, b"va").unwrap();
+        let record = WalCodec::encode_record(&key, b"va");
+        wal.write_bytes(&record).unwrap();
+        wal.flush().unwrap();
     }
 
     // WAL 1
     {
-        let mut wal = WalWriter::new(wal_path(1, &wal_paths), false).unwrap();
+        let mut wal = WalWriter::new(wal_path(1, &wal_paths)).unwrap();
         let key = goat_db::goatkv::format::internal_key::InternalKey::new(
             b"b".to_vec(),
             2,
             goat_db::goatkv::format::internal_key::InternalKeyKind::Put,
         );
-        wal.write(&key, b"vb").unwrap();
+        let record = WalCodec::encode_record(&key, b"vb");
+        wal.write_bytes(&record).unwrap();
+        wal.flush().unwrap();
     }
 
     let options = KvEngineOptions::default()
@@ -259,13 +266,15 @@ fn recovery_replays_wal_if_flush_never_completed() {
 
     // WAL 1 写入一条记录
     {
-        let mut wal = WalWriter::new(wal_path(1, &wal_paths), false).unwrap();
+        let mut wal = WalWriter::new(wal_path(1, &wal_paths)).unwrap();
         let key = goat_db::goatkv::format::internal_key::InternalKey::new(
             b"k".to_vec(),
             1,
             goat_db::goatkv::format::internal_key::InternalKeyKind::Put,
         );
-        wal.write(&key, b"v").unwrap();
+        let record = WalCodec::encode_record(&key, b"v");
+        wal.write_bytes(&record).unwrap();
+        wal.flush().unwrap();
     }
 
     // 让 tmp dir 只读，触发恢复后 flush 失败，模拟“恢复后立即崩溃未落盘”

@@ -55,7 +55,7 @@
   <g transform="translate(80, 180)">
     <rect class="counter-box" width="220" height="90" rx="8" />
     <text class="title" x="110" y="30" text-anchor="middle">log_number</text>
-    <text class="text" x="110" y="55" text-anchor="middle">当前 WAL 编号</text>
+    <text class="text" x="110" y="55" text-anchor="middle">WAL 边界编号</text>
     <text class="label" x="110" y="75" text-anchor="middle" fill="#666">保证日志顺序</text>
   </g>
 
@@ -80,7 +80,7 @@
   <!-- Action 1 -->
   <g transform="translate(80, 360)">
     <rect class="action-box" width="220" height="60" rx="8" />
-    <text class="text" x="110" y="35" text-anchor="middle">WAL 切换 / 创建</text>
+    <text class="text" x="110" y="35" text-anchor="middle">Flush 完成 / 更新 log_number</text>
   </g>
   <!-- Arrow Up 1 -->
   <path class="arrow" d="M190 360 L190 280" />

@@ -83,14 +83,11 @@ impl FlushWorker {
             let imm_table = task.immutable_mem_table.clone();
 
             // 在不持有锁的情况下处理数据
-            let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let mut iter = imm_table.iter();
+            let first = iter.next();
             let mut max_sequence = 0u64;
-            for (key, value) in imm_table.iter() {
-                max_sequence = max_sequence.max(key.sequence_number());
-                entries.push((key.serialize(), value.to_vec()));
-            }
 
-            if entries.is_empty() {
+            if first.is_none() {
                 let mut version_edit = VersionEdit::new();
                 if task.new_log_number > 0 {
                     version_edit.set_log_number(task.new_log_number);
@@ -135,8 +132,16 @@ impl FlushWorker {
             };
 
             // 在不持有锁的情况下写入 SSTable
-            for (key, value) in entries {
-                sst_builder.write(&key, &value);
+            let mut key_buf = Vec::new();
+            if let Some((key, value)) = first {
+                max_sequence = max_sequence.max(key.sequence_number());
+                key.serialize_into(&mut key_buf);
+                sst_builder.write(&key_buf, value.as_ref());
+            }
+            for (key, value) in iter {
+                max_sequence = max_sequence.max(key.sequence_number());
+                key.serialize_into(&mut key_buf);
+                sst_builder.write(&key_buf, value.as_ref());
             }
 
             let props = match sst_builder.finish() {

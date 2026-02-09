@@ -10,7 +10,7 @@ use rand::{Rng, SeedableRng};
 use goat_db::goatkv::utils::init_logging;
 use goat_db::goatkv::{KvEngine, KvEngineOptions};
 #[cfg(feature = "rocksdb")]
-use rocksdb::{DBCompressionType, Options, WriteBatch, DB};
+use rocksdb::{DBCompressionType, Options, WriteBatch, WriteOptions, DB};
 
 #[derive(Parser)]
 #[command(name = "goatkv_bench")]
@@ -68,6 +68,18 @@ enum Commands {
         /// Pairs in one batch
         #[arg(long, default_value_t = 1000)]
         batch_size: u64,
+        /// Value size
+        #[arg(long, default_value_t = 1024)]
+        value_size: usize,
+        /// Write sequentially
+        #[arg(long, default_value_t = true)]
+        seq: bool,
+    },
+    /// Single put per operation (no batching)
+    Singleput {
+        /// Key numbers
+        #[arg(long, default_value_t = 1024)]
+        key_nums: u64,
         /// Value size
         #[arg(long, default_value_t = 1024)]
         value_size: usize,
@@ -160,25 +172,72 @@ fn populate_goatkv(
                 let mut processed = 0u64;
                 while processed < total {
                     let batch = (total - processed).min(batch_size);
+                    let mut entries = Vec::with_capacity(batch as usize);
                     for offset in 0..batch {
                         let key_id = start + processed + offset;
                         let key = make_key(key_id);
                         let value = make_value(value_size, key_id);
-                        engine.put(key, value);
+                        entries.push((key, value));
                     }
+                    engine.put_batch(entries);
                     processed += batch;
                 }
             } else {
                 let mut remaining = total;
                 while remaining > 0 {
                     let batch = remaining.min(batch_size);
+                    let mut entries = Vec::with_capacity(batch as usize);
                     for _ in 0..batch {
                         let key_id = rng.gen_range(0..key_nums);
                         let key = make_key(key_id);
                         let value = make_value(value_size, key_id);
-                        engine.put(key, value);
+                        entries.push((key, value));
                     }
+                    engine.put_batch(entries);
                     remaining = remaining.saturating_sub(batch);
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+}
+
+fn singleput_goatkv(
+    engine: Arc<KvEngine>,
+    key_nums: u64,
+    value_size: usize,
+    seq: bool,
+    threads: usize,
+) {
+    if key_nums == 0 || threads == 0 {
+        return;
+    }
+    let mut handles = Vec::with_capacity(threads);
+
+    for index in 0..threads {
+        let engine = engine.clone();
+        let (start, end) = split_range(key_nums, threads, index);
+        let seed = 0x517c_c1b7_u64.wrapping_mul(index as u64 + 1);
+        let handle = thread::spawn(move || {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            if seq {
+                for key_id in start..end {
+                    let key = make_key(key_id);
+                    let value = make_value(value_size, key_id);
+                    engine.put(key, value);
+                }
+            } else {
+                let mut remaining = end.saturating_sub(start);
+                while remaining > 0 {
+                    let key_id = rng.gen_range(0..key_nums);
+                    let key = make_key(key_id);
+                    let value = make_value(value_size, key_id);
+                    engine.put(key, value);
+                    remaining = remaining.saturating_sub(1);
                 }
             }
         });
@@ -198,6 +257,7 @@ fn populate_rocksdb(
     value_size: usize,
     seq: bool,
     threads: usize,
+    wal_sync: bool,
 ) {
     if key_nums == 0 || threads == 0 {
         return;
@@ -211,6 +271,8 @@ fn populate_rocksdb(
         let seed = 0x9e37_79b9_u64.wrapping_mul(index as u64 + 1);
         let handle = thread::spawn(move || {
             let mut rng = SmallRng::seed_from_u64(seed);
+            let mut write_opts = WriteOptions::default();
+            write_opts.set_sync(wal_sync);
             let total = end.saturating_sub(start);
             if seq {
                 let mut processed = 0u64;
@@ -223,7 +285,7 @@ fn populate_rocksdb(
                         let value = make_value(value_size, key_id);
                         batch.put(key, value);
                     }
-                    let _ = db.write(batch);
+                    let _ = db.write_opt(batch, &write_opts);
                     processed += batch_count;
                 }
             } else {
@@ -237,8 +299,55 @@ fn populate_rocksdb(
                         let value = make_value(value_size, key_id);
                         batch.put(key, value);
                     }
-                    let _ = db.write(batch);
+                    let _ = db.write_opt(batch, &write_opts);
                     remaining = remaining.saturating_sub(batch_count);
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+}
+
+#[cfg(feature = "rocksdb")]
+fn singleput_rocksdb(
+    db: Arc<DB>,
+    key_nums: u64,
+    value_size: usize,
+    seq: bool,
+    threads: usize,
+    wal_sync: bool,
+) {
+    if key_nums == 0 || threads == 0 {
+        return;
+    }
+    let mut handles = Vec::with_capacity(threads);
+
+    for index in 0..threads {
+        let db = db.clone();
+        let (start, end) = split_range(key_nums, threads, index);
+        let seed = 0x24b1_4d3f_u64.wrapping_mul(index as u64 + 1);
+        let handle = thread::spawn(move || {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let mut write_opts = WriteOptions::default();
+            write_opts.set_sync(wal_sync);
+            if seq {
+                for key_id in start..end {
+                    let key = make_key(key_id);
+                    let value = make_value(value_size, key_id);
+                    let _ = db.put_opt(key, value, &write_opts);
+                }
+            } else {
+                let mut remaining = end.saturating_sub(start);
+                while remaining > 0 {
+                    let key_id = rng.gen_range(0..key_nums);
+                    let key = make_key(key_id);
+                    let value = make_value(value_size, key_id);
+                    let _ = db.put_opt(key, value, &write_opts);
+                    remaining = remaining.saturating_sub(1);
                 }
             }
         });
@@ -407,11 +516,69 @@ fn main() {
                                 value_size,
                                 seq,
                                 cli.threads,
+                                cli.wal_sync,
                             );
                             let total_ms = begin.elapsed().as_millis();
                             let result = BenchResult {
                                 engine: "rocksdb",
                                 workload: "populate",
+                                total_ms,
+                                iters,
+                                ms_per_iter: ms_per_iter(total_ms, iters),
+                            };
+                            print_result(&result);
+                        }
+                    }
+                    EngineKind::Both => {}
+                }
+            }
+            Commands::Singleput {
+                key_nums,
+                value_size,
+                seq,
+            } => {
+                let iters = key_nums;
+                match engine_kind {
+                    EngineKind::Goatkv => {
+                        let options = KvEngineOptions::default()
+                            .with_data_dir(&base_dir)
+                            .with_wal_sync(cli.wal_sync);
+                        let engine =
+                            Arc::new(KvEngine::new_with_options(options).expect("open engine"));
+                        let begin = Instant::now();
+                        singleput_goatkv(engine, key_nums, value_size, seq, cli.threads);
+                        let total_ms = begin.elapsed().as_millis();
+                        let result = BenchResult {
+                            engine: "goatkv",
+                            workload: "singleput",
+                            total_ms,
+                            iters,
+                            ms_per_iter: ms_per_iter(total_ms, iters),
+                        };
+                        print_result(&result);
+                    }
+                    EngineKind::Rocksdb => {
+                        ensure_rocksdb_available();
+                        #[cfg(feature = "rocksdb")]
+                        {
+                            let mut rocks_opts = Options::default();
+                            rocks_opts.create_if_missing(true);
+                            rocks_opts.set_compression_type(DBCompressionType::None);
+                            let db =
+                                Arc::new(DB::open(&rocks_opts, &base_dir).expect("open rocksdb"));
+                            let begin = Instant::now();
+                            singleput_rocksdb(
+                                db,
+                                key_nums,
+                                value_size,
+                                seq,
+                                cli.threads,
+                                cli.wal_sync,
+                            );
+                            let total_ms = begin.elapsed().as_millis();
+                            let result = BenchResult {
+                                engine: "rocksdb",
+                                workload: "singleput",
                                 total_ms,
                                 iters,
                                 ms_per_iter: ms_per_iter(total_ms, iters),

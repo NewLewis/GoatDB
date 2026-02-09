@@ -15,6 +15,10 @@
 - `cargo run --bin goatkv_client -- put key value`: Run one client command.
 - `cargo test`: Run all unit, integration, and E2E tests.
 - `cargo test --test e2e_basic_crud`: Run a specific E2E test.
+- `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine both --wal-sync populate`: Run the bench with RocksDB enabled and WAL sync.
+- `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine both --wal-sync --threads 16 populate --key-nums 10000`: Run 16-thread populate with 10k keys.
+- `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine both --wal-sync singleput`: Run single-put benchmark with WAL sync.
+- `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine both --wal-sync --threads 16 singleput --key-nums 10000`: Run 16-thread single-put with 10k keys.
 - `cargo fmt`: Format code with rustfmt.
 - `cargo clippy --all-targets --all-features -- -D warnings`: Lint with clippy.
 
@@ -29,6 +33,21 @@
 - Integration utilities are in `tests/common/`.
 - E2E tests are under `tests/e2e/` and registered in `Cargo.toml` `[[test]]` entries.
 - Slow/load tests may be marked ignored; run with `cargo test -- --ignored`.
+
+## Benchmarking & Flamegraphs
+- Bench targets live in `benches/` (see `benches/goatkv_bench.rs` for CLI flags).
+- Common bench presets:
+  - Populate (batch, WAL sync):
+    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine both --wal-sync populate`
+  - Populate (16 threads, 10k keys):
+    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine both --wal-sync --threads 16 populate --key-nums 10000`
+  - Single put (WAL sync):
+    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine both --wal-sync singleput`
+  - Single put (16 threads, 10k keys):
+    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine both --wal-sync --threads 16 singleput --key-nums 10000`
+- Flamegraph (GoatKV only, avoid rocksdb feature):
+  1) `cargo flamegraph --release --bench goatkv_bench -- --directory ./bench_data --threads 16 --engine goatkv --wal-sync populate --key-nums 2000 --batch-size 2000 --value-size 1024 --seq`
+  2) Output is `flamegraph.svg` in repo root.
 
 ## Commit & Pull Request Guidelines
 - Commit messages are short, imperative, and descriptive (e.g., “Add cleanup worker…”).

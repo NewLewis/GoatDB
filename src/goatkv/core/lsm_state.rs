@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
-use crate::goatkv::core::wal_handle::WalHandle;
 use crate::goatkv::metadata::version::Version;
+use crate::goatkv::storage::wal::WalHandle;
 
 #[derive(Debug)]
 pub struct LSMState {
