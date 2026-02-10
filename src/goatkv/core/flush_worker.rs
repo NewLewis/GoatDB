@@ -102,7 +102,7 @@ impl FlushWorker {
                     let mut vs = version_set.write().unwrap();
                     if let Err(e) = vs.apply_edit(version_edit) {
                         error!("Failed to apply VersionEdit: {}", e);
-                        continue; // 不重试，直接退出
+                        continue; // 跳过当前任务，继续处理后续任务
                     }
                     vs.current()
                 };
@@ -123,47 +123,39 @@ impl FlushWorker {
                 (file_id, next_file_number)
             };
 
-            // Retry loop for SSTable creation and writing
-            let props = loop {
-                let mut sst_builder = match SSTableBuilder::new(file_id, &sstable_paths) {
-                    Ok(builder) => builder,
-                    Err(e) => {
-                        error!(
-                            "Failed to create SSTableBuilder (will retry in 1s): {}",
-                            e
-                        );
-                        std::thread::sleep(std::time::Duration::from_secs(1));
-                        continue;
-                    }
-                };
-
-                // 在不持有锁的情况下写入 SSTable
-                let mut key_buf = Vec::new();
-                let mut write_failed = false;
-
-                let iter = imm_table.iter();
-                for (key, value) in iter {
-                    max_sequence = max_sequence.max(key.sequence_number());
-                    key.serialize_into(&mut key_buf);
-                    if let Err(e) = sst_builder.write(&key_buf, value.as_ref()) {
-                        error!("Failed to write entry to SSTable {} (will retry): {}", file_id, e);
-                        write_failed = true;
-                        break;
-                    }
-                }
-
-                if write_failed {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+            // 单次尝试：失败直接报错，不进行重试。
+            let mut sst_builder = match SSTableBuilder::new(file_id, &sstable_paths) {
+                Ok(builder) => builder,
+                Err(e) => {
+                    error!("Failed to create SSTableBuilder: {}", e);
                     continue;
                 }
+            };
 
-                match sst_builder.finish() {
-                    Ok(meta) => break meta,
-                    Err(e) => {
-                        error!("Failed to finish SSTable {} (will retry in 1s): {}", file_id, e);
-                        std::thread::sleep(std::time::Duration::from_secs(1));
-                        continue;
-                    }
+            // 在不持有锁的情况下写入 SSTable
+            let mut key_buf = Vec::new();
+            let mut write_failed = false;
+
+            let iter = imm_table.iter();
+            for (key, value) in iter {
+                max_sequence = max_sequence.max(key.sequence_number());
+                key.serialize_into(&mut key_buf);
+                if let Err(e) = sst_builder.write(&key_buf, value.as_ref()) {
+                    error!("Failed to write entry to SSTable {}: {}", file_id, e);
+                    write_failed = true;
+                    break;
+                }
+            }
+
+            if write_failed {
+                continue;
+            }
+
+            let props = match sst_builder.finish() {
+                Ok(meta) => meta,
+                Err(e) => {
+                    error!("Failed to finish SSTable {}: {}", file_id, e);
+                    continue;
                 }
             };
 
@@ -185,7 +177,7 @@ impl FlushWorker {
                 let mut vs = version_set.write().unwrap();
                 if let Err(e) = vs.apply_edit(version_edit) {
                     error!("Failed to apply VersionEdit: {}", e);
-                    continue; // 不 pop_front，等待后续重试
+                    continue; // 不移除该任务 memtable，避免丢失内存中数据
                 }
                 vs.current()
             };

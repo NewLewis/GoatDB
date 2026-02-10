@@ -6,10 +6,11 @@
 
 ## 本轮验证结果
 
-- `cargo test --lib --test integration_recovery`：通过。
-- `cargo fmt -- --check`：通过。
+- `cargo test --lib`：通过（91 passed）。
+- `cargo test --test integration_recovery read_path_reports_missing_sstable_as_error -- --nocapture`：通过。
+- `cargo test --test integration_recovery recovery_replays_wal_if_flush_never_completed -- --nocapture`：通过。
 - `cargo clippy --all-targets --all-features -- -D warnings`：失败，`too_many_arguments`（`src/goatkv/core/kv_engine/engine.rs:322`）。
-- `cargo test`：单元测试通过；E2E 在当前沙箱环境失败（无法申请临时端口，`PermissionDenied`，非业务断言失败）。
+- `cargo test --test e2e_basic_crud`：在当前沙箱环境失败（无法申请临时端口，`PermissionDenied`，非业务断言失败）。
 
 ## 问题清单
 
@@ -62,7 +63,37 @@
     - 2026-02-10：`SSTableBuilder::new/new_with_manager/write/finish` 已接入 `goatkv::Result`，移除内部 `unwrap/expect`。
     - 2026-02-10：`FlushWorker` 接入 builder 写入错误处理，失败仅记录并跳过本次任务，不会线程 panic。
 
+- [x] `P0-FLUSH-WORKER-SHUTDOWN-HANG`
+  - 现象：flush 失败后 worker 在重试循环中无限重试，`Drop` 阶段 `join` 可能长期阻塞，进程退出/测试回收卡住。
+  - 影响：服务停机不可控，测试可能长期挂起，恢复路径可用性受影响。
+  - 代码定位：
+    - `src/goatkv/core/flush_worker.rs:127`
+    - `src/goatkv/core/flush_worker.rs:135`
+    - `src/goatkv/core/flush_worker.rs:163`
+    - `src/goatkv/core/flush_worker.rs:226`
+  - 验收标准：
+    - worker 可接收停止信号并有界退出，不因单任务重试无限阻塞 `Drop`。
+    - `recovery_replays_wal_if_flush_never_completed` 在可接受时间内稳定结束（不依赖外部 `timeout` 杀进程）。
+  - 关闭记录：
+    - 2026-02-10：`FlushWorker` 改为“单次尝试，失败直接报错并跳过任务”，移除 `sleep + retry` 机制。
+    - 2026-02-10：回归测试通过：`recovery_replays_wal_if_flush_never_completed`、`flush_failed_task_does_not_evict_other_immutable_memtables`。
+
 ### P1（核心能力缺口）
+
+- [x] `P1-ERROR-CONTRACT-DRIFT`
+  - 现象：`to_status()` 输出消息已包含细节前缀，但错误单测仍断言简短固定文案，导致回归测试失败。
+  - 影响：错误对外契约不稳定，server/client 侧文案与测试、监控规则难以对齐。
+  - 代码定位：
+    - `src/goatkv/error.rs:145`
+    - `src/goatkv/error.rs:147`
+    - `src/goatkv/error.rs:149`
+    - `src/goatkv/error.rs:245`
+  - 验收标准：
+    - 明确并固定错误消息策略（短文案 or 细节文案）。
+    - `error.rs` 实现与单测断言一致，`cargo test` 不再因该项失败。
+  - 关闭记录：
+    - 2026-02-10：统一采用“稳定短文案”策略，`to_status()` 对外返回固定 message（`invalid argument`/`not found`/`data corruption`/`conflict`/`service unavailable`）。
+    - 2026-02-10：`cargo test --lib` 通过，`goatkv::error` 相关映射测试全部通过。
 
 - [x] `P1-READ-ERROR-HIDDEN`
   - 现象：SSTable 打开/读取失败时，读路径返回 `None`（看起来像 key 不存在）。
@@ -80,6 +111,20 @@
     - 2026-02-10：`KvReader::get`、`KvEngine::get` 连带改为 `goatkv::Result<Option<Vec<u8>>>`。
     - 2026-02-10：gRPC `get/update` 路径接入 `map_err(|e| e.to_status())`，读错误可透传为服务端错误。
     - 2026-02-10：新增 `read_path_reports_missing_sstable_as_error` 回归测试（`tests/integration/recovery_test.rs`）。
+
+- [x] `P1-MISSING-SSTABLE-ERROR-KIND-MISMATCH`
+  - 现象：缺失 SSTable 时，读路径当前映射为 `Corruption`，而集成测试断言 `NotFound`，语义未统一。
+  - 影响：调用方无法稳定依赖错误分类；恢复/告警策略容易分歧。
+  - 代码定位：
+    - `src/goatkv/metadata/version.rs:35`
+    - `src/goatkv/metadata/version.rs:59`
+    - `tests/integration/recovery_test.rs:312`
+  - 验收标准：
+    - 确认“缺失 SSTable”统一语义（`NotFound` 或 `Corruption`）并形成文档约定。
+    - 实现与测试统一，相关集成用例稳定通过。
+  - 关闭记录：
+    - 2026-02-10：约定并实现为 `NotFound`；读路径中 SSTable 缺失统一映射为 `Error::not_found("sstable", ...)`。
+    - 2026-02-10：回归测试 `read_path_reports_missing_sstable_as_error` 通过。
 
 - [ ] `P1-NO-COMPACTION`
   - 现象：只有 `needs_compaction` 判定，没有实际 compaction 调度与执行。
@@ -140,15 +185,11 @@
 
 ## 建议修复顺序
 
-1. `P0-FLUSH-QUEUE-MISMATCH`
-2. `P0-WRITE-PATH-PANIC`
-3. `P0-SSTABLE-BUILDER-PANIC`
-4. `P1-READ-ERROR-HIDDEN`
-5. `P1-NO-COMPACTION`
-6. `P1-MANIFEST-REWRITE-NOT-EFFECTIVE`
-7. `P1-SSTABLE-SEQNO-METADATA-MISSING`
-8. `P1-SSTABLE-CLEANUP-PIPELINE-INCOMPLETE`
-9. `P2-CLIPPY-TOO-MANY-ARGS`
+1. `P1-NO-COMPACTION`
+2. `P1-MANIFEST-REWRITE-NOT-EFFECTIVE`
+3. `P1-SSTABLE-SEQNO-METADATA-MISSING`
+4. `P1-SSTABLE-CLEANUP-PIPELINE-INCOMPLETE`
+5. `P2-CLIPPY-TOO-MANY-ARGS`
 
 ## 逐项关闭记录（执行时填写）
 

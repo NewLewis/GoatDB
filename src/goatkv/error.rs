@@ -141,19 +141,11 @@ impl Error {
     /// 统一映射到 gRPC 状态码，供 server 层直接复用。
     pub fn to_status(&self) -> Status {
         match self {
-            Self::InvalidArgument { message, .. } => {
-                Status::invalid_argument(format!("invalid argument: {}", message))
-            }
-            Self::NotFound { message, .. } => Status::not_found(format!("not found: {}", message)),
-            Self::Corruption { message, .. } => {
-                Status::data_loss(format!("data corruption: {}", message))
-            }
-            Self::Conflict { message, .. } => {
-                Status::failed_precondition(format!("conflict: {}", message))
-            }
-            Self::Unavailable { message, .. } => {
-                Status::unavailable(format!("service unavailable: {}", message))
-            }
+            Self::InvalidArgument { .. } => Status::invalid_argument("invalid argument"),
+            Self::NotFound { .. } => Status::not_found("not found"),
+            Self::Corruption { .. } => Status::data_loss("data corruption"),
+            Self::Conflict { .. } => Status::failed_precondition("conflict"),
+            Self::Unavailable { .. } => Status::unavailable("service unavailable"),
             Self::Io { .. } => Status::internal("storage io error"),
             Self::Internal { .. } => Status::internal("internal server error"),
         }

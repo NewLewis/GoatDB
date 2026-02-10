@@ -32,10 +32,7 @@ impl Version {
             GoatError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound
         ) || err.kind() == GoatErrorKind::NotFound
         {
-            return GoatError::corruption(
-                "sstable_open",
-                format!("sstable missing: {:?}", path),
-            );
+            return GoatError::not_found("sstable", format!("missing during open: {:?}", path));
         }
 
         match err.kind() {
@@ -56,10 +53,7 @@ impl Version {
             GoatError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound
         ) || err.kind() == GoatErrorKind::NotFound
         {
-            return GoatError::corruption(
-                "sstable_read",
-                format!("sstable file missing during read: {:?}", path),
-            );
+            return GoatError::not_found("sstable", format!("missing during read: {:?}", path));
         }
 
         match err.kind() {
