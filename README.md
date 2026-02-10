@@ -68,6 +68,12 @@ cargo test --release --test 'e2e_load' -- --ignored
 cargo bench --bench goatkv_bench --features rocksdb -- --directory ./bench_data --threads 1 --engine both populate --key-nums 100000 --batch-size 1000 --value-size 1024 --seq
 ```
 
+### E2E Behavior In Restricted Environments
+
+- E2E tests require binding a loopback TCP port (`127.0.0.1:0`) to launch the test gRPC server.
+- In sandboxed/restricted environments where loopback bind is denied (`PermissionDenied`), E2E tests now return early and are treated as skipped.
+- This skip behavior is implemented in `tests/common/test_server.rs` via `should_skip_network_e2e()` and is checked at the beginning of each E2E test.
+
 ## Architecture
 
 GoatDB uses an LSM-Tree (Log-Structured Merge-Tree) architecture:

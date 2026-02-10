@@ -4,7 +4,7 @@ mod common;
 use std::time::Duration;
 
 use common::test_server::goatkv::{GetRequest, WriteRequest};
-use common::test_server::{GoatKvServiceClient, TestServer};
+use common::test_server::{should_skip_network_e2e, GoatKvServiceClient, TestServer};
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
@@ -13,6 +13,10 @@ use tokio::task::JoinHandle;
 /// 多客户端并发写入测试
 #[tokio::test]
 async fn test_concurrent_writes_from_multiple_clients() {
+    if should_skip_network_e2e() {
+        return;
+    }
+
     let server = TestServer::start().await;
 
     // 启动 10 个并发客户端
@@ -63,6 +67,10 @@ async fn test_concurrent_writes_from_multiple_clients() {
 /// 并发读写混合测试
 #[tokio::test]
 async fn test_concurrent_read_write() {
+    if should_skip_network_e2e() {
+        return;
+    }
+
     let server = TestServer::start().await;
 
     // 预填充一些数据

@@ -86,11 +86,11 @@ pub fn put_varint64(buf: &mut Vec<u8>, mut value: u64) {
 /// ```
 /// use goat_db::goatkv::format::coding;
 ///
-/// assert_eq!(coding::decode_varint64(&[0x00]), Ok(0));
-/// assert_eq!(coding::decode_varint64(&[0x01]), Ok(1));
-/// assert_eq!(coding::decode_varint64(&[0x7F]), Ok(127));
-/// assert_eq!(coding::decode_varint64(&[0x80, 0x01]), Ok(128));
-/// assert_eq!(coding::decode_varint64(&[0xAC, 0x02]), Ok(300));
+/// assert_eq!(coding::decode_varint64(&[0x00]).unwrap(), 0);
+/// assert_eq!(coding::decode_varint64(&[0x01]).unwrap(), 1);
+/// assert_eq!(coding::decode_varint64(&[0x7F]).unwrap(), 127);
+/// assert_eq!(coding::decode_varint64(&[0x80, 0x01]).unwrap(), 128);
+/// assert_eq!(coding::decode_varint64(&[0xAC, 0x02]).unwrap(), 300);
 /// ```
 pub fn decode_varint64(bytes: &[u8]) -> GoatResult<u64> {
     decode_varint64_with_length(bytes).map(|(value, _)| value)
@@ -111,11 +111,11 @@ pub fn decode_varint64(bytes: &[u8]) -> GoatResult<u64> {
 /// ```
 /// use goat_db::goatkv::format::coding;
 ///
-/// assert_eq!(coding::decode_varint64_with_length(&[0x00]), Ok((0, 1)));
-/// assert_eq!(coding::decode_varint64_with_length(&[0x01]), Ok((1, 1)));
-/// assert_eq!(coding::decode_varint64_with_length(&[0x7F]), Ok((127, 1)));
-/// assert_eq!(coding::decode_varint64_with_length(&[0x80, 0x01]), Ok((128, 2)));
-/// assert_eq!(coding::decode_varint64_with_length(&[0xAC, 0x02]), Ok((300, 2)));
+/// assert_eq!(coding::decode_varint64_with_length(&[0x00]).unwrap(), (0, 1));
+/// assert_eq!(coding::decode_varint64_with_length(&[0x01]).unwrap(), (1, 1));
+/// assert_eq!(coding::decode_varint64_with_length(&[0x7F]).unwrap(), (127, 1));
+/// assert_eq!(coding::decode_varint64_with_length(&[0x80, 0x01]).unwrap(), (128, 2));
+/// assert_eq!(coding::decode_varint64_with_length(&[0xAC, 0x02]).unwrap(), (300, 2));
 /// ```
 pub fn decode_varint64_with_length(bytes: &[u8]) -> GoatResult<(u64, usize)> {
     let mut result = 0u64;

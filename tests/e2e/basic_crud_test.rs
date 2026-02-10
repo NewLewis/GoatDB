@@ -2,11 +2,15 @@
 mod common;
 
 use common::test_server::goatkv::{DeleteRequest, GetRequest, UpdateRequest, WriteRequest};
-use common::test_server::TestServer;
+use common::test_server::{should_skip_network_e2e, TestServer};
 
 /// 基本写入读取测试
 #[tokio::test]
 async fn test_write_and_read() {
+    if should_skip_network_e2e() {
+        return;
+    }
+
     // 启动测试服务器
     let server = TestServer::start().await;
     let mut client = server.client().await;
@@ -32,6 +36,10 @@ async fn test_write_and_read() {
 /// 更新已有键的测试
 #[tokio::test]
 async fn test_update_existing_key() {
+    if should_skip_network_e2e() {
+        return;
+    }
+
     let server = TestServer::start().await;
     let mut client = server.client().await;
 
@@ -67,6 +75,10 @@ async fn test_update_existing_key() {
 /// 删除键的测试
 #[tokio::test]
 async fn test_delete_key() {
+    if should_skip_network_e2e() {
+        return;
+    }
+
     let server = TestServer::start().await;
     let mut client = server.client().await;
 
@@ -101,6 +113,10 @@ async fn test_delete_key() {
 /// 测试不存在的键读取
 #[tokio::test]
 async fn test_get_non_existent_key() {
+    if should_skip_network_e2e() {
+        return;
+    }
+
     let server = TestServer::start().await;
     let mut client = server.client().await;
 
@@ -120,6 +136,10 @@ async fn test_get_non_existent_key() {
 /// 测试重复写入同一个键
 #[tokio::test]
 async fn test_write_same_key_multiple_times() {
+    if should_skip_network_e2e() {
+        return;
+    }
+
     let server = TestServer::start().await;
     let mut client = server.client().await;
 
@@ -156,6 +176,10 @@ async fn test_write_same_key_multiple_times() {
 /// 测试多个键值对的CRUD操作
 #[tokio::test]
 async fn test_multiple_keys_crud() {
+    if should_skip_network_e2e() {
+        return;
+    }
+
     let server = TestServer::start().await;
     let mut client = server.client().await;
 

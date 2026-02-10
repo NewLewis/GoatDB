@@ -6,11 +6,15 @@ use std::time::Duration;
 use common::test_server::goatkv::{
     DeleteRequest, FlushRequest, GetRequest, UpdateRequest, WriteRequest,
 };
-use common::test_server::{TestServer, TestServerOptions};
+use common::test_server::{should_skip_network_e2e, TestServer, TestServerOptions};
 use tonic::Code;
 
 #[tokio::test]
 async fn test_rejects_empty_key_requests() {
+    if should_skip_network_e2e() {
+        return;
+    }
+
     let server = TestServer::start().await;
     let mut client = server.client().await;
 
@@ -54,6 +58,10 @@ async fn test_rejects_empty_key_requests() {
 
 #[tokio::test]
 async fn test_update_nonexistent_key_returns_failure() {
+    if should_skip_network_e2e() {
+        return;
+    }
+
     let server = TestServer::start().await;
     let mut client = server.client().await;
 
@@ -79,6 +87,10 @@ async fn test_update_nonexistent_key_returns_failure() {
 
 #[tokio::test]
 async fn test_binary_and_large_value_roundtrip() {
+    if should_skip_network_e2e() {
+        return;
+    }
+
     let server = TestServer::start().await;
     let mut client = server.client().await;
 
@@ -119,6 +131,10 @@ async fn test_binary_and_large_value_roundtrip() {
 
 #[tokio::test]
 async fn test_persistence_across_restart() {
+    if should_skip_network_e2e() {
+        return;
+    }
+
     let temp_dir = tempfile::tempdir().unwrap();
     let data_dir = temp_dir.path().to_path_buf();
 
@@ -167,6 +183,10 @@ async fn test_persistence_across_restart() {
 
 #[tokio::test]
 async fn test_delete_nonexistent_key_is_idempotent() {
+    if should_skip_network_e2e() {
+        return;
+    }
+
     let server = TestServer::start().await;
     let mut client = server.client().await;
 
@@ -193,6 +213,10 @@ async fn test_delete_nonexistent_key_is_idempotent() {
 
 #[tokio::test]
 async fn test_flush_then_immediate_read_consistency() {
+    if should_skip_network_e2e() {
+        return;
+    }
+
     let server = TestServer::start().await;
     let mut client = server.client().await;
 
@@ -220,6 +244,10 @@ async fn test_flush_then_immediate_read_consistency() {
 
 #[tokio::test]
 async fn test_l0_newest_file_wins_on_overlap() {
+    if should_skip_network_e2e() {
+        return;
+    }
+
     let server = TestServer::start().await;
     let mut client = server.client().await;
 
@@ -256,6 +284,10 @@ async fn test_l0_newest_file_wins_on_overlap() {
 
 #[tokio::test]
 async fn test_empty_flush_is_noop() {
+    if should_skip_network_e2e() {
+        return;
+    }
+
     let server = TestServer::start().await;
     let mut client = server.client().await;
 

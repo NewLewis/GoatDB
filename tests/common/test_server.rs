@@ -2,6 +2,7 @@ use std::io::Read;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use goat_db::goatkv::{Error as GoatError, Result as GoatResult};
@@ -10,6 +11,8 @@ use tokio::time::sleep;
 use tonic::transport::Channel;
 
 pub use goatkv::goat_kv_service_client::GoatKvServiceClient;
+
+static NETWORK_E2E_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
 // 包含生成的gRPC代码
 pub mod goatkv {
@@ -253,6 +256,27 @@ impl Drop for TestServer {
     fn drop(&mut self) {
         let _ = self.process.kill();
     }
+}
+
+/// 返回当前环境是否允许绑定本地回环端口用于 E2E 测试。
+/// 仅在 PermissionDenied 时跳过，避免掩盖真实业务失败。
+pub fn should_skip_network_e2e() -> bool {
+    let available =
+        *NETWORK_E2E_AVAILABLE.get_or_init(|| match TcpListener::bind(("127.0.0.1", 0)) {
+            Ok(listener) => {
+                drop(listener);
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "Skipping network E2E tests: loopback port bind is not permitted ({})",
+                    e
+                );
+                false
+            }
+            Err(_) => true,
+        });
+    !available
 }
 
 /// 查找空闲端口

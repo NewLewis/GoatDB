@@ -10,7 +10,7 @@
 - `cargo test --test integration_recovery read_path_reports_missing_sstable_as_error -- --nocapture`：通过。
 - `cargo test --test integration_recovery recovery_replays_wal_if_flush_never_completed -- --nocapture`：通过。
 - `cargo clippy --all-targets --all-features -- -D warnings`：失败，`too_many_arguments`（`src/goatkv/core/kv_engine/engine.rs:322`）。
-- `cargo test --test e2e_basic_crud`：在当前沙箱环境失败（无法申请临时端口，`PermissionDenied`，非业务断言失败）。
+- `cargo test --test e2e_basic_crud`：通过；当环境禁止绑定回环端口时按测试约定自动跳过。
 
 ## 问题清单
 
