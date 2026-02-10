@@ -134,6 +134,10 @@
   - 验收标准：
     - 先实现最小可用 `L0 -> L1` compaction。
     - 完成后能删除被替换旧文件并验证读一致性。
+  - 设计稿归档：
+    - 2026-02-10：`docs/goatkv/core/compaction_design.md`（MVP 范围：`L0 -> L1`，不重试，失败直接报错）。
+  - 实施任务清单：
+    - `docs/goatkv/core/compaction_design.md` 第 15 节（按 PR 顺序拆分 `TASK-01` 到 `TASK-10`）。
 
 - [ ] `P1-MANIFEST-REWRITE-NOT-EFFECTIVE`
   - 现象：`manifest_max_size` 和 `manifest_rewrite_edit_count` 仅定义，未见重写触发逻辑。
