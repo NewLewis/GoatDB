@@ -3,11 +3,12 @@ use std::thread;
 
 use crate::goatkv::core::lsm_state::LSMState;
 use crate::goatkv::core::mem_table::ImmutableMemTable;
+use crate::goatkv::metadata::version::Version;
 use crate::goatkv::metadata::version_edit::{NewFile, VersionEdit};
 use crate::goatkv::metadata::version_set::VersionSet;
 use crate::goatkv::storage::sstable::SSTableBuilder;
 use crate::goatkv::utils::paths::SstablePaths;
-use tracing::error;
+use tracing::{error, warn};
 
 /// 刷盘任务
 #[derive(Debug)]
@@ -107,11 +108,11 @@ impl FlushWorker {
                     vs.current()
                 };
 
-                {
-                    let mut lsm_state_guard = lsm_state.write().unwrap();
-                    lsm_state_guard.version = current_version;
-                    lsm_state_guard.immutable_mem_tables.pop_front();
-                }
+                Self::update_version_and_remove_task_memtable(
+                    &lsm_state,
+                    current_version,
+                    &imm_table,
+                );
                 continue;
             }
 
@@ -175,13 +176,27 @@ impl FlushWorker {
                 vs.current()
             };
 
-            // 从 immutable_mem_tables 中移除已刷盘的 memtable
-            // 注意：需要获取 lsm_state 写锁，并且需要找到对应的任务
-            {
-                let mut lsm_state_guard = lsm_state.write().unwrap();
-                lsm_state_guard.version = current_version;
-                lsm_state_guard.immutable_mem_tables.pop_front();
-            }
+            // 从 immutable_mem_tables 中精确移除当前任务对应的 memtable。
+            // 不能无条件 pop_front：若前序任务失败并未出队，会导致错删队头。
+            Self::update_version_and_remove_task_memtable(&lsm_state, current_version, &imm_table);
+        }
+    }
+
+    fn update_version_and_remove_task_memtable(
+        lsm_state: &Arc<RwLock<LSMState>>,
+        current_version: Arc<Version>,
+        task_memtable: &Arc<ImmutableMemTable>,
+    ) {
+        let mut lsm_state_guard = lsm_state.write().unwrap();
+        lsm_state_guard.version = current_version;
+        let remove_pos = lsm_state_guard
+            .immutable_mem_tables
+            .iter()
+            .position(|entry| Arc::ptr_eq(&entry.table, task_memtable));
+        if let Some(pos) = remove_pos {
+            lsm_state_guard.immutable_mem_tables.remove(pos);
+        } else {
+            warn!("Flush task memtable was not found in immutable queue; skip remove");
         }
     }
 }

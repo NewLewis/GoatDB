@@ -19,6 +19,18 @@ fn wal_path(log_number: u64, base: &WalPaths) -> PathBuf {
     base.wal_path_by_id(log_number)
 }
 
+fn count_sstable_files(data_dir: &std::path::Path) -> usize {
+    fs::read_dir(data_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sst"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 #[test]
 fn recovery_handles_truncated_wal_tail() {
     let tmp = temp_dir();
@@ -314,4 +326,66 @@ fn recovery_replays_wal_if_flush_never_completed() {
     assert_eq!(engine.get(b"k"), Some(b"v".to_vec()));
 
     drop(engine);
+}
+
+#[cfg(unix)]
+#[test]
+fn flush_failed_task_does_not_evict_other_immutable_memtables() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let tmp = temp_dir();
+    let options = KvEngineOptions::default()
+        .with_data_dir(tmp.path())
+        .with_mem_table_size(1)
+        .with_wal_sync(false)
+        .with_recover_from_wal(true);
+    let engine = KvEngine::new_with_options(options).unwrap();
+
+    let tmp_dir = engine.sstable_paths().tmp_dir().to_path_buf();
+    let data_dir = engine.sstable_paths().data_dir().to_path_buf();
+
+    // 让第一个 flush 失败
+    {
+        let mut perms = fs::metadata(&tmp_dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&tmp_dir, perms).unwrap();
+    }
+
+    engine.put(b"k1".to_vec(), b"v1".to_vec());
+    engine.flush();
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert_eq!(
+        count_sstable_files(&data_dir),
+        0,
+        "first flush should fail while tmp dir is readonly"
+    );
+    assert_eq!(engine.get(b"k1"), Some(b"v1".to_vec()));
+
+    // 恢复权限，让第二个 flush 成功
+    {
+        let mut perms = fs::metadata(&tmp_dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&tmp_dir, perms).unwrap();
+    }
+
+    engine.put(b"k2".to_vec(), b"v2".to_vec());
+    engine.flush();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && count_sstable_files(&data_dir) == 0 {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        count_sstable_files(&data_dir) > 0,
+        "second flush should create an SSTable after tmp dir becomes writable"
+    );
+
+    assert_eq!(engine.get(b"k2"), Some(b"v2".to_vec()));
+    assert_eq!(
+        engine.get(b"k1"),
+        Some(b"v1".to_vec()),
+        "successful flush of a later task must not evict data from an earlier failed flush task"
+    );
 }
