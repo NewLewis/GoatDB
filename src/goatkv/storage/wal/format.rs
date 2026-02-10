@@ -1,7 +1,8 @@
-use std::io::{self, Read};
+use std::io::Read;
 
 use crc32fast::Hasher;
 
+use crate::goatkv::error::Result as GoatResult;
 use crate::goatkv::format::internal_key::InternalKey;
 use crate::goatkv::utils::io_helpers::{read_exact_or_eof, ReadOutcome};
 
@@ -67,7 +68,7 @@ pub(crate) fn checksum_for(key: &InternalKey, key_len: u32, value: &[u8], value_
     hasher.finalize()
 }
 
-pub(crate) fn read_record<R: Read>(reader: &mut R) -> io::Result<RecordRead> {
+pub(crate) fn read_record<R: Read>(reader: &mut R) -> GoatResult<RecordRead> {
     let mut checksum_bytes = [0u8; 4];
     match read_exact_or_eof(reader, &mut checksum_bytes)? {
         ReadOutcome::Eof => return Ok(RecordRead::Eof),

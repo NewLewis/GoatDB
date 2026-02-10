@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use super::block_builder::BlockBuilder;
 use super::bloom::BloomBuilder;
+use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::format::coding;
 use crate::goatkv::format::internal_key::InternalKey;
 use crate::goatkv::metadata::file_metadata::TableProperties;
@@ -72,7 +73,7 @@ const MAGIC_NUMBER: u64 = 0x706A725F676F6174;
 /// ```no_run
 /// # use goat_db::goatkv::core::KvEngine;
 /// # use goat_db::goatkv::storage::sstable::SSTableBuilder;
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # fn main() -> goat_db::goatkv::Result<()> {
 /// let (_wal_paths, sstable_paths, _manifest_paths) = KvEngine::init_db_paths("./data")?;
 /// let mut builder = SSTableBuilder::new(1, &sstable_paths)?;
 /// builder.write(b"apple", b"fruit");
@@ -137,7 +138,7 @@ impl SSTableBuilder {
     /// ```no_run
     /// # use goat_db::goatkv::storage::sstable::SSTableBuilder;
     /// # use goat_db::goatkv::core::KvEngine;
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> goat_db::goatkv::Result<()> {
     /// let (_wal_paths, sstable_paths, _manifest_paths) =
     ///     goat_db::goatkv::core::KvEngine::init_db_paths("./data")?;
     /// let builder = SSTableBuilder::new(1, &sstable_paths)?;
@@ -145,7 +146,7 @@ impl SSTableBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new(id: u64, sstable_paths: &SstablePaths) -> io::Result<Self> {
+    pub fn new(id: u64, sstable_paths: &SstablePaths) -> GoatResult<Self> {
         Self::new_with_manager(id, sstable_paths)
     }
 
@@ -160,7 +161,7 @@ impl SSTableBuilder {
     ///
     /// # 注意
     /// 此方法主要用于测试，允许使用临时 SSTablePaths
-    pub fn new_with_manager(id: u64, sstable_paths: &SstablePaths) -> io::Result<Self> {
+    pub fn new_with_manager(id: u64, sstable_paths: &SstablePaths) -> GoatResult<Self> {
         let sstable_path = sstable_paths.sstable_path_by_id(id);
         let tmp_path = sstable_paths.tmp_path(format!("sstable_{:06}.tmp", id));
 
@@ -168,7 +169,8 @@ impl SSTableBuilder {
             .create(true)
             .truncate(true)
             .write(true)
-            .open(&tmp_path)?;
+            .open(&tmp_path)
+            .map_err(|e| GoatError::io("sstable_open_tmp", e))?;
 
         Ok(Self {
             writer: Some(io::BufWriter::new(file)),
@@ -210,7 +212,7 @@ impl SSTableBuilder {
     /// ```no_run
     /// # use goat_db::goatkv::core::KvEngine;
     /// # use goat_db::goatkv::storage::sstable::SSTableBuilder;
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> goat_db::goatkv::Result<()> {
     /// let (_wal_paths, sstable_paths, _manifest_paths) = KvEngine::init_db_paths("./data")?;
     /// let mut builder = SSTableBuilder::new(1, &sstable_paths)?;
     /// builder.write(b"apple", b"fruit");
@@ -219,7 +221,7 @@ impl SSTableBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn write(&mut self, key: &[u8], value: &[u8]) {
+    pub fn write(&mut self, key: &[u8], value: &[u8]) -> GoatResult<()> {
         // 更新 smallest_key 和 largest_key
         if self.smallest_key.is_none() {
             self.smallest_key = Some(key.to_vec());
@@ -237,7 +239,7 @@ impl SSTableBuilder {
         // 检查当前数据块是否已满（>= 4KB）
         if self.data_block_builder.should_finish() {
             // 完成当前数据块，使用下一个key作为separator的参考
-            self.finish_data_block(key);
+            self.finish_data_block(key)?;
         }
 
         // 将key-value对添加到当前数据块
@@ -250,6 +252,7 @@ impl SSTableBuilder {
         debug_assert!(key.len() >= 8);
         let user_key = &key[..key.len() - 8];
         self.bloom_builder.add(user_key);
+        Ok(())
     }
 
     /// 完成当前数据块的构建并写入文件
@@ -270,7 +273,7 @@ impl SSTableBuilder {
     /// - 它是该数据块中最大的key
     /// - 或是该数据块中最后一个key与下一个key之间的最小分隔符
     /// - 用于快速定位包含特定key的数据块
-    fn finish_data_block(&mut self, key: &[u8]) {
+    fn finish_data_block(&mut self, key: &[u8]) -> GoatResult<()> {
         // 完成数据块的编码
         // finish()会写入restart array和restart count
         let (block_content, last_key) = self.data_block_builder.finish();
@@ -293,13 +296,14 @@ impl SSTableBuilder {
         // 将数据块写入文件
         self.writer
             .as_mut()
-            .expect("SSTable writer missing")
+            .ok_or_else(|| GoatError::internal("sstable_builder", "SSTable writer missing"))?
             .write_all(block_content)
-            .unwrap();
+            .map_err(|e| GoatError::io("sstable_write_data_block", e))?;
         self.offset += block_content.len() as u64;
 
         // 重置数据块构建器，准备开始新的数据块
         self.data_block_builder.reset();
+        Ok(())
     }
 
     /// 完成SSTable的构建，写入所有元数据
@@ -335,7 +339,7 @@ impl SSTableBuilder {
     /// ```no_run
     /// # use goat_db::goatkv::core::KvEngine;
     /// # use goat_db::goatkv::storage::sstable::SSTableBuilder;
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> goat_db::goatkv::Result<()> {
     /// let (_wal_paths, sstable_paths, _manifest_paths) = KvEngine::init_db_paths("./data")?;
     /// let mut builder = SSTableBuilder::new(1, &sstable_paths)?;
     /// builder.write(b"key1", b"value1");
@@ -344,7 +348,7 @@ impl SSTableBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn finish(&mut self) -> io::Result<TableProperties> {
+    pub fn finish(&mut self) -> GoatResult<TableProperties> {
         // 如果有未完成的数据块，先完成它
         if !self.data_block_builder.empty() {
             let (block_content, last_key) = self.data_block_builder.finish();
@@ -359,9 +363,9 @@ impl SSTableBuilder {
             // 写入最后一个数据块
             self.writer
                 .as_mut()
-                .expect("SSTable writer missing")
+                .ok_or_else(|| GoatError::internal("sstable_builder", "SSTable writer missing"))?
                 .write_all(block_content)
-                .unwrap();
+                .map_err(|e| GoatError::io("sstable_write_last_data_block", e))?;
             self.offset += block_content.len() as u64;
 
             // 重置数据块构建器
@@ -372,9 +376,9 @@ impl SSTableBuilder {
         // BloomFilter用于快速过滤不存在的key
         self.writer
             .as_mut()
-            .expect("SSTable writer missing")
+            .ok_or_else(|| GoatError::internal("sstable_builder", "SSTable writer missing"))?
             .write_all(self.bloom_builder.bitmap())
-            .unwrap();
+            .map_err(|e| GoatError::io("sstable_write_bloom", e))?;
         let bloom_offset = self.offset;
         self.offset += self.bloom_builder.bitmap().len() as u64;
 
@@ -383,9 +387,9 @@ impl SSTableBuilder {
         let (block_content, _) = self.index_block_builder.finish();
         self.writer
             .as_mut()
-            .expect("SSTable writer missing")
+            .ok_or_else(|| GoatError::internal("sstable_builder", "SSTable writer missing"))?
             .write_all(block_content)
-            .unwrap();
+            .map_err(|e| GoatError::io("sstable_write_index", e))?;
         let index_offset = self.offset;
         self.offset += block_content.len() as u64;
 
@@ -400,14 +404,14 @@ impl SSTableBuilder {
         // 写入两个偏移量
         self.writer
             .as_mut()
-            .expect("SSTable writer missing")
+            .ok_or_else(|| GoatError::internal("sstable_builder", "SSTable writer missing"))?
             .write_all(&bloom_offset_bytes)
-            .unwrap();
+            .map_err(|e| GoatError::io("sstable_write_footer_bloom_offset", e))?;
         self.writer
             .as_mut()
-            .expect("SSTable writer missing")
+            .ok_or_else(|| GoatError::internal("sstable_builder", "SSTable writer missing"))?
             .write_all(&index_offset_bytes)
-            .unwrap();
+            .map_err(|e| GoatError::io("sstable_write_footer_index_offset", e))?;
 
         // 填充0字节，使Footer总大小为48字节
         // Padding = 48 - (bloom_offset_len + index_offset_len + magic_len)
@@ -415,16 +419,16 @@ impl SSTableBuilder {
         let padding = vec![0; 40 - (bloom_offset_len + index_offset_len)];
         self.writer
             .as_mut()
-            .expect("SSTable writer missing")
+            .ok_or_else(|| GoatError::internal("sstable_builder", "SSTable writer missing"))?
             .write_all(&padding)
-            .unwrap();
+            .map_err(|e| GoatError::io("sstable_write_footer_padding", e))?;
 
         // 写入魔数（8字节），标识文件格式
         self.writer
             .as_mut()
-            .expect("SSTable writer missing")
+            .ok_or_else(|| GoatError::internal("sstable_builder", "SSTable writer missing"))?
             .write_all(&MAGIC_NUMBER.to_le_bytes())
-            .unwrap();
+            .map_err(|e| GoatError::io("sstable_write_footer_magic", e))?;
 
         // 更新 offset 以反映 Footer 的大小
         // Footer 总大小为 48 字节
@@ -434,12 +438,18 @@ impl SSTableBuilder {
         let mut writer = self
             .writer
             .take()
-            .ok_or_else(|| io::Error::other("SSTable writer missing"))?;
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
+            .ok_or_else(|| GoatError::internal("sstable_builder", "SSTable writer missing"))?;
+        writer
+            .flush()
+            .map_err(|e| GoatError::io("sstable_flush", e))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|e| GoatError::io("sstable_sync_data", e))?;
         drop(writer);
 
-        std::fs::rename(&self.tmp_path, &self.final_path)?;
+        std::fs::rename(&self.tmp_path, &self.final_path)
+            .map_err(|e| GoatError::io("sstable_rename_tmp", e))?;
         sync_dir(
             self.final_path
                 .parent()
@@ -528,7 +538,8 @@ impl SSTableBuilder {
     }
 }
 
-fn sync_dir(path: &Path) -> io::Result<()> {
-    let dir = File::open(path)?;
+fn sync_dir(path: &Path) -> GoatResult<()> {
+    let dir = File::open(path).map_err(|e| GoatError::io("sstable_sync_dir_open", e))?;
     dir.sync_all()
+        .map_err(|e| GoatError::io("sstable_sync_dir_sync_all", e))
 }

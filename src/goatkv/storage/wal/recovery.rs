@@ -2,6 +2,7 @@ use std::fs::OpenOptions;
 use std::io;
 use std::path::PathBuf;
 
+use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::format::internal_key::InternalKey;
 
 use super::format::{read_record, RecordRead};
@@ -13,12 +14,19 @@ pub struct WalReplayStats {
     pub truncated: bool,
 }
 
-pub fn replay_wal_file<F>(path: &PathBuf, mut on_entry: F) -> io::Result<WalReplayStats>
+pub fn replay_wal_file<F>(path: &PathBuf, mut on_entry: F) -> GoatResult<WalReplayStats>
 where
     F: FnMut(InternalKey, Vec<u8>),
 {
-    let file = OpenOptions::new().read(true).write(true).open(path)?;
-    let mut reader = io::BufReader::new(file.try_clone()?);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| GoatError::io("wal_replay_open", e))?;
+    let mut reader = io::BufReader::new(
+        file.try_clone()
+            .map_err(|e| GoatError::io("wal_replay_clone", e))?,
+    );
     let mut last_good_offset = 0u64;
     let mut max_sequence = 0u64;
     let mut entries = 0u64;
@@ -29,8 +37,10 @@ where
         let record = match read_record(&mut reader)? {
             RecordRead::Eof => break,
             RecordRead::Partial(_) | RecordRead::InvalidKeyLen => {
-                file.set_len(record_start)?;
-                file.sync_data()?;
+                file.set_len(record_start)
+                    .map_err(|e| GoatError::io("wal_replay_truncate_partial", e))?;
+                file.sync_data()
+                    .map_err(|e| GoatError::io("wal_replay_sync_partial", e))?;
                 truncated = true;
                 break;
             }
@@ -38,8 +48,10 @@ where
         };
 
         if !record.checksum_matches() {
-            file.set_len(record_start)?;
-            file.sync_data()?;
+            file.set_len(record_start)
+                .map_err(|e| GoatError::io("wal_replay_truncate_checksum", e))?;
+            file.sync_data()
+                .map_err(|e| GoatError::io("wal_replay_sync_checksum", e))?;
             truncated = true;
             break;
         }

@@ -1,9 +1,9 @@
 use std::collections::VecDeque;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
+use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::metadata::current;
 use crate::goatkv::metadata::file_metadata::FileMetadata;
 use crate::goatkv::metadata::manifest::{ManifestReader, ManifestWriter, INIT_MANIFEST_FILE_NAME};
@@ -135,7 +135,7 @@ impl VersionSet {
         manifest_paths: Arc<ManifestPaths>,
         sstable_paths: Arc<SstablePaths>,
         obsolete_sender: Sender<CleanupTask>,
-    ) -> Result<Self, std::io::Error> {
+    ) -> GoatResult<Self> {
         let options = VersionSetOptions::default();
         Self::new_with_options(manifest_paths, sstable_paths, options, obsolete_sender)
     }
@@ -146,7 +146,7 @@ impl VersionSet {
         sstable_paths: Arc<SstablePaths>,
         options: VersionSetOptions,
         obsolete_sender: Sender<CleanupTask>,
-    ) -> Result<Self, std::io::Error> {
+    ) -> GoatResult<Self> {
         // 创建空的当前版本：没有任何 SSTable
         let current = Arc::new(Version::new(options.num_levels, sstable_paths.clone()));
 
@@ -171,7 +171,7 @@ impl VersionSet {
         sstable_paths: Arc<SstablePaths>,
         options: VersionSetOptions,
         obsolete_sender: Sender<CleanupTask>,
-    ) -> Result<Self, std::io::Error> {
+    ) -> GoatResult<Self> {
         // 先创建空 VersionSet，再通过 MANIFEST 恢复到最新状态
         //
         // 设计理由：
@@ -185,7 +185,7 @@ impl VersionSet {
         Ok(version_set)
     }
 
-    fn recover_manifest(&mut self) -> Result<(), std::io::Error> {
+    fn recover_manifest(&mut self) -> GoatResult<()> {
         let data_dir = self.manifest_paths.data_dir();
 
         let manifest_path = self.resolve_manifest(data_dir)?;
@@ -196,9 +196,7 @@ impl VersionSet {
         // - MANIFEST 为 append-only，顺序回放即可恢复最新状态；
         // - 通过 replay 可保证元数据与历史行为一致。
         let mut reader = ManifestReader::new(&manifest_path)?;
-        let edits = reader
-            .read_all_edits()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let edits = reader.read_all_edits()?;
 
         // 按顺序应用 edit，重建 current 版本（恢复快路径）
         // 设计理由：
@@ -230,7 +228,7 @@ impl VersionSet {
         Ok(())
     }
 
-    fn validate_recovery(&self) -> Result<(), std::io::Error> {
+    fn validate_recovery(&self) -> GoatResult<()> {
         let version = &self.current;
         let mut seen_files = std::collections::HashSet::new();
 
@@ -241,29 +239,30 @@ impl VersionSet {
         // - 防止读路径访问损坏文件引发不可控错误。
         for (level, file) in version.all_files() {
             if !seen_files.insert(file.file_id) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
+                return Err(GoatError::corruption(
+                    "version_recovery",
                     format!("Duplicate file id detected: {}", file.file_id),
                 ));
             }
 
             if file.smallest_key() > file.largest_key() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
+                return Err(GoatError::corruption(
+                    "version_recovery",
                     format!("Invalid key range in level {} file {}", level, file.file_id),
                 ));
             }
 
             let path = self.sstable_paths.sstable_path_by_id(file.file_id);
             let metadata = std::fs::metadata(&path).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("SSTable missing {:?}: {}", path, e),
-                )
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    GoatError::not_found("sstable", format!("{:?}", path))
+                } else {
+                    GoatError::io("validate_recovery_sstable_metadata", e)
+                }
             })?;
             if metadata.len() < file.file_size() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
+                return Err(GoatError::corruption(
+                    "version_recovery",
                     format!(
                         "SSTable size smaller than manifest (file {}, expected {}, got {})",
                         file.file_id,
@@ -275,8 +274,8 @@ impl VersionSet {
 
             // 尝试打开 SSTable，验证 footer/index/bloom 结构
             crate::goatkv::storage::sstable::SSTableReader::open(&path).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
+                GoatError::corruption(
+                    "version_recovery",
                     format!("Invalid SSTable {:?}: {}", path, e),
                 )
             })?;
@@ -291,8 +290,8 @@ impl VersionSet {
             let files = version.get_files(level);
             for window in files.windows(2) {
                 if window[0].largest_key() >= window[1].smallest_key() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
+                    return Err(GoatError::corruption(
+                        "version_recovery",
                         format!("Overlapping SSTables in level {}", level),
                     ));
                 }
@@ -301,8 +300,8 @@ impl VersionSet {
 
         // last_sequence 必须单调非递减（基础检查）
         if self.last_sequence < version.creation_seqno() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            return Err(GoatError::corruption(
+                "version_recovery",
                 "last_sequence is behind current version",
             ));
         }
@@ -314,8 +313,10 @@ impl VersionSet {
         // - 恢复后对齐 manifest 状态，保持目录整洁。
         let data_dir = self.sstable_paths.data_dir();
         if data_dir.exists() {
-            for entry in std::fs::read_dir(data_dir)? {
-                let entry = entry?;
+            for entry in
+                std::fs::read_dir(data_dir).map_err(|e| GoatError::io("list_sstable_dir", e))?
+            {
+                let entry = entry.map_err(|e| GoatError::io("read_sstable_dir_entry", e))?;
                 let path = entry.path();
                 if !path.is_file() {
                     continue;
@@ -340,7 +341,7 @@ impl VersionSet {
         Ok(())
     }
 
-    fn create_initial_manifest(&self) -> Result<String, std::io::Error> {
+    fn create_initial_manifest(&self) -> GoatResult<String> {
         let manifest_name = INIT_MANIFEST_FILE_NAME.to_string();
         let manifest_path = self.manifest_paths.data_dir().join(&manifest_name);
         let _ = ManifestWriter::create(&manifest_path)?;
@@ -372,7 +373,7 @@ impl VersionSet {
         Self::parse_manifest_number(manifest_name).is_some() && manifest_path.is_file()
     }
 
-    fn resolve_manifest(&self, data_dir: &Path) -> Result<PathBuf, std::io::Error> {
+    fn resolve_manifest(&self, data_dir: &Path) -> GoatResult<PathBuf> {
         // 获取 CURRENT 指向的 MANIFEST；若 CURRENT 缺失，则回退到最新 MANIFEST
         // 或创建初始 MANIFEST。
         let mut manifest_name = match current::read_current(&self.manifest_paths)? {
@@ -404,22 +405,22 @@ impl VersionSet {
         }
 
         if !manifest_valid {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("MANIFEST not found: {:?}", manifest_path),
+            return Err(GoatError::not_found(
+                "manifest",
+                format!("{:?}", manifest_path),
             ));
         }
 
         Ok(manifest_path)
     }
 
-    fn apply_edits_for_recovery(&mut self, edits: Vec<VersionEdit>) -> Result<(), std::io::Error> {
+    fn apply_edits_for_recovery(&mut self, edits: Vec<VersionEdit>) -> GoatResult<()> {
         let mut files = self.current.clone_files();
         self.versions.clear();
 
         for edit in edits {
             self.apply_edit_in_place(edit, &mut files)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                .map_err(|e| GoatError::corruption("manifest_recovery", e.to_string()))?;
         }
 
         Self::sort_level_files(&mut files);
@@ -433,22 +434,17 @@ impl VersionSet {
     }
 
     /// 应用 VersionEdit
-    pub fn apply_edit(&mut self, edit: VersionEdit) -> Result<(), std::io::Error> {
+    pub fn apply_edit(&mut self, edit: VersionEdit) -> GoatResult<()> {
         self.apply_edit_internal(edit, true)
     }
 
-    fn apply_edit_internal(
-        &mut self,
-        edit: VersionEdit,
-        write_manifest: bool,
-    ) -> Result<(), std::io::Error> {
+    fn apply_edit_internal(&mut self, edit: VersionEdit, write_manifest: bool) -> GoatResult<()> {
         // 1. 验证 VersionEdit 的合法性，避免非法删除或重复新增
         //
         // 设计理由：
         // - 将安全性检查集中在此处；
         // - 防止错误 edit 破坏 current 结构。
-        self.validate_edit(&edit)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.validate_edit(&edit)?;
 
         // 2. 先写 MANIFEST，保证崩溃恢复时元数据可重放
         //
@@ -456,10 +452,9 @@ impl VersionSet {
         // - 采用 WAL 思路：先持久化 edit，再更新内存；
         // - 崩溃后能通过 MANIFEST 重放恢复一致性。
         if write_manifest {
-            let manifest = self
-                .manifest_writer
-                .as_mut()
-                .ok_or_else(|| io::Error::other("manifest writer not initialized"))?;
+            let manifest = self.manifest_writer.as_mut().ok_or_else(|| {
+                GoatError::internal("version_set", "manifest writer not initialized")
+            })?;
             manifest.append_edit(&edit)?;
             manifest.sync()?; // ⚠️ 必须 fsync
         }
@@ -484,9 +479,7 @@ impl VersionSet {
         // 设计理由：
         // - 旧版本保持不变，读路径可继续使用；
         // - 写路径通过生成新版本完成原子切换。
-        let new_version = self
-            .create_new_version(&edit)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let new_version = self.create_new_version(&edit)?;
 
         // 5. 更新当前版本，并将旧版本加入历史列表
         //
@@ -500,13 +493,16 @@ impl VersionSet {
     }
 
     /// 验证 VersionEdit 的合法性
-    fn validate_edit(&self, edit: &VersionEdit) -> Result<(), String> {
+    fn validate_edit(&self, edit: &VersionEdit) -> GoatResult<()> {
         // 检查删除的文件是否存在
         for (level, file_num) in &edit.deleted_files {
             if !self.contains_file(*level, *file_num) {
-                return Err(format!(
-                    "Trying to delete non-existent file {} at level {}",
-                    file_num, level
+                return Err(GoatError::conflict(
+                    "version_edit",
+                    format!(
+                        "Trying to delete non-existent file {} at level {}",
+                        file_num, level
+                    ),
                 ));
             }
         }
@@ -514,20 +510,26 @@ impl VersionSet {
         // 检查新增文件的 ID 是否有效
         for (level, new_file) in &edit.new_files {
             if *level >= self.options.num_levels {
-                return Err(format!(
-                    "Invalid level {} (max {})",
-                    level, self.options.num_levels
+                return Err(GoatError::conflict(
+                    "version_edit",
+                    format!("Invalid level {} (max {})", level, self.options.num_levels),
                 ));
             }
 
             // 检查文件 ID 是否已被使用
             if self.contains_file_any_level(new_file.file_id) {
-                return Err(format!("File ID {} already exists", new_file.file_id));
+                return Err(GoatError::conflict(
+                    "version_edit",
+                    format!("File ID {} already exists", new_file.file_id),
+                ));
             }
 
             // 验证 key 范围
             if new_file.smallest_key() > new_file.largest_key() {
-                return Err("Invalid key range: smallest > largest".to_string());
+                return Err(GoatError::conflict(
+                    "version_edit",
+                    "Invalid key range: smallest > largest",
+                ));
             }
         }
 
@@ -538,30 +540,39 @@ impl VersionSet {
         &self,
         edit: &VersionEdit,
         files: &[Vec<Arc<FileMetadata>>],
-    ) -> Result<(), String> {
+    ) -> GoatResult<()> {
         for (level, file_num) in &edit.deleted_files {
             if !Self::contains_file_in_files(files, *level, *file_num) {
-                return Err(format!(
-                    "Trying to delete non-existent file {} at level {}",
-                    file_num, level
+                return Err(GoatError::conflict(
+                    "version_edit",
+                    format!(
+                        "Trying to delete non-existent file {} at level {}",
+                        file_num, level
+                    ),
                 ));
             }
         }
 
         for (level, new_file) in &edit.new_files {
             if *level >= self.options.num_levels {
-                return Err(format!(
-                    "Invalid level {} (max {})",
-                    level, self.options.num_levels
+                return Err(GoatError::conflict(
+                    "version_edit",
+                    format!("Invalid level {} (max {})", level, self.options.num_levels),
                 ));
             }
 
             if Self::contains_file_any_level_in_files(files, new_file.file_id) {
-                return Err(format!("File ID {} already exists", new_file.file_id));
+                return Err(GoatError::conflict(
+                    "version_edit",
+                    format!("File ID {} already exists", new_file.file_id),
+                ));
             }
 
             if new_file.smallest_key() > new_file.largest_key() {
-                return Err("Invalid key range: smallest > largest".to_string());
+                return Err(GoatError::conflict(
+                    "version_edit",
+                    "Invalid key range: smallest > largest",
+                ));
             }
         }
 
@@ -604,7 +615,7 @@ impl VersionSet {
     }
 
     /// 创建新 Version
-    fn create_new_version(&self, edit: &VersionEdit) -> Result<Arc<Version>, String> {
+    fn create_new_version(&self, edit: &VersionEdit) -> GoatResult<Arc<Version>> {
         // 复制当前版本的所有文件到新的列表中
         //
         // 设计理由：
@@ -668,7 +679,7 @@ impl VersionSet {
         &mut self,
         edit: VersionEdit,
         files: &mut Vec<Vec<Arc<FileMetadata>>>,
-    ) -> Result<(), String> {
+    ) -> GoatResult<()> {
         self.validate_edit_for_files(&edit, files)?;
 
         if let Some(log_num) = edit.log_number {

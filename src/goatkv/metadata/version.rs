@@ -1,11 +1,12 @@
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 
+use crate::goatkv::error::{Error as GoatError, ErrorKind as GoatErrorKind, Result as GoatResult};
 use crate::goatkv::format::internal_key::InternalKey;
 use crate::goatkv::metadata::file_metadata::FileMetadata;
 use crate::goatkv::storage::sstable::SSTableReader;
 use crate::goatkv::utils::paths::SstablePaths;
-use tracing::warn;
 
 /// Version 代表某一时刻数据库的完整状态
 /// 一旦创建后不可修改，支持并发无锁读取
@@ -25,6 +26,54 @@ pub struct Version {
 }
 
 impl Version {
+    fn map_sstable_open_err(path: &Path, err: GoatError) -> GoatError {
+        if matches!(
+            &err,
+            GoatError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound
+        ) || err.kind() == GoatErrorKind::NotFound
+        {
+            return GoatError::corruption(
+                "sstable_open",
+                format!("sstable missing: {:?}", path),
+            );
+        }
+
+        match err.kind() {
+            GoatErrorKind::Corruption => {
+                GoatError::corruption("sstable_open", format!("{:?}: {}", path, err))
+            }
+            _ => GoatError::internal_with_source(
+                "sstable_open",
+                format!("failed to open sstable: {:?}", path),
+                err,
+            ),
+        }
+    }
+
+    fn map_sstable_read_err(path: &Path, err: GoatError) -> GoatError {
+        if matches!(
+            &err,
+            GoatError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound
+        ) || err.kind() == GoatErrorKind::NotFound
+        {
+            return GoatError::corruption(
+                "sstable_read",
+                format!("sstable file missing during read: {:?}", path),
+            );
+        }
+
+        match err.kind() {
+            GoatErrorKind::Corruption => {
+                GoatError::corruption("sstable_read", format!("{:?}: {}", path, err))
+            }
+            _ => GoatError::internal_with_source(
+                "sstable_read",
+                format!("failed to read sstable: {:?}", path),
+                err,
+            ),
+        }
+    }
+
     /// 创建一个新的空 Version
     pub fn new(num_levels: usize, sstable_paths: Arc<SstablePaths>) -> Self {
         Self {
@@ -58,7 +107,7 @@ impl Version {
     /// 查找包含指定 key 的 SSTable
     /// 返回 (level, file_meta) 如果找到
     // todo table cache
-    pub fn get(&self, key: &[u8]) -> Option<(InternalKey, Vec<u8>)> {
+    pub fn get(&self, key: &[u8]) -> GoatResult<Option<(InternalKey, Vec<u8>)>> {
         // 先检查 Level 0
         // Level 0 文件可能重叠，必须从最新的 SSTable 开始查找，避免返回旧值
         for file in self.files[0].iter().rev() {
@@ -67,22 +116,15 @@ impl Version {
             if key >= file.smallest_user_key() && key <= file.largest_user_key() {
                 // key在文件范围中，说明该文件中可能包含key
                 let sstable_path = self.sstable_paths.sstable_path_by_id(file.file_id);
-                match SSTableReader::open(&sstable_path) {
-                    Ok(mut reader) => {
-                        match reader.get(key) {
-                            Ok(Some(result)) => return Some(result),
-                            Ok(None) => continue, // Not found in this sstable, check next
-                            Err(e) => {
-                                warn!("Failed to read from sstable {:?}: {}", sstable_path, e);
-                                return None;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to open sstable {:?}: {}", sstable_path, e);
-                        return None;
-                    }
-                }
+                let mut reader = SSTableReader::open(&sstable_path)
+                    .map_err(|e| Self::map_sstable_open_err(&sstable_path, e))?;
+                match reader
+                    .get(key)
+                    .map_err(|e| Self::map_sstable_read_err(&sstable_path, e))?
+                {
+                    Some(result) => return Ok(Some(result)),
+                    None => continue, // Not found in this sstable, check next
+                };
             }
         }
 
@@ -90,26 +132,15 @@ impl Version {
         for level in 1..self.files.len() {
             if let Some(file) = self.search_level(level, key) {
                 let sstable_path = self.sstable_paths.sstable_path_by_id(file.file_id);
-                match SSTableReader::open(&sstable_path) {
-                    Ok(mut reader) => {
-                        match reader.get(key) {
-                            Ok(Some(result)) => return Some(result),
-                            Ok(None) => return None, // Not found in this sstable, check next
-                            Err(e) => {
-                                warn!("Failed to read from sstable {:?}: {}", sstable_path, e);
-                                return None;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to open sstable {:?}: {}", sstable_path, e);
-                        return None;
-                    }
-                }
+                let mut reader = SSTableReader::open(&sstable_path)
+                    .map_err(|e| Self::map_sstable_open_err(&sstable_path, e))?;
+                return reader
+                    .get(key)
+                    .map_err(|e| Self::map_sstable_read_err(&sstable_path, e));
             }
         }
 
-        None
+        Ok(None)
     }
 
     /// 在指定层级（非 Level 0）中查找包含 key 的文件

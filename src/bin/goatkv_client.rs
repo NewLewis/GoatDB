@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use goat_db::goatkv::{Error as GoatError, Result as GoatResult};
 use goatkv::goat_kv_service_client::GoatKvServiceClient;
 use rustyline::{error::ReadlineError, DefaultEditor};
 use std::time::Duration;
@@ -108,15 +109,15 @@ enum Commands {
 }
 
 /// 交互式 REPL 客户端
-async fn run_interactive(
-    mut client: GoatKvServiceClient<Channel>,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_interactive(mut client: GoatKvServiceClient<Channel>) -> GoatResult<()> {
     println!("GoatDB Interactive Client");
     println!("Connected to server successfully!");
     println!("Commands: put <key> <value>, get <key>, update <key> <value>, delete <key>, exit");
     println!("Use Tab for auto-completion, ↑↓ for history, Ctrl+C to exit");
 
-    let mut rl = DefaultEditor::new()?;
+    let mut rl = DefaultEditor::new().map_err(|e| {
+        GoatError::internal_with_source("client_repl_init", "failed to initialize repl", e)
+    })?;
     let history_file = get_history_path()?;
 
     // 尝试加载历史文件
@@ -133,7 +134,13 @@ async fn run_interactive(
                     continue;
                 }
 
-                rl.add_history_entry(line)?;
+                rl.add_history_entry(line).map_err(|e| {
+                    GoatError::internal_with_source(
+                        "client_repl_add_history",
+                        "failed to add history entry",
+                        e,
+                    )
+                })?;
 
                 match line {
                     "exit" | "quit" | ":q" => {
@@ -191,7 +198,9 @@ async fn run_interactive(
     }
 
     // 保存历史记录
-    rl.save_history(&history_file)?;
+    rl.save_history(&history_file).map_err(|e| {
+        GoatError::internal_with_source("client_repl_save_history", "failed to save history", e)
+    })?;
     Ok(())
 }
 
@@ -214,19 +223,22 @@ fn print_help() {
 }
 
 /// 处理 put 命令
-async fn handle_put(
-    client: &mut GoatKvServiceClient<Channel>,
-    args: &[&str],
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_put(client: &mut GoatKvServiceClient<Channel>, args: &[&str]) -> GoatResult<()> {
     if args.len() < 2 {
-        return Err("Usage: put <key> <value>".into());
+        return Err(GoatError::invalid_argument(
+            "put",
+            "Usage: put <key> <value>",
+        ));
     }
 
     let key = args[0].as_bytes().to_vec();
     let value = args[1].as_bytes().to_vec();
 
     let request = tonic::Request::new(goatkv::WriteRequest { key, value });
-    let response = client.write(request).await?;
+    let response = client
+        .write(request)
+        .await
+        .map_err(|e| GoatError::unavailable("grpc_write", e.to_string()))?;
     let resp_data = response.into_inner();
 
     if resp_data.success {
@@ -239,18 +251,18 @@ async fn handle_put(
 }
 
 /// 处理 get 命令
-async fn handle_get(
-    client: &mut GoatKvServiceClient<Channel>,
-    args: &[&str],
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_get(client: &mut GoatKvServiceClient<Channel>, args: &[&str]) -> GoatResult<()> {
     if args.is_empty() {
-        return Err("Usage: get <key>".into());
+        return Err(GoatError::invalid_argument("get", "Usage: get <key>"));
     }
 
     let key = args[0].as_bytes().to_vec();
 
     let request = tonic::Request::new(goatkv::GetRequest { key });
-    let response = client.get(request).await?;
+    let response = client
+        .get(request)
+        .await
+        .map_err(|e| GoatError::unavailable("grpc_get", e.to_string()))?;
     let resp_data = response.into_inner();
 
     if resp_data.success {
@@ -264,19 +276,22 @@ async fn handle_get(
 }
 
 /// 处理 update 命令
-async fn handle_update(
-    client: &mut GoatKvServiceClient<Channel>,
-    args: &[&str],
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_update(client: &mut GoatKvServiceClient<Channel>, args: &[&str]) -> GoatResult<()> {
     if args.len() < 2 {
-        return Err("Usage: update <key> <value>".into());
+        return Err(GoatError::invalid_argument(
+            "update",
+            "Usage: update <key> <value>",
+        ));
     }
 
     let key = args[0].as_bytes().to_vec();
     let value = args[1].as_bytes().to_vec();
 
     let request = tonic::Request::new(goatkv::UpdateRequest { key, value });
-    let response = client.update(request).await?;
+    let response = client
+        .update(request)
+        .await
+        .map_err(|e| GoatError::unavailable("grpc_update", e.to_string()))?;
     let resp_data = response.into_inner();
 
     if resp_data.success {
@@ -289,18 +304,18 @@ async fn handle_update(
 }
 
 /// 处理 delete 命令
-async fn handle_delete(
-    client: &mut GoatKvServiceClient<Channel>,
-    args: &[&str],
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_delete(client: &mut GoatKvServiceClient<Channel>, args: &[&str]) -> GoatResult<()> {
     if args.is_empty() {
-        return Err("Usage: delete <key>".into());
+        return Err(GoatError::invalid_argument("delete", "Usage: delete <key>"));
     }
 
     let key = args[0].as_bytes().to_vec();
 
     let request = tonic::Request::new(goatkv::DeleteRequest { key });
-    let response = client.delete(request).await?;
+    let response = client
+        .delete(request)
+        .await
+        .map_err(|e| GoatError::unavailable("grpc_delete", e.to_string()))?;
     let resp_data = response.into_inner();
 
     if resp_data.success {
@@ -313,11 +328,12 @@ async fn handle_delete(
 }
 
 /// 处理 flush 命令
-async fn handle_flush(
-    client: &mut GoatKvServiceClient<Channel>,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_flush(client: &mut GoatKvServiceClient<Channel>) -> GoatResult<()> {
     let request = tonic::Request::new(goatkv::FlushRequest {});
-    let response = client.flush(request).await?;
+    let response = client
+        .flush(request)
+        .await
+        .map_err(|e| GoatError::unavailable("grpc_flush", e.to_string()))?;
     let resp_data = response.into_inner();
 
     if resp_data.success {
@@ -333,7 +349,7 @@ async fn handle_flush(
 async fn execute_command(
     mut client: GoatKvServiceClient<Channel>,
     command: Commands,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> GoatResult<()> {
     match command {
         Commands::Put { key, value } => {
             let args = vec![key.as_str(), value.as_str()];
@@ -356,32 +372,45 @@ async fn execute_command(
 }
 
 /// 获取历史文件路径（位于用户主目录）
-fn get_history_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+fn get_history_path() -> GoatResult<std::path::PathBuf> {
     // 获取用户主目录
     let home_dir = if cfg!(windows) {
-        std::env::var("USERPROFILE").map_err(|_| "Cannot find USERPROFILE environment variable")?
+        std::env::var("USERPROFILE").map_err(|e| {
+            GoatError::internal_with_source(
+                "client_history_home",
+                "cannot find USERPROFILE environment variable",
+                e,
+            )
+        })?
     } else {
-        std::env::var("HOME").map_err(|_| "Cannot find HOME environment variable")?
+        std::env::var("HOME").map_err(|e| {
+            GoatError::internal_with_source(
+                "client_history_home",
+                "cannot find HOME environment variable",
+                e,
+            )
+        })?
     };
 
     let mut path = std::path::PathBuf::from(home_dir);
     path.push(".goatkv");
 
     // 确保目录存在
-    std::fs::create_dir_all(&path)?;
+    std::fs::create_dir_all(&path).map_err(|e| GoatError::io("client_history_mkdir", e))?;
 
     path.push("history");
     Ok(path)
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> GoatResult<()> {
     let cli = Cli::parse();
 
     // 创建带有超时的连接端点
     println!("Connecting to {}...", cli.address);
 
-    let endpoint = Endpoint::from_shared(cli.address)?
+    let endpoint = Endpoint::from_shared(cli.address)
+        .map_err(|e| GoatError::invalid_argument("address", e.to_string()))?
         .timeout(Duration::from_secs(5)) // 连接和请求超时
         .connect_timeout(Duration::from_secs(3)) // 连接建立超时
         .tcp_keepalive(Some(Duration::from_secs(30))) // TCP keepalive
@@ -396,7 +425,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("✗ Failed to connect to server: {}", e);
             eprintln!("  Please ensure the server is running at the specified address.");
             eprintln!("  You can start the server with: cargo run --bin goatkv_server");
-            return Err(e.into());
+            return Err(GoatError::unavailable("grpc_connect", e.to_string()));
         }
     };
 

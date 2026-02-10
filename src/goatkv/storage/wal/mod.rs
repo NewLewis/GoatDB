@@ -22,6 +22,7 @@ mod tests {
     use super::format::checksum_for;
     use super::{WalCodec, WalReader, WalWriter};
     use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
+    use crate::goatkv::ErrorKind;
     use std::fs;
     use tempfile::NamedTempFile;
 
@@ -140,7 +141,8 @@ mod tests {
         let result = reader.next().expect("Expected entry");
         assert!(result.is_err());
         let error = result.unwrap_err();
-        assert!(error.to_string().contains("Checksum mismatch"));
+        assert_eq!(error.kind(), ErrorKind::Corruption);
+        assert!(error.to_string().contains("checksum mismatch"));
     }
 
     #[test]

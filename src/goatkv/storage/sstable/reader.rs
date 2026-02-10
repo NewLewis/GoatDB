@@ -1,9 +1,10 @@
 use std::cmp::Ordering;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use super::block_reader::BlockReader;
+use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::format::coding;
 use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind, SEQUENCE_NUMBER_MAX};
 
@@ -38,24 +39,32 @@ pub struct SSTableReader {
 }
 
 impl SSTableReader {
+    fn corruption(message: impl Into<String>) -> GoatError {
+        GoatError::corruption("sstable_reader", message.into())
+    }
+
     /// 打开并解析 SSTable 文件
-    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+    pub fn open<P: AsRef<Path>>(path: P) -> GoatResult<Self> {
         let path_ref = path.as_ref();
-        let mut file = File::open(path_ref)?;
+        let mut file = File::open(path_ref).map_err(|e| GoatError::io("sstable_open", e))?;
 
         // 1. 读取文件大小
-        let file_size = file.metadata()?.len();
+        let file_size = file
+            .metadata()
+            .map_err(|e| GoatError::io("sstable_metadata", e))?
+            .len();
         if file_size < FOOTER_SIZE as u64 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            return Err(Self::corruption(
                 "SSTable file is too small to contain valid footer",
             ));
         }
 
         // 2. 读取最后的 FOOTER_SIZE 字节
-        file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
+        file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))
+            .map_err(|e| GoatError::io("sstable_seek_footer", e))?;
         let mut footer = vec![0u8; FOOTER_SIZE];
-        file.read_exact(&mut footer)?;
+        file.read_exact(&mut footer)
+            .map_err(|e| GoatError::io("sstable_read_footer", e))?;
 
         // 3. 首先验证 Magic Number（最后8字节）
         let magic_bytes = &footer[footer.len() - 8..];
@@ -71,13 +80,10 @@ impl SSTableReader {
         ]);
 
         if magic != MAGIC_NUMBER {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Invalid magic number: expected {:x}, got {:x}",
-                    MAGIC_NUMBER, magic
-                ),
-            ));
+            return Err(Self::corruption(format!(
+                "Invalid magic number: expected {:x}, got {:x}",
+                MAGIC_NUMBER, magic
+            )));
         }
 
         // 4. 从前往后解析 Footer，但使用更健壮的方法
@@ -89,10 +95,10 @@ impl SSTableReader {
             match coding::decode_varint64_with_length(&footer[cursor..]) {
                 Ok(result) => result,
                 Err(e) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("Failed to decode bloom filter offset: {}", e),
-                    ));
+                    return Err(Self::corruption(format!(
+                        "Failed to decode bloom filter offset: {}",
+                        e
+                    )));
                 }
             };
 
@@ -103,10 +109,10 @@ impl SSTableReader {
             match coding::decode_varint64_with_length(&footer[cursor..]) {
                 Ok(result) => result,
                 Err(e) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("Failed to decode index block offset: {}", e),
-                    ));
+                    return Err(Self::corruption(format!(
+                        "Failed to decode index block offset: {}",
+                        e
+                    )));
                 }
             };
 
@@ -123,41 +129,34 @@ impl SSTableReader {
 
         // 6. 验证偏移量
         if bloom_offset >= file_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Invalid bloom_offset: bloom_offset={}, file_size={}",
-                    bloom_offset, file_size
-                ),
-            ));
+            return Err(Self::corruption(format!(
+                "Invalid bloom_offset: bloom_offset={}, file_size={}",
+                bloom_offset, file_size
+            )));
         }
 
         if index_offset >= file_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Invalid index_offset: index_offset={}, file_size={}",
-                    index_offset, file_size
-                ),
-            ));
+            return Err(Self::corruption(format!(
+                "Invalid index_offset: index_offset={}, file_size={}",
+                index_offset, file_size
+            )));
         }
 
         if bloom_offset >= index_offset {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Invalid offset order: bloom_offset={} >= index_offset={}",
-                    bloom_offset, index_offset
-                ),
-            ));
+            return Err(Self::corruption(format!(
+                "Invalid offset order: bloom_offset={} >= index_offset={}",
+                bloom_offset, index_offset
+            )));
         }
 
         // 5. 读取 BloomFilter
-        file.seek(SeekFrom::Start(bloom_offset))?;
+        file.seek(SeekFrom::Start(bloom_offset))
+            .map_err(|e| GoatError::io("sstable_seek_bloom", e))?;
         // BloomFilter 的大小是 index_offset - bloom_offset
         let bloom_filter_size = index_offset - bloom_offset;
         let mut bloom_bitmap = vec![0u8; bloom_filter_size as usize];
-        file.read_exact(&mut bloom_bitmap)?;
+        file.read_exact(&mut bloom_bitmap)
+            .map_err(|e| GoatError::io("sstable_read_bloom", e))?;
         let bloom_filter = super::bloom::BloomFilter::new(bloom_bitmap);
 
         // 6. 读取和解析索引块
@@ -168,36 +167,32 @@ impl SSTableReader {
         let footer_start = file_size - FOOTER_SIZE as u64;
 
         if index_block_start >= footer_start {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Index block start beyond footer: index_block_start={}, footer_start={}",
-                    index_block_start, footer_start
-                ),
-            ));
+            return Err(Self::corruption(format!(
+                "Index block start beyond footer: index_block_start={}, footer_start={}",
+                index_block_start, footer_start
+            )));
         }
 
         let index_block_size = footer_start - index_block_start;
         if index_block_size == 0 {
             // 索引块可能为空（只有一个数据块的情况？）
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Index block size is zero",
-            ));
+            return Err(Self::corruption("Index block size is zero"));
         }
 
-        file.seek(SeekFrom::Start(index_block_start))?;
+        file.seek(SeekFrom::Start(index_block_start))
+            .map_err(|e| GoatError::io("sstable_seek_index", e))?;
         let mut index_block_data = vec![0u8; index_block_size as usize];
-        file.read_exact(&mut index_block_data)?;
+        file.read_exact(&mut index_block_data)
+            .map_err(|e| GoatError::io("sstable_read_index", e))?;
 
         // 解析索引块
         let index_reader = match BlockReader::new(&index_block_data) {
             Ok(reader) => reader,
             Err(e) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Failed to parse index block: {}", e),
-                ));
+                return Err(Self::corruption(format!(
+                    "Failed to parse index block: {}",
+                    e
+                )));
             }
         };
 
@@ -206,13 +201,10 @@ impl SSTableReader {
         for (separator, offset_data) in index_reader.iter() {
             // offset_data 格式：block_offset(varint) + block_size(varint)
             if offset_data.len() < 2 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Index entry offset data too short: {} bytes",
-                        offset_data.len()
-                    ),
-                ));
+                return Err(Self::corruption(format!(
+                    "Index entry offset data too short: {} bytes",
+                    offset_data.len()
+                )));
             }
 
             // 解码块偏移量
@@ -220,10 +212,10 @@ impl SSTableReader {
             {
                 Ok(result) => result,
                 Err(e) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("Failed to decode block offset varint: {}", e),
-                    ));
+                    return Err(Self::corruption(format!(
+                        "Failed to decode block offset varint: {}",
+                        e
+                    )));
                 }
             };
 
@@ -232,10 +224,10 @@ impl SSTableReader {
             let block_size = match coding::decode_varint64(block_size_data) {
                 Ok(size) => size,
                 Err(e) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("Failed to decode block size varint: {}", e),
-                    ));
+                    return Err(Self::corruption(format!(
+                        "Failed to decode block size varint: {}",
+                        e
+                    )));
                 }
             };
 
@@ -263,7 +255,7 @@ impl SSTableReader {
     }
 
     /// 在 SSTable 中查找指定的 key (UserKey)
-    pub fn get(&mut self, key: &[u8]) -> io::Result<Option<(InternalKey, Vec<u8>)>> {
+    pub fn get(&mut self, key: &[u8]) -> GoatResult<Option<(InternalKey, Vec<u8>)>> {
         // 1. 使用 BloomFilter 快速过滤 (BloomFilter now indexes UserKey)
         if !self.may_contain(key) {
             return Ok(None);
@@ -279,18 +271,22 @@ impl SSTableReader {
         };
 
         // 3. 读取数据块
-        self.file.seek(SeekFrom::Start(block_offset))?;
+        self.file
+            .seek(SeekFrom::Start(block_offset))
+            .map_err(|e| GoatError::io("sstable_seek_data_block", e))?;
         let mut block_data = vec![0u8; block_size as usize];
-        self.file.read_exact(&mut block_data)?;
+        self.file
+            .read_exact(&mut block_data)
+            .map_err(|e| GoatError::io("sstable_read_data_block", e))?;
 
         // 4. 在数据块中查找 key
         let block_reader = match BlockReader::new(&block_data) {
             Ok(reader) => reader,
             Err(e) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Failed to parse data block: {}", e),
-                ));
+                return Err(Self::corruption(format!(
+                    "Failed to parse data block: {}",
+                    e
+                )));
             }
         };
 
@@ -422,7 +418,7 @@ mod tests {
             key_bytes.extend_from_slice(internal_key.user_key());
             key_bytes.extend_from_slice(&(!internal_key.encoded_sequence_number()).to_be_bytes());
 
-            builder.write(&key_bytes, &value);
+            builder.write(&key_bytes, &value).unwrap();
             sequence_number -= 1; // 递减序列号以确保正确排序
         }
 
@@ -448,7 +444,9 @@ mod tests {
             let key_bytes = key.as_bytes().to_vec();
             let value_bytes = value.as_bytes().to_vec();
 
-            builder.write(&internal_key.serialize(), &value_bytes);
+            builder
+                .write(&internal_key.serialize(), &value_bytes)
+                .unwrap();
             test_data.push((key_bytes, value_bytes));
         }
 

@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 
+use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::format::coding;
 
 /// SSTable块读取器，用于解码BlockBuilder创建的块
@@ -15,9 +16,12 @@ pub struct BlockReader<'a> {
 
 impl<'a> BlockReader<'a> {
     /// 从原始字节创建BlockReader
-    pub fn new(data: &'a [u8]) -> Result<Self, &'static str> {
+    pub fn new(data: &'a [u8]) -> GoatResult<Self> {
         if data.len() < 4 {
-            return Err("Block too small to contain restart count");
+            return Err(GoatError::corruption(
+                "block_reader",
+                "block too small to contain restart count",
+            ));
         }
 
         // 最后4字节是重启点数量
@@ -42,7 +46,10 @@ impl<'a> BlockReader<'a> {
         // 检查是否有足够的空间容纳重启点数组
         let restart_array_size = restart_count * 4;
         if data.len() < 4 + restart_array_size {
-            return Err("Block too small for restart array");
+            return Err(GoatError::corruption(
+                "block_reader",
+                "block too small for restart array",
+            ));
         }
 
         // 重启点数组位于数据末尾之前（在重启点数量之前）
@@ -272,9 +279,12 @@ impl<'a> BlockReader<'a> {
     }
 
     /// 解码指定位置的条目
-    fn decode_entry_at(&self, pos: usize) -> Result<(u32, Vec<u8>, Vec<u8>), &'static str> {
+    fn decode_entry_at(&self, pos: usize) -> GoatResult<(u32, Vec<u8>, Vec<u8>)> {
         if pos >= self.data_end {
-            return Err("Position out of bounds");
+            return Err(GoatError::corruption(
+                "block_reader",
+                "position out of bounds",
+            ));
         }
 
         let mut offset = pos;
@@ -293,7 +303,10 @@ impl<'a> BlockReader<'a> {
 
         // 检查边界
         if offset + unshared as usize + value_len as usize > self.data_end {
-            return Err("Entry exceeds block boundary");
+            return Err(GoatError::corruption(
+                "block_reader",
+                "entry exceeds block boundary",
+            ));
         }
 
         // 读取非共享的key部分
@@ -346,9 +359,12 @@ impl<'a> BlockReader<'a> {
     }
 
     /// 在指定位置解码varint
-    fn decode_varint_at(&self, pos: usize) -> Result<(u64, usize), &'static str> {
+    fn decode_varint_at(&self, pos: usize) -> GoatResult<(u64, usize)> {
         if pos >= self.data_end {
-            return Err("Position out of bounds");
+            return Err(GoatError::corruption(
+                "block_reader",
+                "position out of bounds",
+            ));
         }
 
         let bytes = &self.data[pos..self.data_end];

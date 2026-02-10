@@ -1,6 +1,5 @@
 use std::cmp::max;
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
@@ -14,6 +13,7 @@ use crate::goatkv::core::flush_worker::{FlushTask, FlushWorker};
 use crate::goatkv::core::lsm_state::{ImmutableMemTableEntry, LSMState};
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
 use crate::goatkv::core::sequence_number::SequenceNumber;
+use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::metadata::version::Version;
 use crate::goatkv::metadata::version_set::{VersionSet, VersionSetOptions};
 use crate::goatkv::storage::wal::{
@@ -68,7 +68,7 @@ impl Default for KvEngine {
 }
 
 impl KvEngine {
-    pub fn init_db_paths<P: AsRef<Path>>(base_dir: P) -> Result<DbPaths, std::io::Error> {
+    pub fn init_db_paths<P: AsRef<Path>>(base_dir: P) -> GoatResult<DbPaths> {
         let base_dir = base_dir.as_ref().to_path_buf();
         let data_dir = base_dir.join("data");
         let wal_dir = base_dir.join("wal");
@@ -78,7 +78,7 @@ impl KvEngine {
         let dirs = [&base_dir, &data_dir, &wal_dir, &log_dir, &tmp_dir];
         for dir in dirs {
             if !dir.exists() {
-                fs::create_dir_all(dir)?;
+                fs::create_dir_all(dir).map_err(|e| GoatError::io("init_db_paths_mkdir", e))?;
             }
         }
 
@@ -96,7 +96,7 @@ impl KvEngine {
     }
 
     /// 创建新的 KvEngine，使用指定的配置选项
-    pub fn new_with_options(options: KvEngineOptions) -> Result<Self, io::Error> {
+    pub fn new_with_options(options: KvEngineOptions) -> GoatResult<Self> {
         let (wal_paths, sstable_paths, manifest_paths) = Self::prepare_paths(&options)?;
         let (cleanup_worker, cleanup_sender, cleanup_enabled) =
             Self::init_cleanup(wal_paths.clone(), sstable_paths.clone());
@@ -171,30 +171,27 @@ impl KvEngine {
         &self.manifest_paths
     }
 
-    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+    pub fn get(&self, key: &[u8]) -> GoatResult<Option<Vec<u8>>> {
         self.reader.get(key)
     }
 
-    pub fn put(&self, key: Vec<u8>, value: Vec<u8>) {
+    pub fn put(&self, key: Vec<u8>, value: Vec<u8>) -> GoatResult<()> {
         self.submit_write(vec![WriteOp::Put(key, value)])
-            .expect("Failed to write to WAL");
     }
 
-    pub fn put_batch(&self, entries: Vec<(Vec<u8>, Vec<u8>)>) {
+    pub fn put_batch(&self, entries: Vec<(Vec<u8>, Vec<u8>)>) -> GoatResult<()> {
         if entries.is_empty() {
-            return;
+            return Ok(());
         }
         let ops = entries
             .into_iter()
             .map(|(key, value)| WriteOp::Put(key, value))
             .collect();
         self.submit_write(ops)
-            .expect("Failed to write batch to WAL");
     }
 
-    pub fn delete(&self, key: Vec<u8>) {
+    pub fn delete(&self, key: Vec<u8>) -> GoatResult<()> {
         self.submit_write(vec![WriteOp::Delete(key)])
-            .expect("Failed to write to WAL");
     }
 
     pub fn flush(&self) {
@@ -223,7 +220,7 @@ impl Drop for KvEngine {
 }
 
 impl KvEngine {
-    fn prepare_paths(options: &KvEngineOptions) -> io::Result<DbPaths> {
+    fn prepare_paths(options: &KvEngineOptions) -> GoatResult<DbPaths> {
         let (wal_paths, sstable_paths, manifest_paths) = Self::init_db_paths(&options.data_dir)?;
         let _ = sstable_paths.cleanup_tmp_dir();
         Ok((wal_paths, sstable_paths, manifest_paths))
@@ -243,7 +240,7 @@ impl KvEngine {
         sstable_paths: Arc<SstablePaths>,
         options: &KvEngineOptions,
         cleanup_sender: mpsc::Sender<CleanupTask>,
-    ) -> io::Result<(Arc<RwLock<VersionSet>>, Arc<Version>)> {
+    ) -> GoatResult<(Arc<RwLock<VersionSet>>, Arc<Version>)> {
         let vs_options = VersionSetOptions::from(options);
         let version_set =
             VersionSet::open(manifest_paths, sstable_paths, vs_options, cleanup_sender)?;
@@ -259,7 +256,7 @@ impl KvEngine {
         min_log_number: u64,
         cleanup_sender: &mpsc::Sender<CleanupTask>,
         cleanup_enabled: &Arc<AtomicBool>,
-    ) -> io::Result<(WalReplayStats, u64)> {
+    ) -> GoatResult<(WalReplayStats, u64)> {
         if !options.recover_from_wal {
             return Ok((
                 WalReplayStats {
@@ -296,7 +293,7 @@ impl KvEngine {
         options: &KvEngineOptions,
         wal_paths: &WalPaths,
         log_number: u64,
-    ) -> io::Result<WalManager> {
+    ) -> GoatResult<WalManager> {
         let wal_path = wal_paths.wal_path_by_id(log_number);
         WalManager::new(
             wal_path,
@@ -307,7 +304,9 @@ impl KvEngine {
                 max_buffer_bytes: options.wal_max_buffer_bytes,
             },
         )
-        .map_err(|e| io::Error::other(format!("Failed to open WAL manager: {}", e)))
+        .map_err(|e| {
+            GoatError::internal_with_source("open_wal_manager", "failed to open wal manager", e)
+        })
     }
 
     fn init_sequence_number(
@@ -458,7 +457,7 @@ impl KvEngine {
 }
 
 impl KvEngine {
-    fn submit_write(&self, ops: Vec<WriteOp>) -> io::Result<()> {
+    fn submit_write(&self, ops: Vec<WriteOp>) -> GoatResult<()> {
         self.writer.submit_write(ops, || self.flush())
     }
 }
@@ -472,7 +471,7 @@ impl KvEngine {
         min_log_number: u64,
         cleanup_sender: &mpsc::Sender<CleanupTask>,
         cleanup_enabled: &Arc<AtomicBool>,
-    ) -> Result<(WalReplayStats, u64), io::Error> {
+    ) -> GoatResult<(WalReplayStats, u64)> {
         let wal_files = Self::list_wal_files(wal_paths, min_log_number)?;
         let mut stats = WalReplayStats {
             max_sequence: 0,
@@ -522,7 +521,7 @@ impl KvEngine {
         wal_handle: &mut Option<Arc<WalHandle>>,
         cleanup_sender: &mpsc::Sender<CleanupTask>,
         cleanup_enabled: &Arc<AtomicBool>,
-    ) -> io::Result<WalReplayStats> {
+    ) -> GoatResult<WalReplayStats> {
         replay_wal_file(wal_path, |key, value| {
             let mut state = lsm_state.write().unwrap();
             state.mem_table.put(key, value.into());
@@ -603,13 +602,15 @@ impl KvEngine {
     fn list_wal_files(
         wal_paths: &WalPaths,
         min_log_number: u64,
-    ) -> Result<Vec<(u64, PathBuf)>, io::Error> {
+    ) -> GoatResult<Vec<(u64, PathBuf)>> {
         let wal_dir = wal_paths.wal_dir();
         let mut wal_files = Vec::new();
 
         if wal_dir.exists() {
-            for entry in std::fs::read_dir(wal_dir)? {
-                let entry = entry?;
+            for entry in std::fs::read_dir(wal_dir)
+                .map_err(|e| GoatError::io("list_wal_files_read_dir", e))?
+            {
+                let entry = entry.map_err(|e| GoatError::io("list_wal_files_entry", e))?;
                 let path = entry.path();
                 if !path.is_file() {
                     continue;
@@ -683,65 +684,70 @@ mod tests {
     fn test_put_and_get() {
         let engine = KvEngine::new_for_test();
 
-        engine.put(b"key1".to_vec(), b"value1".to_vec());
-        assert_eq!(engine.get(b"key1"), Some(b"value1".to_vec()));
+        engine.put(b"key1".to_vec(), b"value1".to_vec()).unwrap();
+        assert_eq!(engine.get(b"key1").unwrap(), Some(b"value1".to_vec()));
 
-        engine.put(b"key2".to_vec(), b"value2".to_vec());
-        assert_eq!(engine.get(b"key2"), Some(b"value2".to_vec()));
+        engine.put(b"key2".to_vec(), b"value2".to_vec()).unwrap();
+        assert_eq!(engine.get(b"key2").unwrap(), Some(b"value2".to_vec()));
 
-        assert_eq!(engine.get(b"nonexistent"), None);
+        assert_eq!(engine.get(b"nonexistent").unwrap(), None);
     }
 
     #[test]
     fn test_update_existing_key() {
         let engine = KvEngine::new_for_test();
 
-        engine.put(b"key1".to_vec(), b"value1".to_vec());
-        assert_eq!(engine.get(b"key1"), Some(b"value1".to_vec()));
+        engine.put(b"key1".to_vec(), b"value1".to_vec()).unwrap();
+        assert_eq!(engine.get(b"key1").unwrap(), Some(b"value1".to_vec()));
 
-        engine.put(b"key1".to_vec(), b"newvalue".to_vec());
-        assert_eq!(engine.get(b"key1"), Some(b"newvalue".to_vec()));
+        engine.put(b"key1".to_vec(), b"newvalue".to_vec()).unwrap();
+        assert_eq!(engine.get(b"key1").unwrap(), Some(b"newvalue".to_vec()));
     }
 
     #[test]
     fn test_delete_key() {
         let engine = KvEngine::new_for_test();
 
-        engine.put(b"key1".to_vec(), b"value1".to_vec());
-        assert_eq!(engine.get(b"key1"), Some(b"value1".to_vec()));
+        engine.put(b"key1".to_vec(), b"value1".to_vec()).unwrap();
+        assert_eq!(engine.get(b"key1").unwrap(), Some(b"value1".to_vec()));
 
-        engine.delete(b"key1".to_vec());
-        assert_eq!(engine.get(b"key1"), None);
+        engine.delete(b"key1".to_vec()).unwrap();
+        assert_eq!(engine.get(b"key1").unwrap(), None);
 
-        engine.delete(b"nonexistent".to_vec());
-        assert_eq!(engine.get(b"nonexistent"), None);
+        engine.delete(b"nonexistent".to_vec()).unwrap();
+        assert_eq!(engine.get(b"nonexistent").unwrap(), None);
     }
 
     #[test]
     fn test_delete_then_reinsert() {
         let engine = KvEngine::new_for_test();
 
-        engine.put(b"key1".to_vec(), b"value1".to_vec());
-        engine.delete(b"key1".to_vec());
-        assert_eq!(engine.get(b"key1"), None);
+        engine.put(b"key1".to_vec(), b"value1".to_vec()).unwrap();
+        engine.delete(b"key1".to_vec()).unwrap();
+        assert_eq!(engine.get(b"key1").unwrap(), None);
 
-        engine.put(b"key1".to_vec(), b"value2".to_vec());
-        assert_eq!(engine.get(b"key1"), Some(b"value2".to_vec()));
+        engine.put(b"key1".to_vec(), b"value2".to_vec()).unwrap();
+        assert_eq!(engine.get(b"key1").unwrap(), Some(b"value2".to_vec()));
     }
 
     #[test]
     fn test_multiple_operations() {
         let engine = KvEngine::new_for_test();
 
-        engine.put(b"key1".to_vec(), b"value1".to_vec());
-        engine.put(b"key2".to_vec(), b"value2".to_vec());
-        engine.delete(b"key1".to_vec());
-        engine.put(b"key3".to_vec(), b"value3".to_vec());
-        engine.put(b"key2".to_vec(), b"updated_value2".to_vec());
+        engine.put(b"key1".to_vec(), b"value1".to_vec()).unwrap();
+        engine.put(b"key2".to_vec(), b"value2".to_vec()).unwrap();
+        engine.delete(b"key1".to_vec()).unwrap();
+        engine.put(b"key3".to_vec(), b"value3".to_vec()).unwrap();
+        engine
+            .put(b"key2".to_vec(), b"updated_value2".to_vec())
+            .unwrap();
 
-        assert_eq!(engine.get(b"key1"), None);
-        assert_eq!(engine.get(b"key2"), Some(b"updated_value2".to_vec()));
-        assert_eq!(engine.get(b"key3"), Some(b"value3".to_vec()));
+        assert_eq!(engine.get(b"key1").unwrap(), None);
+        assert_eq!(
+            engine.get(b"key2").unwrap(),
+            Some(b"updated_value2".to_vec())
+        );
+        assert_eq!(engine.get(b"key3").unwrap(), Some(b"value3".to_vec()));
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+use goat_db::goatkv::{Error as GoatError, Result as GoatResult};
 use tempfile::TempDir;
 use tokio::time::sleep;
 use tonic::transport::Channel;
@@ -181,7 +182,7 @@ impl TestServer {
         process: &mut Child,
         mut stderr_pipe: Option<&mut std::process::ChildStderr>,
         stderr_output: &mut Vec<u8>,
-    ) -> Result<(), String> {
+    ) -> GoatResult<()> {
         let start = std::time::Instant::now();
 
         loop {
@@ -202,7 +203,7 @@ impl TestServer {
                         }
                     }
 
-                    return Err(error_msg);
+                    return Err(GoatError::unavailable("test_server_process", error_msg));
                 }
                 Ok(None) => {
                     // 进程还在运行，尝试连接
@@ -212,13 +213,19 @@ impl TestServer {
                             if start.elapsed() < timeout {
                                 sleep(Duration::from_millis(100)).await;
                             } else {
-                                return Err(format!("{}", e));
+                                return Err(GoatError::unavailable(
+                                    "test_server_connect_timeout",
+                                    e.to_string(),
+                                ));
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    return Err(format!("Failed to check process status: {}", e));
+                    return Err(GoatError::internal(
+                        "test_server_status_check",
+                        format!("Failed to check process status: {}", e),
+                    ));
                 }
             }
         }

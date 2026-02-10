@@ -25,6 +25,8 @@
 //! 值 127 (0x7F) 编码为 [0x7F]
 //! 值 128 (0x80) 编码为 [0x80, 0x01]
 
+use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
+
 /// 将 64 位无符号整数编码为 varint 字节。
 ///
 /// # 参数
@@ -76,9 +78,9 @@ pub fn put_varint64(buf: &mut Vec<u8>, mut value: u64) {
 ///
 /// # 返回值
 /// * `Ok(u64)` - 成功解码的整数
-/// * `Err(&'static str)` - 解码错误：
-///   - `"Overflow"`: 编码值超过 64 位
-///   - `"Incomplete"`: 缺少终止字节（所有字节的 MSB 都为 1）
+/// * `Err(goatkv::Error)` - 解码错误（`ErrorKind::Corruption`）
+///   - `overflow`: 编码值超过 64 位
+///   - `incomplete varint`: 缺少终止字节（所有字节的 MSB 都为 1）
 ///
 /// # 示例
 /// ```
@@ -90,7 +92,7 @@ pub fn put_varint64(buf: &mut Vec<u8>, mut value: u64) {
 /// assert_eq!(coding::decode_varint64(&[0x80, 0x01]), Ok(128));
 /// assert_eq!(coding::decode_varint64(&[0xAC, 0x02]), Ok(300));
 /// ```
-pub fn decode_varint64(bytes: &[u8]) -> Result<u64, &'static str> {
+pub fn decode_varint64(bytes: &[u8]) -> GoatResult<u64> {
     decode_varint64_with_length(bytes).map(|(value, _)| value)
 }
 
@@ -101,9 +103,9 @@ pub fn decode_varint64(bytes: &[u8]) -> Result<u64, &'static str> {
 ///
 /// # 返回值
 /// * `Ok((u64, usize))` - 成功解码的整数和读取的字节数
-/// * `Err(&'static str)` - 解码错误：
-///   - `"Overflow"`: 编码值超过 64 位
-///   - `"Incomplete"`: 缺少终止字节（所有字节的 MSB 都为 1）
+/// * `Err(goatkv::Error)` - 解码错误（`ErrorKind::Corruption`）
+///   - `overflow`: 编码值超过 64 位
+///   - `incomplete varint`: 缺少终止字节（所有字节的 MSB 都为 1）
 ///
 /// # 示例
 /// ```
@@ -115,7 +117,7 @@ pub fn decode_varint64(bytes: &[u8]) -> Result<u64, &'static str> {
 /// assert_eq!(coding::decode_varint64_with_length(&[0x80, 0x01]), Ok((128, 2)));
 /// assert_eq!(coding::decode_varint64_with_length(&[0xAC, 0x02]), Ok((300, 2)));
 /// ```
-pub fn decode_varint64_with_length(bytes: &[u8]) -> Result<(u64, usize), &'static str> {
+pub fn decode_varint64_with_length(bytes: &[u8]) -> GoatResult<(u64, usize)> {
     let mut result = 0u64;
     let mut shift = 0u32;
     let mut bytes_read = 0;
@@ -124,7 +126,7 @@ pub fn decode_varint64_with_length(bytes: &[u8]) -> Result<(u64, usize), &'stati
         // 检查溢出：varint 最多为 u64 编码 10 字节
         // (10 字节 * 7 位 = 70 位，但我们只使用 64 位)
         if shift >= 64 {
-            return Err("Overflow");
+            return Err(GoatError::corruption("varint_decode", "overflow"));
         }
 
         // 将 7 位数据添加到结果的当前移位位置
@@ -139,7 +141,7 @@ pub fn decode_varint64_with_length(bytes: &[u8]) -> Result<(u64, usize), &'stati
     }
 
     // 如果执行到这里，说明消耗了所有字节但从未看到终止
-    Err("Incomplete")
+    Err(GoatError::corruption("varint_decode", "incomplete varint"))
 }
 
 /// 写入带长度前缀的字节切片
@@ -149,12 +151,15 @@ pub fn put_length_prefixed_slice(buf: &mut Vec<u8>, data: &[u8]) {
 }
 
 /// 读取带长度前缀的字节切片，返回 (data, bytes_read)
-pub fn get_length_prefixed_slice(bytes: &[u8]) -> Result<(&[u8], usize), &'static str> {
+pub fn get_length_prefixed_slice(bytes: &[u8]) -> GoatResult<(&[u8], usize)> {
     let (length, bytes_read) = decode_varint64_with_length(bytes)?;
     let length = length as usize;
 
     if bytes_read + length > bytes.len() {
-        return Err("Incomplete");
+        return Err(GoatError::corruption(
+            "length_prefixed_decode",
+            "incomplete length-prefixed slice",
+        ));
     }
 
     Ok((&bytes[bytes_read..bytes_read + length], bytes_read + length))
@@ -163,6 +168,22 @@ pub fn get_length_prefixed_slice(bytes: &[u8]) -> Result<(&[u8], usize), &'stati
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_decode_ok(bytes: &[u8], expected: u64, case: &str) {
+        let decoded = decode_varint64(bytes).unwrap_or_else(|e| panic!("{}: {}", case, e));
+        assert_eq!(decoded, expected, "{}", case);
+    }
+
+    fn assert_decode_err_contains(bytes: &[u8], needle: &str, case: &str) {
+        let err = decode_varint64(bytes).expect_err(case);
+        assert!(
+            err.to_string().contains(needle),
+            "{}: expected error containing `{}`, got `{}`",
+            case,
+            needle,
+            err
+        );
+    }
 
     /// 测试基本单字节编码（0-127）
     #[test]
@@ -240,46 +261,38 @@ mod tests {
     /// 测试解码单字节值
     #[test]
     fn test_decode_single_byte() {
-        assert_eq!(decode_varint64(&[0x00]), Ok(0), "[0x00] 应解码为 0");
-        assert_eq!(decode_varint64(&[0x01]), Ok(1), "[0x01] 应解码为 1");
-        assert_eq!(decode_varint64(&[0x7F]), Ok(127), "[0x7F] 应解码为 127");
-        assert_eq!(decode_varint64(&[0x2A]), Ok(42), "[0x2A] 应解码为 42");
-        assert_eq!(decode_varint64(&[0x64]), Ok(100), "[0x64] 应解码为 100");
+        assert_decode_ok(&[0x00], 0, "[0x00] 应解码为 0");
+        assert_decode_ok(&[0x01], 1, "[0x01] 应解码为 1");
+        assert_decode_ok(&[0x7F], 127, "[0x7F] 应解码为 127");
+        assert_decode_ok(&[0x2A], 42, "[0x2A] 应解码为 42");
+        assert_decode_ok(&[0x64], 100, "[0x64] 应解码为 100");
     }
 
     /// 测试解码多字节值
     #[test]
     fn test_decode_multi_byte() {
-        assert_eq!(decode_varint64(&[0x80, 0x01]), Ok(128), "2 字节的 128");
-        assert_eq!(decode_varint64(&[0xFF, 0x01]), Ok(255), "2 字节的 255");
-        assert_eq!(decode_varint64(&[0xAC, 0x02]), Ok(300), "2 字节的 300");
-        assert_eq!(
-            decode_varint64(&[0x80, 0x80, 0x01]),
-            Ok(16384),
-            "3 字节的 16384"
-        );
-        assert_eq!(
-            decode_varint64(&[0xFF, 0x7F]),
-            Ok(16383),
-            "2 字节最大值 (16383)"
-        );
+        assert_decode_ok(&[0x80, 0x01], 128, "2 字节的 128");
+        assert_decode_ok(&[0xFF, 0x01], 255, "2 字节的 255");
+        assert_decode_ok(&[0xAC, 0x02], 300, "2 字节的 300");
+        assert_decode_ok(&[0x80, 0x80, 0x01], 16384, "3 字节的 16384");
+        assert_decode_ok(&[0xFF, 0x7F], 16383, "2 字节最大值 (16383)");
     }
 
     /// 测试解码大数值
     #[test]
     fn test_decode_large_values() {
         // 测试最大 u64 值
-        assert_eq!(
-            decode_varint64(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]),
-            Ok(u64::MAX),
-            "解码 u64::MAX"
+        assert_decode_ok(
+            &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01],
+            u64::MAX,
+            "解码 u64::MAX",
         );
 
         // 测试 2^63 - 1
-        assert_eq!(
-            decode_varint64(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F]),
-            Ok(0x7FFFFFFFFFFFFFFF),
-            "解码 2^63-1"
+        assert_decode_ok(
+            &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F],
+            0x7FFFFFFFFFFFFFFF,
+            "解码 2^63-1",
         );
     }
 
@@ -324,17 +337,17 @@ mod tests {
     #[test]
     fn test_decode_incomplete() {
         // 设置了延续位的单字节
-        assert_eq!(decode_varint64(&[0x80]), Err("Incomplete"), "单字节延续");
+        assert_decode_err_contains(&[0x80], "incomplete", "单字节延续");
 
         // 所有字节都有延续位
-        assert_eq!(
-            decode_varint64(&[0x80, 0x80, 0x80, 0x80, 0x80]),
-            Err("Incomplete"),
-            "所有字节都有延续位"
+        assert_decode_err_contains(
+            &[0x80, 0x80, 0x80, 0x80, 0x80],
+            "incomplete",
+            "所有字节都有延续位",
         );
 
         // 空切片
-        assert_eq!(decode_varint64(&[]), Err("Incomplete"), "空切片");
+        assert_decode_err_contains(&[], "incomplete", "空切片");
     }
 
     /// 测试解码错误：溢出（超过 u64 的 10 字节限制）
@@ -343,11 +356,7 @@ mod tests {
         // 10 个有效字节，但第 11 个会溢出 u64
         // 这是一个有效的 10 字节 varint，解码为 u64::MAX
         let max_valid = vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01];
-        assert_eq!(
-            decode_varint64(&max_valid),
-            Ok(u64::MAX),
-            "有效的 10 字节 varint"
-        );
+        assert_decode_ok(&max_valid, u64::MAX, "有效的 10 字节 varint");
 
         // 创建一个无效的 11 字节 varint（需要 >64 位）
         // 11 字节 * 7 位 = 77 位潜力，但我们限制为 64 位
@@ -367,11 +376,7 @@ mod tests {
         long_varint[10] = 0x00; // 在第 11 字节终止
 
         // 应该溢出，因为我们尝试处理 11 字节 * 7 位 = 77 位
-        assert_eq!(
-            decode_varint64(&long_varint),
-            Err("Overflow"),
-            "11 字节 varint 应溢出"
-        );
+        assert_decode_err_contains(&long_varint, "overflow", "11 字节 varint 应溢出");
     }
 
     /// 测试编码产生最小表示
@@ -394,18 +399,10 @@ mod tests {
     #[test]
     fn test_decode_extra_bytes() {
         // 有效的 varint 后面跟着垃圾数据
-        assert_eq!(
-            decode_varint64(&[0x01, 0x00, 0x00, 0x00]),
-            Ok(1),
-            "应忽略终止后的字节"
-        );
+        assert_decode_ok(&[0x01, 0x00, 0x00, 0x00], 1, "应忽略终止后的字节");
 
         // 带额外字节的多字节 varint
-        assert_eq!(
-            decode_varint64(&[0x80, 0x01, 0xFF, 0xFF]),
-            Ok(128),
-            "应在终止字节处停止"
-        );
+        assert_decode_ok(&[0x80, 0x01, 0xFF, 0xFF], 128, "应在终止字节处停止");
     }
 
     /// 基于属性的样式测试：所有 u64 值往返正确

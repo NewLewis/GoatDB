@@ -179,7 +179,7 @@ fn populate_goatkv(
                         let value = make_value(value_size, key_id);
                         entries.push((key, value));
                     }
-                    engine.put_batch(entries);
+                    engine.put_batch(entries).expect("goatkv put_batch");
                     processed += batch;
                 }
             } else {
@@ -193,7 +193,7 @@ fn populate_goatkv(
                         let value = make_value(value_size, key_id);
                         entries.push((key, value));
                     }
-                    engine.put_batch(entries);
+                    engine.put_batch(entries).expect("goatkv put_batch");
                     remaining = remaining.saturating_sub(batch);
                 }
             }
@@ -228,7 +228,7 @@ fn singleput_goatkv(
                 for key_id in start..end {
                     let key = make_key(key_id);
                     let value = make_value(value_size, key_id);
-                    engine.put(key, value);
+                    engine.put(key, value).expect("goatkv put");
                 }
             } else {
                 let mut remaining = end.saturating_sub(start);
@@ -236,7 +236,7 @@ fn singleput_goatkv(
                     let key_id = rng.gen_range(0..key_nums);
                     let key = make_key(key_id);
                     let value = make_value(value_size, key_id);
-                    engine.put(key, value);
+                    engine.put(key, value).expect("goatkv put");
                     remaining = remaining.saturating_sub(1);
                 }
             }

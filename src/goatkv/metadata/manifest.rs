@@ -2,6 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 
+use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::metadata::version_edit::VersionEdit;
 use crate::goatkv::utils::io_helpers::{read_exact_or_eof, ReadOutcome};
 
@@ -16,12 +17,13 @@ pub struct ManifestWriter {
 }
 
 impl ManifestWriter {
-    pub fn create(path: &Path) -> Result<Self, std::io::Error> {
+    pub fn create(path: &Path) -> GoatResult<Self> {
         let file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(path)?;
+            .open(path)
+            .map_err(|e| GoatError::io("manifest_create", e))?;
 
         let writer = BufWriter::new(file);
         let current_size = 0u64;
@@ -33,10 +35,16 @@ impl ManifestWriter {
         })
     }
 
-    pub fn open_for_append(path: &Path, file_number: u64) -> Result<Self, std::io::Error> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+    pub fn open_for_append(path: &Path, file_number: u64) -> GoatResult<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| GoatError::io("manifest_open_for_append", e))?;
 
-        let metadata = file.metadata()?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| GoatError::io("manifest_read_metadata", e))?;
         let current_size = metadata.len();
 
         let writer = BufWriter::new(file);
@@ -48,13 +56,19 @@ impl ManifestWriter {
         })
     }
 
-    pub fn append_edit(&mut self, edit: &VersionEdit) -> Result<(), std::io::Error> {
+    pub fn append_edit(&mut self, edit: &VersionEdit) -> GoatResult<()> {
         let encoded = edit.encode();
         let len = encoded.len() as u64;
 
-        self.writer.write_all(&len.to_be_bytes())?;
-        self.writer.write_all(&encoded)?;
-        self.writer.flush()?;
+        self.writer
+            .write_all(&len.to_be_bytes())
+            .map_err(|e| GoatError::io("manifest_write_len", e))?;
+        self.writer
+            .write_all(&encoded)
+            .map_err(|e| GoatError::io("manifest_write_edit", e))?;
+        self.writer
+            .flush()
+            .map_err(|e| GoatError::io("manifest_flush", e))?;
 
         self.current_size += 8 + len;
 
@@ -69,9 +83,14 @@ impl ManifestWriter {
         self.file_number
     }
 
-    pub fn sync(&mut self) -> Result<(), std::io::Error> {
-        self.writer.flush()?;
-        self.writer.get_ref().sync_all()?;
+    pub fn sync(&mut self) -> GoatResult<()> {
+        self.writer
+            .flush()
+            .map_err(|e| GoatError::io("manifest_sync_flush", e))?;
+        self.writer
+            .get_ref()
+            .sync_all()
+            .map_err(|e| GoatError::io("manifest_sync_all", e))?;
         Ok(())
     }
 }
@@ -84,8 +103,12 @@ pub struct ManifestReader {
 
 impl ManifestReader {
     /// 打开 MANIFEST 文件读取
-    pub fn new(path: &Path) -> Result<Self, std::io::Error> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+    pub fn new(path: &Path) -> GoatResult<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| GoatError::io("manifest_open_reader", e))?;
         Ok(ManifestReader {
             reader: BufReader::new(file),
             last_good_offset: 0,
@@ -93,7 +116,7 @@ impl ManifestReader {
     }
 
     /// 读取所有 VersionEdit
-    pub fn read_all_edits(&mut self) -> Result<Vec<VersionEdit>, String> {
+    pub fn read_all_edits(&mut self) -> GoatResult<Vec<VersionEdit>> {
         let mut edits = Vec::new();
 
         loop {
@@ -108,12 +131,12 @@ impl ManifestReader {
     }
 
     /// 读取下一个 VersionEdit
-    fn read_next_edit(&mut self) -> Result<Option<VersionEdit>, String> {
+    fn read_next_edit(&mut self) -> GoatResult<Option<VersionEdit>> {
         let record_start = self.last_good_offset;
 
         // 读取长度前缀
         let mut len_bytes = [0u8; 8];
-        match read_exact_or_eof(&mut self.reader, &mut len_bytes).map_err(|e| e.to_string())? {
+        match read_exact_or_eof(&mut self.reader, &mut len_bytes)? {
             ReadOutcome::Eof => return Ok(None),
             ReadOutcome::Partial => {
                 self.truncate_to(record_start)?;
@@ -126,7 +149,7 @@ impl ManifestReader {
 
         // 读取编码数据
         let mut buffer = vec![0u8; len];
-        match read_exact_or_eof(&mut self.reader, &mut buffer).map_err(|e| e.to_string())? {
+        match read_exact_or_eof(&mut self.reader, &mut buffer)? {
             ReadOutcome::Eof | ReadOutcome::Partial => {
                 self.truncate_to(record_start)?;
                 return Ok(None);
@@ -140,10 +163,12 @@ impl ManifestReader {
         Ok(Some(edit))
     }
 
-    fn truncate_to(&mut self, offset: u64) -> Result<(), String> {
+    fn truncate_to(&mut self, offset: u64) -> GoatResult<()> {
         let file = self.reader.get_ref();
-        file.set_len(offset).map_err(|e| e.to_string())?;
-        file.sync_data().map_err(|e| e.to_string())?;
+        file.set_len(offset)
+            .map_err(|e| GoatError::io("manifest_truncate", e))?;
+        file.sync_data()
+            .map_err(|e| GoatError::io("manifest_truncate_sync", e))?;
         Ok(())
     }
 }

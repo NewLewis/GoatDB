@@ -2,6 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
+
 #[derive(Debug, Clone)]
 pub struct WalPaths {
     wal_dir: PathBuf,
@@ -76,16 +78,18 @@ impl SstablePaths {
     }
 
     /// 清理临时目录（删除所有临时文件）
-    pub fn cleanup_tmp_dir(&self) -> Result<(), std::io::Error> {
+    pub fn cleanup_tmp_dir(&self) -> GoatResult<()> {
         if self.tmp_dir.exists() {
-            for entry in fs::read_dir(&self.tmp_dir)? {
-                let entry = entry?;
+            for entry in
+                fs::read_dir(&self.tmp_dir).map_err(|e| GoatError::io("list_tmp_dir", e))?
+            {
+                let entry = entry.map_err(|e| GoatError::io("read_tmp_dir_entry", e))?;
                 let path = entry.path();
 
                 if path.is_file() {
-                    fs::remove_file(&path)?;
+                    fs::remove_file(&path).map_err(|e| GoatError::io("remove_tmp_file", e))?;
                 } else if path.is_dir() {
-                    fs::remove_dir_all(&path)?;
+                    fs::remove_dir_all(&path).map_err(|e| GoatError::io("remove_tmp_dir", e))?;
                 }
             }
         }

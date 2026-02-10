@@ -1,10 +1,10 @@
-use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::goatkv::format::internal_key::InternalKey;
+use crate::goatkv::{Error as GoatError, Result as GoatResult};
 use bytes::Bytes;
 
 use super::codec::WalCodec;
@@ -54,7 +54,7 @@ struct WalState {
     /// 已完成的轮换次数
     rotate_completed: u64,
     /// 轮换错误信息
-    rotate_error: Option<String>,
+    rotate_error: Option<GoatError>,
 }
 
 /// 刷新操作结果
@@ -98,8 +98,8 @@ impl WalManager {
     /// - `config`: 管理器配置
     ///
     /// # 返回值
-    /// - `io::Result<Self>`: 成功返回WAL管理器实例
-    pub fn new(path: PathBuf, config: WalManagerConfig) -> io::Result<Self> {
+    /// - `GoatResult<Self>`: 成功返回WAL管理器实例
+    pub fn new(path: PathBuf, config: WalManagerConfig) -> GoatResult<Self> {
         // 初始化状态
         let state = WalState {
             buffer: Vec::new(),
@@ -132,8 +132,8 @@ impl WalManager {
     /// - `value`: 值
     ///
     /// # 返回值
-    /// - `io::Result<()>`: 成功返回Ok，失败返回错误
-    pub fn append(&self, key: &InternalKey, value: &[u8]) -> io::Result<()> {
+    /// - `GoatResult<()>`: 成功返回Ok，失败返回错误
+    pub fn append(&self, key: &InternalKey, value: &[u8]) -> GoatResult<()> {
         // 编码记录
         let record = WalCodec::encode_record(key, value);
 
@@ -153,8 +153,8 @@ impl WalManager {
     /// - `records`: 键值对切片
     ///
     /// # 返回值
-    /// - `io::Result<()>`: 成功返回Ok，失败返回错误
-    pub fn append_batch(&self, records: &[(InternalKey, Bytes)]) -> io::Result<()> {
+    /// - `GoatResult<()>`: 成功返回Ok，失败返回错误
+    pub fn append_batch(&self, records: &[(InternalKey, Bytes)]) -> GoatResult<()> {
         if records.is_empty() {
             return Ok(());
         }
@@ -180,8 +180,8 @@ impl WalManager {
     /// - `data`: 要写入的数据
     ///
     /// # 返回值
-    /// - `io::Result<()>`: 成功返回Ok，失败返回错误
-    fn enqueue_async_bytes(&self, data: &[u8]) -> io::Result<()> {
+    /// - `GoatResult<()>`: 成功返回Ok，失败返回错误
+    fn enqueue_async_bytes(&self, data: &[u8]) -> GoatResult<()> {
         self.enqueue_bytes(data, EnqueueMode::Async).map(|_| ())
     }
 
@@ -191,8 +191,8 @@ impl WalManager {
     /// - `data`: 要写入的数据
     ///
     /// # 返回值
-    /// - `io::Result<u64>`: 成功返回结束偏移，失败返回错误
-    fn enqueue_sync_bytes(&self, data: &[u8]) -> io::Result<u64> {
+    /// - `GoatResult<u64>`: 成功返回结束偏移，失败返回错误
+    fn enqueue_sync_bytes(&self, data: &[u8]) -> GoatResult<u64> {
         self.enqueue_bytes(data, EnqueueMode::Sync)
     }
 
@@ -203,8 +203,8 @@ impl WalManager {
     /// - `mode`: 入队模式（同步/异步）
     ///
     /// # 返回值
-    /// - `io::Result<u64>`: 同步模式返回结束偏移，异步模式返回0
-    fn enqueue_bytes(&self, data: &[u8], mode: EnqueueMode) -> io::Result<u64> {
+    /// - `GoatResult<u64>`: 同步模式返回结束偏移，异步模式返回0
+    fn enqueue_bytes(&self, data: &[u8], mode: EnqueueMode) -> GoatResult<u64> {
         if data.is_empty() {
             return Ok(0);
         }
@@ -222,7 +222,7 @@ impl WalManager {
         }
 
         if state.closed {
-            return Err(io::Error::other("WAL manager closed"));
+            return Err(GoatError::unavailable("wal_manager", "WAL manager closed"));
         }
 
         let offset_end = if mode == EnqueueMode::Sync {
@@ -248,8 +248,8 @@ impl WalManager {
     /// - `offset_end`: 需要持久化的结束偏移
     ///
     /// # 返回值
-    /// - `io::Result<()>`: 成功返回Ok，失败返回错误
-    fn wait_for_durable(&self, offset_end: u64) -> io::Result<()> {
+    /// - `GoatResult<()>`: 成功返回Ok，失败返回错误
+    fn wait_for_durable(&self, offset_end: u64) -> GoatResult<()> {
         if offset_end == 0 {
             return Ok(());
         }
@@ -262,7 +262,7 @@ impl WalManager {
         }
 
         if state.closed {
-            return Err(io::Error::other("WAL manager closed"));
+            return Err(GoatError::unavailable("wal_manager", "WAL manager closed"));
         }
         Ok(())
     }
@@ -273,8 +273,8 @@ impl WalManager {
     /// - `new_path`: 新WAL文件路径
     ///
     /// # 返回值
-    /// - `io::Result<()>`: 成功返回Ok，失败返回错误
-    pub fn rotate(&self, new_path: PathBuf) -> io::Result<()> {
+    /// - `GoatResult<()>`: 成功返回Ok，失败返回错误
+    pub fn rotate(&self, new_path: PathBuf) -> GoatResult<()> {
         let mut state = self.state.lock().unwrap();
 
         // 递增轮换请求计数器
@@ -294,12 +294,16 @@ impl WalManager {
         }
 
         if state.closed {
-            return Err(io::Error::other("WAL manager closed"));
+            return Err(GoatError::unavailable("wal_manager", "WAL manager closed"));
         }
 
         // 检查轮换错误
         if let Some(err) = state.rotate_error.take() {
-            return Err(io::Error::other(err));
+            return Err(GoatError::internal_with_source(
+                "wal_rotate",
+                "wal rotation failed",
+                err,
+            ));
         }
         Ok(())
     }
@@ -310,8 +314,8 @@ impl WalManager {
     /// - `path`: 初始WAL文件路径
     ///
     /// # 返回值
-    /// - `io::Result<()>`: 成功返回Ok，失败返回错误
-    fn spawn_writer(&mut self, path: PathBuf) -> io::Result<()> {
+    /// - `GoatResult<()>`: 成功返回Ok，失败返回错误
+    fn spawn_writer(&mut self, path: PathBuf) -> GoatResult<()> {
         // 创建初始WAL写入器
         let writer = WalWriter::new(path)?;
         let config = self.config.clone();
@@ -552,8 +556,8 @@ impl WalManager {
     /// - `data`: 待写入数据
     ///
     /// # 返回值
-    /// - `io::Result<bool>`: 成功返回是否写入了数据
-    fn write_and_flush_if_needed(writer: &mut WalWriter, data: &[u8]) -> io::Result<bool> {
+    /// - `GoatResult<bool>`: 成功返回是否写入了数据
+    fn write_and_flush_if_needed(writer: &mut WalWriter, data: &[u8]) -> GoatResult<bool> {
         if data.is_empty() {
             return Ok(false);
         }
@@ -571,12 +575,12 @@ impl WalManager {
     /// - `offset_end`: 结束偏移
     ///
     /// # 返回值
-    /// - `io::Result<FlushOutcome>`: 刷新结果
+    /// - `GoatResult<FlushOutcome>`: 刷新结果
     fn flush_sync_if_needed(
         writer: &mut WalWriter,
         data: Vec<u8>,
         offset_end: Option<u64>,
-    ) -> io::Result<FlushOutcome> {
+    ) -> GoatResult<FlushOutcome> {
         let Some(offset_end) = offset_end else {
             return Ok(FlushOutcome::Noop);
         };
@@ -597,8 +601,8 @@ impl WalManager {
     /// - `data`: 要写入的数据
     ///
     /// # 返回值
-    /// - `io::Result<FlushOutcome>`: 刷新结果
-    fn flush_async_if_needed(writer: &mut WalWriter, data: Vec<u8>) -> io::Result<FlushOutcome> {
+    /// - `GoatResult<FlushOutcome>`: 刷新结果
+    fn flush_async_if_needed(writer: &mut WalWriter, data: Vec<u8>) -> GoatResult<FlushOutcome> {
         if !Self::write_and_flush_if_needed(writer, &data)? {
             return Ok(FlushOutcome::Noop);
         }
@@ -645,10 +649,14 @@ impl WalManager {
     /// - `state`: 共享状态
     /// - `cv`: 条件变量
     /// - `err`: 错误信息
-    fn on_write_error(state: &Arc<Mutex<WalState>>, cv: &Condvar, err: io::Error) {
+    fn on_write_error(state: &Arc<Mutex<WalState>>, cv: &Condvar, err: GoatError) {
         let mut guard = state.lock().unwrap();
         guard.closed = true;
-        guard.rotate_error = Some(format!("WAL write failed: {}", err));
+        guard.rotate_error = Some(GoatError::internal_with_source(
+            "wal_writer",
+            "wal write failed",
+            err,
+        ));
         cv.notify_all();
     }
 
@@ -671,15 +679,23 @@ impl WalManager {
             return;
         };
 
-        let mut rotate_error = None;
+        let mut rotate_error: Option<GoatError> = None;
 
         // 刷新当前文件
         if let Err(e) = writer.flush() {
-            rotate_error = Some(format!("WAL flush failed: {}", e));
+            rotate_error = Some(GoatError::internal_with_source(
+                "wal_rotate_flush",
+                "wal flush failed before rotation",
+                e,
+            ));
         } else if config.wal_sync {
             // 同步模式下需要确保数据同步到磁盘
             if let Err(e) = writer.sync_data() {
-                rotate_error = Some(format!("WAL sync failed: {}", e));
+                rotate_error = Some(GoatError::internal_with_source(
+                    "wal_rotate_sync",
+                    "wal sync failed before rotation",
+                    e,
+                ));
             }
         }
 
@@ -690,7 +706,11 @@ impl WalManager {
                     *writer = new_writer;
                 }
                 Err(e) => {
-                    rotate_error = Some(format!("Failed to open new WAL file: {}", e));
+                    rotate_error = Some(GoatError::internal_with_source(
+                        "wal_rotate_open_new",
+                        "failed to open new wal file",
+                        e,
+                    ));
                 }
             }
         }

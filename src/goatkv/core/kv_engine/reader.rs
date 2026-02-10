@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::goatkv::core::lsm_state::{ImmutableMemTableEntry, LSMState};
 use crate::goatkv::core::mem_table::MemTable;
+use crate::goatkv::error::Result as GoatResult;
 use crate::goatkv::format::internal_key::InternalKeyKind;
 use crate::goatkv::metadata::version::Version;
 
@@ -16,15 +17,15 @@ impl KvReader {
         Self { lsm_state }
     }
 
-    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+    pub fn get(&self, key: &[u8]) -> GoatResult<Option<Vec<u8>>> {
         let (mem_table, immutable_mem_tables, version) = self.snapshot_read_state();
 
         if let Some(result) = Self::get_from_memtable(&mem_table, key) {
-            return result;
+            return Ok(result);
         }
         for entry in immutable_mem_tables.iter().rev() {
             if let Some(result) = Self::get_from_immutable(entry, key) {
-                return result;
+                return Ok(result);
             }
         }
         Self::get_from_version(&version, key)
@@ -65,13 +66,13 @@ impl KvReader {
         })
     }
 
-    fn get_from_version(version: &Arc<Version>, key: &[u8]) -> Option<Vec<u8>> {
-        version.get(key).and_then(|(internal_key, value)| {
+    fn get_from_version(version: &Arc<Version>, key: &[u8]) -> GoatResult<Option<Vec<u8>>> {
+        Ok(version.get(key)?.and_then(|(internal_key, value)| {
             if internal_key.kind() == InternalKeyKind::Delete {
                 None
             } else {
                 Some(value)
             }
-        })
+        }))
     }
 }

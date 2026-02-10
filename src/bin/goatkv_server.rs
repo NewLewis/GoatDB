@@ -3,6 +3,7 @@ use std::sync::Arc;
 use clap::Parser;
 use goat_db::goatkv::core::kv_engine::KvEngine;
 use goat_db::goatkv::utils::{init_logging, KvEngineOptions};
+use goat_db::goatkv::{Error as GoatError, Result as GoatResult};
 use goatkv::{
     goat_kv_service_server::{GoatKvService, GoatKvServiceServer},
     DeleteRequest, DeleteResponse, FlushRequest, FlushResponse, GetRequest, GetResponse,
@@ -28,6 +29,10 @@ impl GoatKVServiceImpl {
             engine: Arc::new(engine),
         }
     }
+
+    fn map_engine_err(err: GoatError) -> Status {
+        err.to_status()
+    }
 }
 
 // 实现 GoatKvService trait
@@ -50,7 +55,9 @@ impl GoatKvService for GoatKVServiceImpl {
             return Err(Status::invalid_argument("Key cannot be empty"));
         }
 
-        self.engine.put(req.key, req.value);
+        self.engine
+            .put(req.key, req.value)
+            .map_err(Self::map_engine_err)?;
 
         let reply = WriteResponse {
             success: true,
@@ -70,7 +77,7 @@ impl GoatKvService for GoatKVServiceImpl {
             return Err(Status::invalid_argument("Key cannot be empty"));
         }
 
-        match self.engine.get(&req.key) {
+        match self.engine.get(&req.key).map_err(Self::map_engine_err)? {
             Some(value) => {
                 let reply = GetResponse {
                     success: true,
@@ -108,7 +115,12 @@ impl GoatKvService for GoatKVServiceImpl {
         }
 
         // 检查 key 是否存在
-        if self.engine.get(&req.key).is_none() {
+        if self
+            .engine
+            .get(&req.key)
+            .map_err(Self::map_engine_err)?
+            .is_none()
+        {
             let reply = UpdateResponse {
                 success: false,
                 message: "Key not found, cannot update".to_string(),
@@ -117,7 +129,9 @@ impl GoatKvService for GoatKVServiceImpl {
         }
 
         // 更新 key 的值
-        self.engine.put(req.key, req.value);
+        self.engine
+            .put(req.key, req.value)
+            .map_err(Self::map_engine_err)?;
 
         let reply = UpdateResponse {
             success: true,
@@ -141,7 +155,7 @@ impl GoatKvService for GoatKVServiceImpl {
         }
 
         // 删除 key (即使不存在也会插入删除标记)
-        self.engine.delete(req.key);
+        self.engine.delete(req.key).map_err(Self::map_engine_err)?;
 
         let reply = DeleteResponse {
             success: true,
@@ -186,11 +200,13 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> GoatResult<()> {
     // 解析命令行参数
     let args = Args::parse();
 
-    let addr = args.address.parse()?;
+    let addr = args.address.parse().map_err(|e| {
+        GoatError::invalid_argument("address", format!("invalid listen address: {}", e))
+    })?;
 
     // 创建 KvEngine，使用指定的数据目录或默认值
     let mut options = KvEngineOptions::default();
@@ -205,8 +221,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Using default data directory (./goatdb_data)");
     }
 
-    let engine = KvEngine::new_with_options(options)
-        .map_err(|e| format!("Failed to create KvEngine: {}", e))?;
+    let engine = KvEngine::new_with_options(options).map_err(|e| {
+        GoatError::internal_with_source("server_init_engine", "failed to create kv engine", e)
+    })?;
 
     let service = GoatKVServiceImpl::new(engine);
 
@@ -216,7 +233,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Server::builder()
         .add_service(GoatKvServiceServer::new(service))
         .serve(addr)
-        .await?;
+        .await
+        .map_err(|e| {
+            GoatError::internal_with_source("grpc_server_serve", "grpc server failed", e)
+        })?;
 
     info!("Server finished");
 

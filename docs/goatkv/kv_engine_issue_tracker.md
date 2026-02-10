@@ -30,7 +30,7 @@
     - 2026-02-10：已修复。flush 成功后改为按 `Arc::ptr_eq` 精确移除任务对应 immutable memtable，不再无条件 `pop_front`。
     - 回归测试：`flush_failed_task_does_not_evict_other_immutable_memtables`（`tests/integration/recovery_test.rs`）。
 
-- [ ] `P0-WRITE-PATH-PANIC`
+- [x] `P0-WRITE-PATH-PANIC`
   - 现象：写路径发生 I/O 错误时使用 `expect` 直接 panic。
   - 影响：线上服务在可恢复错误下进程崩溃。
   - 代码定位：
@@ -43,8 +43,11 @@
   - 验收标准：
     - `KvEngine` 写接口返回 `Result`。
     - gRPC 层将写失败映射为 `tonic::Status`，不发生 panic。
+  - 关闭记录：
+    - 2026-02-10：`KvEngine::put/put_batch/delete` 改为返回 `goatkv::Result<()>`，不再内部 `expect`。
+    - 2026-02-10：gRPC server 写路径统一 `map_err(|e| e.to_status())`。
 
-- [ ] `P0-SSTABLE-BUILDER-PANIC`
+- [x] `P0-SSTABLE-BUILDER-PANIC`
   - 现象：SSTable 构建流程内大量 `unwrap/expect`。
   - 影响：磁盘异常会导致 flush 线程直接崩溃。
   - 代码定位（示例）：
@@ -55,10 +58,13 @@
   - 验收标准：
     - 统一改为 `io::Result` 透传。
     - flush worker 收到错误可记录并按策略处理，不崩线程。
+  - 关闭记录：
+    - 2026-02-10：`SSTableBuilder::new/new_with_manager/write/finish` 已接入 `goatkv::Result`，移除内部 `unwrap/expect`。
+    - 2026-02-10：`FlushWorker` 接入 builder 写入错误处理，失败仅记录并跳过本次任务，不会线程 panic。
 
 ### P1（核心能力缺口）
 
-- [ ] `P1-READ-ERROR-HIDDEN`
+- [x] `P1-READ-ERROR-HIDDEN`
   - 现象：SSTable 打开/读取失败时，读路径返回 `None`（看起来像 key 不存在）。
   - 影响：错误语义被吞，排障困难，可能误判数据状态。
   - 代码定位：
@@ -69,6 +75,11 @@
   - 验收标准：
     - 读路径可区分“未命中”和“I/O 错误”。
     - 上层 API 的错误语义明确（内部/外部可见按设计决定）。
+  - 关闭记录：
+    - 2026-02-10：`Version::get` 改为返回 `goatkv::Result<Option<...>>`，不再吞掉 SSTable 打开/读取错误。
+    - 2026-02-10：`KvReader::get`、`KvEngine::get` 连带改为 `goatkv::Result<Option<Vec<u8>>>`。
+    - 2026-02-10：gRPC `get/update` 路径接入 `map_err(|e| e.to_status())`，读错误可透传为服务端错误。
+    - 2026-02-10：新增 `read_path_reports_missing_sstable_as_error` 回归测试（`tests/integration/recovery_test.rs`）。
 
 - [ ] `P1-NO-COMPACTION`
   - 现象：只有 `needs_compaction` 判定，没有实际 compaction 调度与执行。

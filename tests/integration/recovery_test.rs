@@ -1,8 +1,10 @@
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use goat_db::goatkv::core::kv_engine::KvEngine;
+use goat_db::goatkv::error::ErrorKind;
 use goat_db::goatkv::metadata::current;
 use goat_db::goatkv::metadata::manifest::{ManifestWriter, INIT_MANIFEST_FILE_NAME};
 use goat_db::goatkv::metadata::version_edit::VersionEdit;
@@ -67,7 +69,7 @@ fn recovery_handles_truncated_wal_tail() {
 
     let engine = KvEngine::new_with_options(options).unwrap();
 
-    assert_eq!(engine.get(b"ok"), Some(b"v1".to_vec()));
+    assert_eq!(engine.get(b"ok").unwrap(), Some(b"v1".to_vec()));
 
     // 截断应已发生：文件现在能被重新打开且尾部无多余无效记录（无法精确比对长度，但能重新打开 WalWriter）
     WalWriter::new(wal_path(0, &wal_paths)).expect("truncated WAL should be openable");
@@ -115,8 +117,8 @@ fn recovery_replays_multiple_wals_in_order() {
 
     let engine = KvEngine::new_with_options(options).unwrap();
 
-    assert_eq!(engine.get(b"a"), Some(b"va".to_vec()));
-    assert_eq!(engine.get(b"b"), Some(b"vb".to_vec()));
+    assert_eq!(engine.get(b"a").unwrap(), Some(b"va".to_vec()));
+    assert_eq!(engine.get(b"b").unwrap(), Some(b"vb".to_vec()));
 
     // 主动 flush，触发 WAL 轮转与清理
     engine.flush();
@@ -262,9 +264,52 @@ fn recovery_errors_on_corrupted_manifest_edit() {
     let err = result.unwrap_err();
     assert_eq!(
         err.kind(),
-        std::io::ErrorKind::InvalidData,
+        ErrorKind::Corruption,
         "unexpected error kind for corrupted manifest: {err}"
     );
+}
+
+#[test]
+fn read_path_reports_missing_sstable_as_error() {
+    let tmp = temp_dir();
+    let options = KvEngineOptions::default()
+        .with_data_dir(tmp.path())
+        .with_mem_table_size(1)
+        .with_wal_sync(false)
+        .with_recover_from_wal(true);
+    let engine = KvEngine::new_with_options(options).unwrap();
+
+    engine.put(b"k".to_vec(), b"v".to_vec()).unwrap();
+    engine.flush();
+
+    let data_dir = engine.sstable_paths().data_dir().to_path_buf();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && count_sstable_files(&data_dir) == 0 {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        count_sstable_files(&data_dir) > 0,
+        "flush should create at least one SSTable"
+    );
+    drop(engine);
+
+    let options = KvEngineOptions::default()
+        .with_data_dir(tmp.path())
+        .with_mem_table_size(1)
+        .with_wal_sync(false)
+        .with_recover_from_wal(false);
+    let engine = KvEngine::new_with_options(options).unwrap();
+
+    let missing_file = fs::read_dir(engine.sstable_paths().data_dir())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sst"))
+        .expect("expect at least one sstable");
+    fs::remove_file(&missing_file).unwrap();
+
+    let err = engine.get(b"k").unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::NotFound);
 }
 
 #[cfg(unix)]
@@ -323,7 +368,7 @@ fn recovery_replays_wal_if_flush_never_completed() {
         .with_recover_from_wal(true);
     let engine = KvEngine::new_with_options(options).unwrap();
 
-    assert_eq!(engine.get(b"k"), Some(b"v".to_vec()));
+    assert_eq!(engine.get(b"k").unwrap(), Some(b"v".to_vec()));
 
     drop(engine);
 }
@@ -352,7 +397,7 @@ fn flush_failed_task_does_not_evict_other_immutable_memtables() {
         fs::set_permissions(&tmp_dir, perms).unwrap();
     }
 
-    engine.put(b"k1".to_vec(), b"v1".to_vec());
+    engine.put(b"k1".to_vec(), b"v1".to_vec()).unwrap();
     engine.flush();
     std::thread::sleep(Duration::from_millis(200));
 
@@ -361,7 +406,7 @@ fn flush_failed_task_does_not_evict_other_immutable_memtables() {
         0,
         "first flush should fail while tmp dir is readonly"
     );
-    assert_eq!(engine.get(b"k1"), Some(b"v1".to_vec()));
+    assert_eq!(engine.get(b"k1").unwrap(), Some(b"v1".to_vec()));
 
     // 恢复权限，让第二个 flush 成功
     {
@@ -370,7 +415,7 @@ fn flush_failed_task_does_not_evict_other_immutable_memtables() {
         fs::set_permissions(&tmp_dir, perms).unwrap();
     }
 
-    engine.put(b"k2".to_vec(), b"v2".to_vec());
+    engine.put(b"k2".to_vec(), b"v2".to_vec()).unwrap();
     engine.flush();
 
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -382,9 +427,9 @@ fn flush_failed_task_does_not_evict_other_immutable_memtables() {
         "second flush should create an SSTable after tmp dir becomes writable"
     );
 
-    assert_eq!(engine.get(b"k2"), Some(b"v2".to_vec()));
+    assert_eq!(engine.get(b"k2").unwrap(), Some(b"v2".to_vec()));
     assert_eq!(
-        engine.get(b"k1"),
+        engine.get(b"k1").unwrap(),
         Some(b"v1".to_vec()),
         "successful flush of a later task must not evict data from an earlier failed flush task"
     );

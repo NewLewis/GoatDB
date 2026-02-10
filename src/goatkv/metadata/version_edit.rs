@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::format::coding;
 use crate::goatkv::metadata::file_metadata::TableProperties;
 
@@ -181,7 +182,7 @@ impl VersionEdit {
     }
 
     // 反序列化
-    pub fn decode(data: &[u8]) -> Result<Self, &'static str> {
+    pub fn decode(data: &[u8]) -> GoatResult<Self> {
         let mut edit = Self::default();
         let mut cursor = 0;
 
@@ -255,7 +256,10 @@ impl VersionEdit {
                     ));
                 }
                 _ => {
-                    return Err("Unknown tag");
+                    return Err(GoatError::corruption(
+                        "version_edit_decode",
+                        format!("unknown tag {}", tag),
+                    ));
                 }
             }
         }

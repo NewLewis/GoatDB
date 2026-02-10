@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::io;
 use std::mem;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
@@ -7,6 +6,7 @@ use bytes::Bytes;
 
 use crate::goatkv::core::lsm_state::LSMState;
 use crate::goatkv::core::sequence_number::SequenceNumber;
+use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
 use crate::goatkv::storage::wal::WalManager;
 use crate::goatkv::utils::options::KvEngineOptions;
@@ -24,7 +24,7 @@ struct WriteRequest {
     ops: Mutex<Vec<WriteOp>>,
     ops_len: usize,
     approx_bytes: usize,
-    result: Mutex<Option<Result<(), String>>>,
+    result: Mutex<Option<GoatResult<()>>>,
     cv: Condvar,
 }
 
@@ -56,21 +56,18 @@ impl WriteRequest {
         mem::take(&mut *guard)
     }
 
-    fn complete(&self, result: Result<(), String>) {
+    fn complete(&self, result: GoatResult<()>) {
         let mut guard = self.result.lock().unwrap();
         *guard = Some(result);
         self.cv.notify_one();
     }
 
-    fn wait(&self) -> io::Result<()> {
+    fn wait(&self) -> GoatResult<()> {
         let mut guard = self.result.lock().unwrap();
         while guard.is_none() {
             guard = self.cv.wait(guard).unwrap();
         }
-        match guard.take().unwrap() {
-            Ok(()) => Ok(()),
-            Err(msg) => Err(io::Error::other(msg)),
-        }
+        guard.take().unwrap()
     }
 }
 
@@ -113,7 +110,7 @@ impl KvWriter {
         }
     }
 
-    pub(crate) fn submit_write<F>(&self, ops: Vec<WriteOp>, flush_fn: F) -> io::Result<()>
+    pub(crate) fn submit_write<F>(&self, ops: Vec<WriteOp>, flush_fn: F) -> GoatResult<()>
     where
         F: Fn(),
     {
@@ -122,7 +119,10 @@ impl KvWriter {
         {
             let mut state = self.write_state.lock().unwrap();
             if state.closed {
-                return Err(io::Error::other("write coordinator closed"));
+                return Err(GoatError::unavailable(
+                    "write_coordinator",
+                    "write coordinator closed",
+                ));
             }
             state.queue.push_back(request.clone());
             if !state.leader_active {
@@ -152,7 +152,7 @@ impl KvWriter {
             let result_msg = result.as_ref().err().map(|e| e.to_string());
             for req in &group {
                 match &result_msg {
-                    Some(msg) => req.complete(Err(msg.clone())),
+                    Some(msg) => req.complete(Err(GoatError::internal("write_group", msg.clone()))),
                     None => req.complete(Ok(())),
                 }
             }
@@ -166,7 +166,7 @@ impl KvWriter {
                     drained
                 };
                 for req in remaining {
-                    req.complete(Err(msg.clone()));
+                    req.complete(Err(GoatError::internal("write_group", msg.clone())));
                 }
                 return;
             }
@@ -217,7 +217,7 @@ impl KvWriter {
         group
     }
 
-    fn apply_write_group(&self, group: &[Arc<WriteRequest>]) -> io::Result<bool> {
+    fn apply_write_group(&self, group: &[Arc<WriteRequest>]) -> GoatResult<bool> {
         let _gate = self.write_gate.read().unwrap();
 
         let (ops_groups, total_ops) = Self::collect_ops(group);
