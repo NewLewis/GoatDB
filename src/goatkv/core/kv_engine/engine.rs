@@ -2,9 +2,10 @@ use std::cmp::max;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, RwLock};
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedSender;
 
 use tracing::{error, warn};
 
@@ -35,7 +36,7 @@ pub struct KvEngine {
     /// WAL 写入器，负责写前日志
     wal_manager: Arc<WalManager>,
     /// 清理任务发送端
-    cleanup_sender: mpsc::Sender<CleanupTask>,
+    cleanup_sender: UnboundedSender<CleanupTask>,
     /// 是否允许删除 WAL（关闭时禁用）
     cleanup_enabled: Arc<AtomicBool>,
     /// LSM 状态管理器（memtables + current version）
@@ -104,7 +105,7 @@ impl KvEngine {
         let (wal_paths, sstable_paths, manifest_paths) = Self::prepare_paths(&options)?;
 
         let (cleanup_worker, cleanup_sender, cleanup_enabled) =
-            Self::init_cleanup(wal_paths.clone(), sstable_paths.clone());
+            Self::init_cleanup(wal_paths.clone(), sstable_paths.clone())?;
 
         let mem_table = Arc::new(MemTable::new(options.mem_table_size));
         let (version_set, current_version) = Self::open_version_set(
@@ -278,17 +279,17 @@ impl KvEngine {
     fn init_cleanup(
         wal_paths: Arc<WalPaths>,
         sstable_paths: Arc<SstablePaths>,
-    ) -> (CleanupWorker, mpsc::Sender<CleanupTask>, Arc<AtomicBool>) {
-        let (cleanup_worker, cleanup_sender) = CleanupWorker::new(wal_paths, sstable_paths);
+    ) -> GoatResult<(CleanupWorker, UnboundedSender<CleanupTask>, Arc<AtomicBool>)> {
+        let (cleanup_worker, cleanup_sender) = CleanupWorker::new(wal_paths, sstable_paths)?;
         let cleanup_enabled = Arc::new(AtomicBool::new(true));
-        (cleanup_worker, cleanup_sender, cleanup_enabled)
+        Ok((cleanup_worker, cleanup_sender, cleanup_enabled))
     }
 
     fn open_version_set(
         manifest_paths: Arc<ManifestPaths>,
         sstable_paths: Arc<SstablePaths>,
         options: &KvEngineOptions,
-        cleanup_sender: mpsc::Sender<CleanupTask>,
+        cleanup_sender: UnboundedSender<CleanupTask>,
     ) -> GoatResult<(Arc<RwLock<VersionSet>>, Arc<Version>)> {
         let vs_options = VersionSetOptions::from(options);
         let version_set =
@@ -303,7 +304,7 @@ impl KvEngine {
         wal_paths: &WalPaths,
         lsm_state: &Arc<RwLock<LSMState>>,
         min_log_number: u64,
-        cleanup_sender: &mpsc::Sender<CleanupTask>,
+        cleanup_sender: &UnboundedSender<CleanupTask>,
         cleanup_enabled: &Arc<AtomicBool>,
     ) -> GoatResult<(WalReplayStats, u64)> {
         if !options.recover_from_wal {
@@ -372,7 +373,7 @@ impl KvEngine {
         sequence_number: Arc<SequenceNumber>,
         lsm_state: Arc<RwLock<LSMState>>,
         version_set: Arc<RwLock<VersionSet>>,
-        cleanup_sender: mpsc::Sender<CleanupTask>,
+        cleanup_sender: UnboundedSender<CleanupTask>,
         cleanup_enabled: Arc<AtomicBool>,
         options: KvEngineOptions,
         wal_paths: Arc<WalPaths>,
@@ -518,7 +519,7 @@ impl KvEngine {
         lsm_state: &Arc<RwLock<LSMState>>,
         mem_table_size: usize,
         min_log_number: u64,
-        cleanup_sender: &mpsc::Sender<CleanupTask>,
+        cleanup_sender: &UnboundedSender<CleanupTask>,
         cleanup_enabled: &Arc<AtomicBool>,
     ) -> GoatResult<(WalReplayStats, u64)> {
         let wal_files = Self::list_wal_files(wal_paths, min_log_number)?;
@@ -568,7 +569,7 @@ impl KvEngine {
         mem_table_size: usize,
         log_number: u64,
         wal_handle: &mut Option<Arc<WalHandle>>,
-        cleanup_sender: &mpsc::Sender<CleanupTask>,
+        cleanup_sender: &UnboundedSender<CleanupTask>,
         cleanup_enabled: &Arc<AtomicBool>,
     ) -> GoatResult<WalReplayStats> {
         replay_wal_file(wal_path, |key, value| {
@@ -592,7 +593,7 @@ impl KvEngine {
         mem_table_size: usize,
         log_number: u64,
         wal_handle: &mut Option<Arc<WalHandle>>,
-        cleanup_sender: &mpsc::Sender<CleanupTask>,
+        cleanup_sender: &UnboundedSender<CleanupTask>,
         cleanup_enabled: &Arc<AtomicBool>,
     ) {
         let wal_handle =
@@ -612,7 +613,7 @@ impl KvEngine {
         mem_table_size: usize,
         log_number: u64,
         wal_handle: &mut Option<Arc<WalHandle>>,
-        cleanup_sender: &mpsc::Sender<CleanupTask>,
+        cleanup_sender: &UnboundedSender<CleanupTask>,
         cleanup_enabled: &Arc<AtomicBool>,
     ) {
         let mut state = lsm_state.write().unwrap();
@@ -632,7 +633,7 @@ impl KvEngine {
     fn wal_handle_for_log(
         log_number: u64,
         wal_handle: &mut Option<Arc<WalHandle>>,
-        cleanup_sender: &mpsc::Sender<CleanupTask>,
+        cleanup_sender: &UnboundedSender<CleanupTask>,
         cleanup_enabled: &Arc<AtomicBool>,
     ) -> Option<Arc<WalHandle>> {
         if log_number == 0 {
@@ -730,8 +731,18 @@ mod tests {
     use super::KvEngine;
     use crate::goatkv::error::ErrorKind;
 
+    fn test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build tokio runtime for kv engine tests")
+    }
+
     #[test]
     fn test_put_and_get() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
         let engine = KvEngine::new_for_test();
 
         engine.put(b"key1".to_vec(), b"value1".to_vec()).unwrap();
@@ -745,6 +756,8 @@ mod tests {
 
     #[test]
     fn test_update_existing_key() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
         let engine = KvEngine::new_for_test();
 
         engine.put(b"key1".to_vec(), b"value1".to_vec()).unwrap();
@@ -756,6 +769,8 @@ mod tests {
 
     #[test]
     fn test_delete_key() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
         let engine = KvEngine::new_for_test();
 
         engine.put(b"key1".to_vec(), b"value1".to_vec()).unwrap();
@@ -770,6 +785,8 @@ mod tests {
 
     #[test]
     fn test_delete_then_reinsert() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
         let engine = KvEngine::new_for_test();
 
         engine.put(b"key1".to_vec(), b"value1".to_vec()).unwrap();
@@ -782,6 +799,8 @@ mod tests {
 
     #[test]
     fn test_multiple_operations() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
         let engine = KvEngine::new_for_test();
 
         engine.put(b"key1".to_vec(), b"value1".to_vec()).unwrap();
@@ -802,6 +821,8 @@ mod tests {
 
     #[test]
     fn test_empty_flush_is_noop() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
         let engine = KvEngine::new_for_test();
 
         engine.flush();
@@ -817,6 +838,8 @@ mod tests {
 
     #[test]
     fn test_shutdown_rejects_new_writes() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
         let engine = KvEngine::new_for_test();
         engine
             .put(b"key_before_shutdown".to_vec(), b"value".to_vec())
@@ -836,6 +859,8 @@ mod tests {
 
     #[test]
     fn test_shutdown_is_idempotent() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
         let engine = KvEngine::new_for_test();
         engine.put(b"k".to_vec(), b"v".to_vec()).unwrap();
 
@@ -845,6 +870,8 @@ mod tests {
 
     #[test]
     fn test_paths_integration() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
         let engine = KvEngine::new_for_test();
         let wal_paths = engine.wal_paths();
         let sstable_paths = engine.sstable_paths();

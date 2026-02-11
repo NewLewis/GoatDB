@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
@@ -12,6 +11,7 @@ use crate::goatkv::metadata::version_edit::VersionEdit;
 use crate::goatkv::utils::cleanup_task::CleanupTask;
 use crate::goatkv::utils::options::KvEngineOptions;
 use crate::goatkv::utils::paths::{ManifestPaths, SstablePaths};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
 /// VersionSet 管理所有版本和增量变更。
@@ -83,7 +83,7 @@ pub struct VersionSet {
     /// 设计理由：
     /// - 删除由后台异步执行，避免阻塞写路径；
     /// - 读路径可能仍持有旧版本，延迟删除避免读到缺失文件。
-    obsolete_sender: Sender<CleanupTask>,
+    obsolete_sender: UnboundedSender<CleanupTask>,
 
     // ---------------- 环境配置 ----------------
     manifest_paths: Arc<ManifestPaths>,
@@ -134,7 +134,7 @@ impl VersionSet {
     pub fn new(
         manifest_paths: Arc<ManifestPaths>,
         sstable_paths: Arc<SstablePaths>,
-        obsolete_sender: Sender<CleanupTask>,
+        obsolete_sender: UnboundedSender<CleanupTask>,
     ) -> GoatResult<Self> {
         let options = VersionSetOptions::default();
         Self::new_with_options(manifest_paths, sstable_paths, options, obsolete_sender)
@@ -145,7 +145,7 @@ impl VersionSet {
         manifest_paths: Arc<ManifestPaths>,
         sstable_paths: Arc<SstablePaths>,
         options: VersionSetOptions,
-        obsolete_sender: Sender<CleanupTask>,
+        obsolete_sender: UnboundedSender<CleanupTask>,
     ) -> GoatResult<Self> {
         // 创建空的当前版本：没有任何 SSTable
         let current = Arc::new(Version::new(options.num_levels, sstable_paths.clone()));
@@ -170,7 +170,7 @@ impl VersionSet {
         manifest_paths: Arc<ManifestPaths>,
         sstable_paths: Arc<SstablePaths>,
         options: VersionSetOptions,
-        obsolete_sender: Sender<CleanupTask>,
+        obsolete_sender: UnboundedSender<CleanupTask>,
     ) -> GoatResult<Self> {
         // 先创建空 VersionSet，再通过 MANIFEST 恢复到最新状态
         //

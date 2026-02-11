@@ -1,76 +1,91 @@
-use std::fs;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::thread;
 
+use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::storage::wal::WalPaths;
 use crate::goatkv::utils::cleanup_task::CleanupTask;
 use crate::goatkv::utils::paths::SstablePaths;
+use tokio::runtime::Handle;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing::{info, warn};
 
 #[derive(Debug)]
 pub struct CleanupWorker {
-    // 保存句柄，防止线程被 detach，也方便未来实现 Drop 时的 graceful shutdown
-    _handle: thread::JoinHandle<()>,
+    // 保存句柄，防止后台 task 被 detach。
+    _handle: tokio::task::JoinHandle<()>,
 }
 
 impl CleanupWorker {
-    /// 创建并启动清理线程
+    /// 创建并启动纯异步清理 worker（要求当前线程已在 Tokio runtime 中）
     ///
     /// # 参数
     /// - `wal_paths`: WAL 路径集合
     /// - `sstable_paths`: SSTable 路径集合
     ///
     /// # Returns
-    /// - `Self`: Worker 实例（持有线程句柄）
-    /// - `Sender<CleanupTask>`: 删除信号发送端，你需要把这个传给 VersionSet
+    /// - `Self`: Worker 实例（持有后台 task 句柄）
+    /// - `UnboundedSender<CleanupTask>`: 删除信号发送端，你需要把这个传给 VersionSet
     pub fn new(
         wal_paths: Arc<WalPaths>,
         sstable_paths: Arc<SstablePaths>,
-    ) -> (Self, Sender<CleanupTask>) {
-        // 1. 在内部创建通道
-        let (tx, rx) = mpsc::channel();
+    ) -> GoatResult<(Self, UnboundedSender<CleanupTask>)> {
+        Handle::try_current().map_err(|_| {
+            GoatError::unavailable(
+                "cleanup_worker",
+                "tokio runtime required for async cleanup worker",
+            )
+        })?;
 
-        // 2. 在内部启动线程
-        // 注意：这里把 path 和 rx move 进去了，不需要 self 参与
-        let handle = thread::spawn(move || {
-            Self::run_loop(rx, wal_paths, sstable_paths);
-        });
+        // 1. 在内部创建通道
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        // 2. 在当前 Tokio runtime 上启动异步任务
+        let handle = tokio::spawn(Self::run_loop_async(rx, wal_paths, sstable_paths));
+        let worker = Self { _handle: handle };
 
         // 3. 返回 Worker 实例和 Sender
-        (
-            Self { _handle: handle },
-            tx, // 把 Sender 抛出去给外部使用
-        )
+        Ok((worker, tx))
     }
 
-    /// 后台主循环
-    fn run_loop(
-        rx: Receiver<CleanupTask>,
+    fn task_to_path(
+        task: CleanupTask,
         wal_paths: Arc<WalPaths>,
         sstable_paths: Arc<SstablePaths>,
-    ) {
-        // 只要 tx 还有人持有，recv 就会阻塞等待；tx 全部销毁，recv 返回 Err，循环退出
-        while let Ok(task) = rx.recv() {
-            let (file_path, label) = match task {
-                CleanupTask::Sstable(file_number) => {
-                    (sstable_paths.sstable_path_by_id(file_number), "sstable")
-                }
-                CleanupTask::Wal(log_number) => (wal_paths.wal_path_by_id(log_number), "wal"),
-            };
+    ) -> (std::path::PathBuf, &'static str) {
+        match task {
+            CleanupTask::Sstable(file_number) => {
+                (sstable_paths.sstable_path_by_id(file_number), "sstable")
+            }
+            CleanupTask::Wal(log_number) => (wal_paths.wal_path_by_id(log_number), "wal"),
+        }
+    }
 
-            match fs::remove_file(&file_path) {
-                Ok(_) => {
-                    info!("[CleanUp] Deleted {}: {:?}", label, file_path);
-                }
-                Err(e) => {
-                    // 忽略文件不存在的错误，可能是重复删除
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        warn!("[CleanUp] Failed to delete {:?}: {}", file_path, e);
-                    }
+    fn log_delete_result(file_path: &std::path::Path, label: &str, result: std::io::Result<()>) {
+        match result {
+            Ok(_) => {
+                info!("[CleanUp] Deleted {}: {:?}", label, file_path);
+            }
+            Err(e) => {
+                // 忽略文件不存在的错误，可能是重复删除
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!("[CleanUp] Failed to delete {:?}: {}", file_path, e);
                 }
             }
         }
-        info!("[CleanUp] Worker thread stopped.");
+    }
+
+    /// Tokio 后台主循环
+    async fn run_loop_async(
+        mut rx: UnboundedReceiver<CleanupTask>,
+        wal_paths: Arc<WalPaths>,
+        sstable_paths: Arc<SstablePaths>,
+    ) {
+        while let Some(task) = rx.recv().await {
+            let (file_path, label) =
+                Self::task_to_path(task, wal_paths.clone(), sstable_paths.clone());
+            let remove_path = file_path.clone();
+            let remove_result = tokio::fs::remove_file(&remove_path).await;
+            Self::log_delete_result(&file_path, label, remove_result);
+        }
+        info!("[CleanUp] Worker task stopped.");
     }
 }

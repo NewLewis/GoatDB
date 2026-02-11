@@ -1,20 +1,20 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use crate::goatkv::utils::cleanup_task::CleanupTask;
+use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug)]
 pub struct WalHandle {
     log_number: u64,
-    cleanup_sender: Sender<CleanupTask>,
+    cleanup_sender: UnboundedSender<CleanupTask>,
     cleanup_enabled: Arc<AtomicBool>,
 }
 
 impl WalHandle {
     pub fn new(
         log_number: u64,
-        cleanup_sender: Sender<CleanupTask>,
+        cleanup_sender: UnboundedSender<CleanupTask>,
         cleanup_enabled: Arc<AtomicBool>,
     ) -> Self {
         Self {

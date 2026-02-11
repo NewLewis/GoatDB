@@ -33,8 +33,18 @@ fn count_sstable_files(data_dir: &std::path::Path) -> usize {
         .unwrap_or(0)
 }
 
+fn test_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build tokio runtime for recovery tests")
+}
+
 #[test]
 fn recovery_handles_truncated_wal_tail() {
+    let rt = test_runtime();
+    let _guard = rt.enter();
     let tmp = temp_dir();
 
     let (wal_paths, _sstable_paths, _manifest_paths) = KvEngine::init_db_paths(tmp.path()).unwrap();
@@ -79,6 +89,8 @@ fn recovery_handles_truncated_wal_tail() {
 
 #[test]
 fn recovery_replays_multiple_wals_in_order() {
+    let rt = test_runtime();
+    let _guard = rt.enter();
     let tmp = temp_dir();
 
     let (wal_paths, _sstable_paths, _manifest_paths) = KvEngine::init_db_paths(tmp.path()).unwrap();
@@ -145,6 +157,8 @@ fn recovery_replays_multiple_wals_in_order() {
 
 #[test]
 fn recovery_advances_log_number_past_existing_wals() {
+    let rt = test_runtime();
+    let _guard = rt.enter();
     let tmp = temp_dir();
 
     let (wal_paths, _sstable_paths, _manifest_paths) = KvEngine::init_db_paths(tmp.path()).unwrap();
@@ -179,6 +193,8 @@ fn recovery_advances_log_number_past_existing_wals() {
 
 #[test]
 fn recovery_truncates_manifest_tail() {
+    let rt = test_runtime();
+    let _guard = rt.enter();
     let tmp = temp_dir();
 
     let (_wal_paths, sstable_paths, manifest_paths) = KvEngine::init_db_paths(tmp.path()).unwrap();
@@ -232,6 +248,8 @@ fn recovery_truncates_manifest_tail() {
 
 #[test]
 fn recovery_errors_on_corrupted_manifest_edit() {
+    let rt = test_runtime();
+    let _guard = rt.enter();
     let tmp = temp_dir();
 
     let (_wal_paths, sstable_paths, manifest_paths) = KvEngine::init_db_paths(tmp.path()).unwrap();
@@ -271,6 +289,8 @@ fn recovery_errors_on_corrupted_manifest_edit() {
 
 #[test]
 fn read_path_reports_missing_sstable_as_error() {
+    let rt = test_runtime();
+    let _guard = rt.enter();
     let tmp = temp_dir();
     let options = KvEngineOptions::default()
         .with_data_dir(tmp.path())
@@ -315,6 +335,8 @@ fn read_path_reports_missing_sstable_as_error() {
 #[cfg(unix)]
 #[test]
 fn recovery_replays_wal_if_flush_never_completed() {
+    let rt = test_runtime();
+    let _guard = rt.enter();
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = temp_dir();
@@ -376,6 +398,8 @@ fn recovery_replays_wal_if_flush_never_completed() {
 #[cfg(unix)]
 #[test]
 fn flush_failed_task_does_not_evict_other_immutable_memtables() {
+    let rt = test_runtime();
+    let _guard = rt.enter();
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
 

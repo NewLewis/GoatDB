@@ -1,7 +1,6 @@
-use std::sync::mpsc::Sender;
-
 use crate::goatkv::metadata::version_edit::NewFile;
 use crate::goatkv::utils::cleanup_task::CleanupTask;
+use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug, Clone)]
 pub struct TableProperties {
@@ -39,14 +38,14 @@ impl TableProperties {
 pub struct FileMetadata {
     pub file_id: u64,
     pub props: TableProperties,
-    pub obsolete_sender: Sender<CleanupTask>,
+    pub obsolete_sender: UnboundedSender<CleanupTask>,
 }
 
 impl FileMetadata {
     pub fn from_props(
         file_id: u64,
         props: TableProperties,
-        obsolete_sender: Sender<CleanupTask>,
+        obsolete_sender: UnboundedSender<CleanupTask>,
     ) -> Self {
         FileMetadata {
             file_id,
@@ -55,7 +54,7 @@ impl FileMetadata {
         }
     }
 
-    pub fn from_new_file(new_file: NewFile, obsolete_sender: Sender<CleanupTask>) -> Self {
+    pub fn from_new_file(new_file: NewFile, obsolete_sender: UnboundedSender<CleanupTask>) -> Self {
         FileMetadata {
             file_id: new_file.file_id,
             props: new_file.props,

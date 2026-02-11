@@ -458,6 +458,14 @@ fn main() {
         return;
     }
 
+    // KvEngine 内部 cleanup worker 以 Tokio task 运行，需要当前线程具备 runtime 上下文。
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build tokio runtime for benchmark");
+    let _runtime_guard = runtime.enter();
+
     let engines: Vec<EngineKind> = match cli.engine {
         EngineKind::Both => vec![EngineKind::Goatkv, EngineKind::Rocksdb],
         other => vec![other],
