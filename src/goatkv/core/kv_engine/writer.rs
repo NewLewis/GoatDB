@@ -138,6 +138,25 @@ impl KvWriter {
         request.wait()
     }
 
+    /// 关闭写入协调器，拒绝后续写请求，并让已排队但未处理的请求快速失败。
+    pub(crate) fn close(&self) {
+        let pending = {
+            let mut state = self.write_state.lock().unwrap();
+            if state.closed {
+                return;
+            }
+            state.closed = true;
+            state.queue.drain(..).collect::<Vec<_>>()
+        };
+
+        for req in pending {
+            req.complete(Err(GoatError::unavailable(
+                "write_coordinator",
+                "write coordinator closed",
+            )));
+        }
+    }
+
     fn process_write_groups<F>(&self, flush_fn: &F)
     where
         F: Fn(),

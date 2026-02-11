@@ -9,8 +9,9 @@ use goatkv::{
     DeleteRequest, DeleteResponse, FlushRequest, FlushResponse, GetRequest, GetResponse,
     UpdateRequest, UpdateResponse, WriteRequest, WriteResponse,
 };
+use tokio::signal;
 use tonic::{transport::Server, Request, Response, Status};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 // 引入编译生成的代码
 pub mod goatkv {
@@ -24,10 +25,8 @@ pub struct GoatKVServiceImpl {
 
 impl GoatKVServiceImpl {
     /// 创建新的服务实例，使用指定的 KvEngine
-    pub fn new(engine: KvEngine) -> Self {
-        Self {
-            engine: Arc::new(engine),
-        }
+    pub fn new(engine: Arc<KvEngine>) -> Self {
+        Self { engine }
     }
 
     fn map_engine_err(err: GoatError) -> Status {
@@ -213,32 +212,43 @@ async fn main() -> GoatResult<()> {
     if let Some(ref dir) = args.data_dir {
         options = options.with_data_dir(dir);
     }
+    // 初始化日志
     let _log_guards = init_logging("goatkv_server", &options.data_dir, "info");
-
-    if let Some(dir) = args.data_dir {
+    if let Some(dir) = args.data_dir.as_ref() {
         info!("Using data directory: {}", dir);
     } else {
         info!("Using default data directory (./goatdb_data)");
     }
 
-    let engine = KvEngine::new_with_options(options).map_err(|e| {
+    let engine = Arc::new(KvEngine::new_with_options(options).map_err(|e| {
         GoatError::internal_with_source("server_init_engine", "failed to create kv engine", e)
-    })?;
+    })?);
 
-    let service = GoatKVServiceImpl::new(engine);
+    let service = GoatKVServiceImpl::new(engine.clone());
 
     info!("gRPC Server listening on {}", addr);
     info!("Starting server...");
 
-    Server::builder()
+    let serve_result = Server::builder()
         .add_service(GoatKvServiceServer::new(service))
-        .serve(addr)
-        .await
-        .map_err(|e| {
-            GoatError::internal_with_source("grpc_server_serve", "grpc server failed", e)
-        })?;
+        .serve_with_shutdown(addr, async {
+            match signal::ctrl_c().await {
+                Ok(()) => info!("Received Ctrl+C, initiating graceful shutdown"),
+                Err(e) => warn!("Failed to listen for Ctrl+C signal: {}", e),
+            }
+        })
+        .await;
 
-    info!("Server finished");
+    info!("gRPC server stopped accepting new requests");
+    if let Err(e) = engine.shutdown() {
+        warn!("Engine graceful shutdown failed: {}", e);
+    } else {
+        info!("Engine graceful shutdown completed");
+    }
+
+    serve_result.map_err(|e| {
+        GoatError::internal_with_source("grpc_server_serve", "grpc server failed", e)
+    })?;
 
     Ok(())
 }

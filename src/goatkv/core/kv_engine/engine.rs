@@ -3,6 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use tracing::{error, warn};
 
@@ -24,6 +26,8 @@ use crate::goatkv::utils::options::KvEngineOptions;
 use crate::goatkv::utils::paths::{ManifestPaths, SstablePaths};
 
 type DbPaths = (Arc<WalPaths>, Arc<SstablePaths>, Arc<ManifestPaths>);
+const SHUTDOWN_FLUSH_WAIT_TIMEOUT_MS: u64 = 30_000;
+const SHUTDOWN_FLUSH_WAIT_INTERVAL_MS: u64 = 10;
 
 /// LSM-Tree 键值存储引擎
 #[derive(Debug)]
@@ -98,8 +102,10 @@ impl KvEngine {
     /// 创建新的 KvEngine，使用指定的配置选项
     pub fn new_with_options(options: KvEngineOptions) -> GoatResult<Self> {
         let (wal_paths, sstable_paths, manifest_paths) = Self::prepare_paths(&options)?;
+
         let (cleanup_worker, cleanup_sender, cleanup_enabled) =
             Self::init_cleanup(wal_paths.clone(), sstable_paths.clone());
+
         let mem_table = Arc::new(MemTable::new(options.mem_table_size));
         let (version_set, current_version) = Self::open_version_set(
             manifest_paths.clone(),
@@ -196,7 +202,30 @@ impl KvEngine {
 
     pub fn flush(&self) {
         let _gate = self.write_gate.write().unwrap();
+        self.flush_inner();
+    }
 
+    /// 优雅停机：
+    /// 1) 关闭写入入口，拒绝新写请求；
+    /// 2) 在写入门闩保护下封存当前 memtable 并触发 flush；
+    /// 3) 等待 immutable 队列清空（后台 flush 完成）。
+    pub fn shutdown(&self) -> GoatResult<()> {
+        self.writer.close();
+        {
+            let _gate = self.write_gate.write().unwrap();
+            self.flush_inner();
+        }
+        if let Err(e) =
+            self.wait_for_immutable_memtables(Duration::from_millis(SHUTDOWN_FLUSH_WAIT_TIMEOUT_MS))
+        {
+            self.cleanup_enabled.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+        self.cleanup_enabled.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn flush_inner(&self) {
         let candidate_log_number = self.next_log_number_candidate();
         let old_log_number = self.current_log_number.load(Ordering::SeqCst);
         let (new_log_number, rotation_succeeded) =
@@ -209,6 +238,26 @@ impl KvEngine {
         };
 
         self.submit_flush_task(immutable_mem_table, new_log_number, rotation_succeeded);
+    }
+
+    fn wait_for_immutable_memtables(&self, timeout: Duration) -> GoatResult<()> {
+        let start = Instant::now();
+        loop {
+            let pending = self.lsm_state.read().unwrap().immutable_mem_tables.len();
+            if pending == 0 {
+                return Ok(());
+            }
+            if start.elapsed() >= timeout {
+                return Err(GoatError::unavailable(
+                    "engine_shutdown",
+                    format!(
+                        "timeout waiting for flush completion, pending immutable memtables={}",
+                        pending
+                    ),
+                ));
+            }
+            thread::sleep(Duration::from_millis(SHUTDOWN_FLUSH_WAIT_INTERVAL_MS));
+        }
     }
 }
 
@@ -679,6 +728,7 @@ impl KvEngine {
 #[cfg(test)]
 mod tests {
     use super::KvEngine;
+    use crate::goatkv::error::ErrorKind;
 
     #[test]
     fn test_put_and_get() {
@@ -763,6 +813,34 @@ mod tests {
 
         let version = engine.version_set.read().unwrap().current();
         assert!(version.get_files(0).is_empty());
+    }
+
+    #[test]
+    fn test_shutdown_rejects_new_writes() {
+        let engine = KvEngine::new_for_test();
+        engine
+            .put(b"key_before_shutdown".to_vec(), b"value".to_vec())
+            .unwrap();
+
+        engine.shutdown().unwrap();
+
+        let err = engine
+            .put(b"key_after_shutdown".to_vec(), b"value".to_vec())
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Unavailable);
+        assert_eq!(
+            err.to_string(),
+            "unavailable write_coordinator: write coordinator closed"
+        );
+    }
+
+    #[test]
+    fn test_shutdown_is_idempotent() {
+        let engine = KvEngine::new_for_test();
+        engine.put(b"k".to_vec(), b"v".to_vec()).unwrap();
+
+        engine.shutdown().unwrap();
+        engine.shutdown().unwrap();
     }
 
     #[test]
