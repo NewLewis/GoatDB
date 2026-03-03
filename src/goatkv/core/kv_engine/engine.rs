@@ -17,6 +17,7 @@ use crate::goatkv::core::lsm_state::{ImmutableMemTableEntry, LSMState};
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
 use crate::goatkv::core::sequence_number::SequenceNumber;
 use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
+use crate::goatkv::format::internal_key::SEQUENCE_NUMBER_MAX;
 use crate::goatkv::metadata::version::Version;
 use crate::goatkv::metadata::version_set::{VersionSet, VersionSetOptions};
 use crate::goatkv::storage::wal::{
@@ -29,6 +30,21 @@ use crate::goatkv::utils::paths::{ManifestPaths, SstablePaths};
 type DbPaths = (Arc<WalPaths>, Arc<SstablePaths>, Arc<ManifestPaths>);
 const SHUTDOWN_FLUSH_WAIT_TIMEOUT_MS: u64 = 30_000;
 const SHUTDOWN_FLUSH_WAIT_INTERVAL_MS: u64 = 10;
+
+struct BuildEngineInput {
+    wal_writer: WalWriter,
+    sequence_number: Arc<SequenceNumber>,
+    lsm_state: Arc<RwLock<LSMState>>,
+    version_set: Arc<RwLock<VersionSet>>,
+    cleanup_sender: UnboundedSender<CleanupTask>,
+    cleanup_enabled: Arc<AtomicBool>,
+    options: KvEngineOptions,
+    wal_paths: Arc<WalPaths>,
+    sstable_paths: Arc<SstablePaths>,
+    manifest_paths: Arc<ManifestPaths>,
+    cleanup_worker: CleanupWorker,
+    current_log_number: u64,
+}
 
 /// LSM-Tree 键值存储引擎
 #[derive(Debug)]
@@ -135,9 +151,9 @@ impl KvEngine {
 
         let current_log_number = Self::select_start_log_number(&version_set, wal_max_number);
         let wal_writer = Self::open_wal_writer(&options, &wal_paths, current_log_number)?;
-        let sequence_number = Self::init_sequence_number(&version_set, wal_stats.max_sequence);
+        let sequence_number = Self::init_sequence_number(&version_set, wal_stats.max_sequence)?;
 
-        let engine = Self::build_engine(
+        let engine = Self::build_engine(BuildEngineInput {
             wal_writer,
             sequence_number,
             lsm_state,
@@ -150,7 +166,7 @@ impl KvEngine {
             manifest_paths,
             cleanup_worker,
             current_log_number,
-        );
+        });
 
         engine.submit_recovery_flushes();
         Ok(engine)
@@ -202,12 +218,11 @@ impl KvEngine {
     }
 
     pub fn flush(&self) {
-        self.writer.begin_flush_barrier();
+        let _barrier = self.writer.enter_flush_barrier();
         {
             let _gate = self.write_gate.write().unwrap();
             self.flush_inner();
         }
-        self.writer.end_flush_barrier();
     }
 
     /// 优雅停机：
@@ -360,26 +375,35 @@ impl KvEngine {
     fn init_sequence_number(
         version_set: &Arc<RwLock<VersionSet>>,
         wal_max_sequence: u64,
-    ) -> Arc<SequenceNumber> {
+    ) -> GoatResult<Arc<SequenceNumber>> {
         let vs_guard = version_set.read().unwrap();
         let last_sequence = max(wal_max_sequence, vs_guard.last_sequence());
-        Arc::new(SequenceNumber::with_start(last_sequence + 1))
+        if last_sequence >= SEQUENCE_NUMBER_MAX {
+            return Err(GoatError::unavailable(
+                "sequence_number",
+                format!("sequence number exhausted at {}", last_sequence),
+            ));
+        }
+        Ok(Arc::new(SequenceNumber::with_start(
+            last_sequence.saturating_add(1),
+        )))
     }
 
-    fn build_engine(
-        wal_writer: WalWriter,
-        sequence_number: Arc<SequenceNumber>,
-        lsm_state: Arc<RwLock<LSMState>>,
-        version_set: Arc<RwLock<VersionSet>>,
-        cleanup_sender: UnboundedSender<CleanupTask>,
-        cleanup_enabled: Arc<AtomicBool>,
-        options: KvEngineOptions,
-        wal_paths: Arc<WalPaths>,
-        sstable_paths: Arc<SstablePaths>,
-        manifest_paths: Arc<ManifestPaths>,
-        cleanup_worker: CleanupWorker,
-        current_log_number: u64,
-    ) -> Self {
+    fn build_engine(input: BuildEngineInput) -> Self {
+        let BuildEngineInput {
+            wal_writer,
+            sequence_number,
+            lsm_state,
+            version_set,
+            cleanup_sender,
+            cleanup_enabled,
+            options,
+            wal_paths,
+            sstable_paths,
+            manifest_paths,
+            cleanup_worker,
+            current_log_number,
+        } = input;
         let flush_worker = FlushWorker::new(
             lsm_state.clone(),
             version_set.clone(),
@@ -728,6 +752,9 @@ impl KvEngine {
 mod tests {
     use super::KvEngine;
     use crate::goatkv::error::ErrorKind;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     fn test_runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
@@ -882,5 +909,78 @@ mod tests {
 
         let wal_path = wal_paths.main_wal_path();
         assert!(wal_path.parent().unwrap() == wal_paths.wal_dir());
+    }
+
+    #[test]
+    fn test_shutdown_write_race_only_returns_unavailable() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = Arc::new(KvEngine::new_for_test());
+
+        let error_kinds = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        for tid in 0..4usize {
+            let engine = Arc::clone(&engine);
+            let error_kinds = Arc::clone(&error_kinds);
+            handles.push(thread::spawn(move || {
+                for i in 0..20_000usize {
+                    let key = format!("k{}_{}", tid, i).into_bytes();
+                    match engine.put(key, b"v".to_vec()) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            error_kinds.lock().unwrap().push(e.kind());
+                            break;
+                        }
+                    }
+                }
+            }));
+        }
+
+        thread::sleep(Duration::from_millis(20));
+        engine.shutdown().unwrap();
+        for handle in handles {
+            handle.join().expect("writer thread panicked");
+        }
+
+        for kind in error_kinds.lock().unwrap().iter() {
+            assert_eq!(
+                *kind,
+                ErrorKind::Unavailable,
+                "shutdown race should not surface non-unavailable errors"
+            );
+        }
+    }
+
+    #[test]
+    fn test_l0_compacts_to_l1_when_l0_exceeds_threshold() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        for i in 0..6usize {
+            engine
+                .put(
+                    format!("k{:02}", i).into_bytes(),
+                    format!("v{:02}", i).into_bytes(),
+                )
+                .unwrap();
+            engine.flush();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let (l0_len, l1_len) = {
+                let vs = engine.version_set.read().unwrap();
+                let v = vs.current();
+                (v.get_files(0).len(), v.get_files(1).len())
+            };
+            if l0_len <= 4 && l1_len > 0 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("timeout waiting compaction: l0={}, l1={}", l0_len, l1_len);
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 }

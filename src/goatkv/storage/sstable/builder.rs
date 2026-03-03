@@ -111,6 +111,10 @@ pub struct SSTableBuilder {
     smallest_key: Option<Vec<u8>>,
     /// 最大的键（最后一个写入的键）
     largest_key: Option<Vec<u8>>,
+    /// 最小序列号
+    smallest_seqno: Option<u64>,
+    /// 最大序列号
+    largest_seqno: Option<u64>,
 
     /// 临时文件路径（写入完成后重命名）
     tmp_path: PathBuf,
@@ -182,6 +186,8 @@ impl SSTableBuilder {
 
             smallest_key: None,
             largest_key: None,
+            smallest_seqno: None,
+            largest_seqno: None,
             tmp_path,
             final_path: sstable_path,
         })
@@ -222,6 +228,10 @@ impl SSTableBuilder {
     /// # }
     /// ```
     pub fn write(&mut self, key: &[u8], value: &[u8]) -> GoatResult<()> {
+        let seqno = Self::parse_seqno_from_internal_key(key)?;
+        self.smallest_seqno = Some(self.smallest_seqno.map_or(seqno, |cur| cur.min(seqno)));
+        self.largest_seqno = Some(self.largest_seqno.map_or(seqno, |cur| cur.max(seqno)));
+
         // 更新 smallest_key 和 largest_key
         if self.smallest_key.is_none() {
             self.smallest_key = Some(key.to_vec());
@@ -249,7 +259,6 @@ impl SSTableBuilder {
         // 将key添加到布隆过滤器
         // 注意：BloomFilter 应该索引 UserKey，以便于查询
         // key 是 InternalKey (UserKey + 8 bytes Seq/Kind)
-        debug_assert!(key.len() >= 8);
         let user_key = &key[..key.len() - 8];
         self.bloom_builder.add(user_key);
         Ok(())
@@ -464,11 +473,27 @@ impl SSTableBuilder {
             file_size: self.offset, // offset 现在是完整的文件大小
             smallest_key: self.smallest_key.clone().unwrap_or_default(),
             largest_key: self.largest_key.clone().unwrap_or_default(),
-            smallest_seqno: 0, // TODO: 从 InternalKey 中解析
-            largest_seqno: 0,  // TODO: 从 InternalKey 中解析
+            smallest_seqno: self.smallest_seqno.unwrap_or(0),
+            largest_seqno: self.largest_seqno.unwrap_or(0),
         };
 
         Ok(file_metadata)
+    }
+
+    fn parse_seqno_from_internal_key(key: &[u8]) -> GoatResult<u64> {
+        if key.len() < 8 {
+            return Err(GoatError::invalid_argument(
+                "sstable_key",
+                "internal key must contain at least 8-byte trailer",
+            ));
+        }
+        let trailer = &key[key.len() - 8..];
+        let inverted = u64::from_be_bytes([
+            trailer[0], trailer[1], trailer[2], trailer[3], trailer[4], trailer[5], trailer[6],
+            trailer[7],
+        ]);
+        let encoded = !inverted;
+        Ok(encoded >> 8)
     }
 
     /// 计算索引中使用的分隔符（separator）

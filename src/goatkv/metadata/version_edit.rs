@@ -15,6 +15,7 @@ const TAG_LAST_SEQUENCE: u32 = 4;
 const TAG_COMPACT_POINTER: u32 = 5;
 const TAG_DELETED_FILE: u32 = 6;
 const TAG_NEW_FILE: u32 = 7;
+const TAG_NEW_FILE_V2: u32 = 8;
 
 #[derive(Debug, Clone)]
 pub struct NewFile {
@@ -167,15 +168,19 @@ impl VersionEdit {
             coding::put_varint64(&mut buf, *file_id);
         }
 
-        // 7. New Files
-        // 格式: Tag -> Level -> FileId -> FileSize -> SmallestKey -> LargestKey
+        // 7. New Files (v2)
+        // 格式:
+        // Tag -> Level -> FileId -> FileSize -> SmallestKey -> LargestKey
+        //     -> SmallestSeqno -> LargestSeqno
         for (level, meta) in &self.new_files {
-            coding::put_varint64(&mut buf, TAG_NEW_FILE as u64);
+            coding::put_varint64(&mut buf, TAG_NEW_FILE_V2 as u64);
             coding::put_varint64(&mut buf, *level as u64);
             coding::put_varint64(&mut buf, meta.file_id);
             coding::put_varint64(&mut buf, meta.file_size());
             coding::put_length_prefixed_slice(&mut buf, meta.smallest_key());
             coding::put_length_prefixed_slice(&mut buf, meta.largest_key());
+            coding::put_varint64(&mut buf, meta.props.smallest_seqno);
+            coding::put_varint64(&mut buf, meta.props.largest_seqno);
         }
 
         buf
@@ -229,6 +234,7 @@ impl VersionEdit {
                     edit.deleted_files.insert((level as usize, file_id));
                 }
                 TAG_NEW_FILE => {
+                    // 兼容旧格式：不含 seqno，默认置 0。
                     let (level, bytes_read) = coding::decode_varint64_with_length(&data[cursor..])?;
                     cursor += bytes_read;
                     let (file_id, bytes_read) =
@@ -252,6 +258,39 @@ impl VersionEdit {
                             largest_key.to_vec(),
                             0,
                             0,
+                        ),
+                    ));
+                }
+                TAG_NEW_FILE_V2 => {
+                    let (level, bytes_read) = coding::decode_varint64_with_length(&data[cursor..])?;
+                    cursor += bytes_read;
+                    let (file_id, bytes_read) =
+                        coding::decode_varint64_with_length(&data[cursor..])?;
+                    cursor += bytes_read;
+                    let (file_size, bytes_read) =
+                        coding::decode_varint64_with_length(&data[cursor..])?;
+                    cursor += bytes_read;
+                    let (smallest_key, bytes_read) =
+                        coding::get_length_prefixed_slice(&data[cursor..])?;
+                    cursor += bytes_read;
+                    let (largest_key, bytes_read) =
+                        coding::get_length_prefixed_slice(&data[cursor..])?;
+                    cursor += bytes_read;
+                    let (smallest_seqno, bytes_read) =
+                        coding::decode_varint64_with_length(&data[cursor..])?;
+                    cursor += bytes_read;
+                    let (largest_seqno, bytes_read) =
+                        coding::decode_varint64_with_length(&data[cursor..])?;
+                    cursor += bytes_read;
+                    edit.new_files.push((
+                        level as usize,
+                        NewFile::new(
+                            file_id,
+                            file_size,
+                            smallest_key.to_vec(),
+                            largest_key.to_vec(),
+                            smallest_seqno,
+                            largest_seqno,
                         ),
                     ));
                 }

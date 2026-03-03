@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -7,7 +7,7 @@ use crate::goatkv::metadata::current;
 use crate::goatkv::metadata::file_metadata::FileMetadata;
 use crate::goatkv::metadata::manifest::{ManifestReader, ManifestWriter, INIT_MANIFEST_FILE_NAME};
 use crate::goatkv::metadata::version::Version;
-use crate::goatkv::metadata::version_edit::VersionEdit;
+use crate::goatkv::metadata::version_edit::{NewFile, VersionEdit};
 use crate::goatkv::utils::cleanup_task::CleanupTask;
 use crate::goatkv::utils::options::KvEngineOptions;
 use crate::goatkv::utils::paths::{ManifestPaths, SstablePaths};
@@ -58,6 +58,8 @@ pub struct VersionSet {
     manifest_writer: Option<ManifestWriter>,
     /// 当前 MANIFEST 文件编号。
     manifest_file_number: u64,
+    /// 当前 MANIFEST 自上次重写以来累计的 edit 数量。
+    manifest_edit_count: usize,
 
     /// 最近一次记录的 WAL 日志编号。
     ///
@@ -155,6 +157,7 @@ impl VersionSet {
             versions: VecDeque::new(),
             manifest_writer: None,
             manifest_file_number: 0,
+            manifest_edit_count: 0,
             log_number: 0,
             next_file_number: 1,
             last_sequence: 0,
@@ -197,6 +200,7 @@ impl VersionSet {
         // - 通过 replay 可保证元数据与历史行为一致。
         let mut reader = ManifestReader::new(&manifest_path)?;
         let edits = reader.read_all_edits()?;
+        let recovered_edit_count = edits.len();
 
         // 按顺序应用 edit，重建 current 版本（恢复快路径）
         // 设计理由：
@@ -224,6 +228,7 @@ impl VersionSet {
             manifest_file_number,
         )?);
         self.manifest_file_number = manifest_file_number;
+        self.manifest_edit_count = recovered_edit_count;
 
         Ok(())
     }
@@ -457,6 +462,7 @@ impl VersionSet {
             })?;
             manifest.append_edit(&edit)?;
             manifest.sync()?; // ⚠️ 必须 fsync
+            self.manifest_edit_count = self.manifest_edit_count.saturating_add(1);
         }
 
         // 3. 更新全局状态（日志号、文件号、序列号）
@@ -488,6 +494,9 @@ impl VersionSet {
         // - 历史版本数量受限，避免内存膨胀。
         let old_version = std::mem::replace(&mut self.current, new_version);
         self.append_old_version(old_version);
+        if write_manifest {
+            self.maybe_rewrite_manifest()?;
+        }
 
         Ok(())
     }
@@ -671,8 +680,76 @@ impl VersionSet {
         // - 读路径通常只需要短期持有旧版本。
         self.versions.push_back(version);
         if self.versions.len() > self.options.max_versions {
-            self.versions.pop_front();
+            if let Some(dropped) = self.versions.pop_front() {
+                self.enqueue_obsolete_files_from_dropped_version(&dropped);
+            }
         }
+    }
+
+    fn collect_live_file_ids(&self) -> HashSet<u64> {
+        let mut live = self.current.all_file_ids();
+        for version in &self.versions {
+            live.extend(version.all_file_ids());
+        }
+        live
+    }
+
+    fn enqueue_obsolete_files_from_dropped_version(&self, dropped: &Arc<Version>) {
+        let live = self.collect_live_file_ids();
+        for file_id in dropped.all_file_ids() {
+            if !live.contains(&file_id) {
+                let _ = self.obsolete_sender.send(CleanupTask::Sstable(file_id));
+            }
+        }
+    }
+
+    fn should_rewrite_manifest(&self) -> bool {
+        let hit_edit_count = self.options.manifest_rewrite_edit_count > 0
+            && self.manifest_edit_count >= self.options.manifest_rewrite_edit_count;
+        let hit_size = self.options.manifest_max_size > 0
+            && self
+                .manifest_writer
+                .as_ref()
+                .map(|m| m.size() >= self.options.manifest_max_size)
+                .unwrap_or(false);
+        hit_edit_count || hit_size
+    }
+
+    fn build_snapshot_edit(&self) -> VersionEdit {
+        let mut edit = VersionEdit::new();
+        edit.set_log_number(self.log_number);
+        edit.set_next_file_number(self.next_file_number);
+        edit.set_last_sequence(self.last_sequence);
+        for (level, file) in self.current.all_files() {
+            edit.add_file(
+                level,
+                NewFile::new_with_props(file.file_id, file.props.clone()),
+            );
+        }
+        edit
+    }
+
+    fn maybe_rewrite_manifest(&mut self) -> GoatResult<()> {
+        if !self.should_rewrite_manifest() {
+            return Ok(());
+        }
+
+        let new_manifest_number = self.manifest_file_number.saturating_add(1);
+        let new_manifest_name = format!("MANIFEST-{}", new_manifest_number);
+        let new_manifest_path = self.manifest_paths.data_dir().join(&new_manifest_name);
+
+        let _ = ManifestWriter::create(&new_manifest_path)?;
+        let mut new_writer =
+            ManifestWriter::open_for_append(&new_manifest_path, new_manifest_number)?;
+        let snapshot = self.build_snapshot_edit();
+        new_writer.append_edit(&snapshot)?;
+        new_writer.sync()?;
+        current::write_current(&self.manifest_paths, &new_manifest_name)?;
+
+        self.manifest_writer = Some(new_writer);
+        self.manifest_file_number = new_manifest_number;
+        self.manifest_edit_count = 1;
+        Ok(())
     }
 
     fn apply_edit_in_place(

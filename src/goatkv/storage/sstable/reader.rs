@@ -334,6 +334,44 @@ impl SSTableReader {
         Ok(None)
     }
 
+    /// Full scan of all entries in this SSTable.
+    pub fn scan_all(&mut self) -> GoatResult<Vec<(InternalKey, Vec<u8>)>> {
+        let mut entries = Vec::new();
+        for entry in &self.index_entries {
+            self.file
+                .seek(SeekFrom::Start(entry.block_offset))
+                .map_err(|e| GoatError::io("sstable_seek_scan_block", e))?;
+            let mut block_data = vec![0u8; entry.block_size as usize];
+            self.file
+                .read_exact(&mut block_data)
+                .map_err(|e| GoatError::io("sstable_read_scan_block", e))?;
+            let block_reader = BlockReader::new(&block_data).map_err(|e| {
+                Self::corruption(format!("Failed to parse data block during scan: {}", e))
+            })?;
+            for (k, v) in block_reader.iter() {
+                if k.len() < 8 {
+                    return Err(Self::corruption(
+                        "invalid internal key length in data block",
+                    ));
+                }
+                let n = k.len();
+                let inverted = u64::from_be_bytes([
+                    k[n - 8],
+                    k[n - 7],
+                    k[n - 6],
+                    k[n - 5],
+                    k[n - 4],
+                    k[n - 3],
+                    k[n - 2],
+                    k[n - 1],
+                ]);
+                let encoded = !inverted;
+                entries.push((InternalKey::from_encoded(k[..n - 8].to_vec(), encoded), v));
+            }
+        }
+        Ok(entries)
+    }
+
     /// 查找包含指定 key 的数据块
     fn find_block_for_key(&self, key: &[u8]) -> Option<(u64, u64)> {
         if self.index_entries.is_empty() {

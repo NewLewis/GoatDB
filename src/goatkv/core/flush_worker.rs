@@ -1,12 +1,16 @@
+use std::collections::BTreeMap;
 use std::sync::{mpsc, Arc, RwLock};
 use std::thread;
 
 use crate::goatkv::core::lsm_state::LSMState;
 use crate::goatkv::core::mem_table::ImmutableMemTable;
+use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
+use crate::goatkv::format::internal_key::InternalKey;
+use crate::goatkv::metadata::file_metadata::{FileMetadata, TableProperties};
 use crate::goatkv::metadata::version::Version;
 use crate::goatkv::metadata::version_edit::{NewFile, VersionEdit};
 use crate::goatkv::metadata::version_set::VersionSet;
-use crate::goatkv::storage::sstable::SSTableBuilder;
+use crate::goatkv::storage::sstable::{SSTableBuilder, SSTableReader};
 use crate::goatkv::utils::paths::SstablePaths;
 use tracing::{error, warn};
 
@@ -185,6 +189,7 @@ impl FlushWorker {
             // 从 immutable_mem_tables 中精确移除当前任务对应的 memtable。
             // 不能无条件 pop_front：若前序任务失败并未出队，会导致错删队头。
             Self::update_version_and_remove_task_memtable(&lsm_state, current_version, &imm_table);
+            Self::maybe_compact_l0_to_l1(&lsm_state, &version_set, &sstable_paths);
         }
     }
 
@@ -204,6 +209,167 @@ impl FlushWorker {
         } else {
             warn!("Flush task memtable was not found in immutable queue; skip remove");
         }
+    }
+
+    fn maybe_compact_l0_to_l1(
+        lsm_state: &Arc<RwLock<LSMState>>,
+        version_set: &Arc<RwLock<VersionSet>>,
+        sstable_paths: &Arc<SstablePaths>,
+    ) {
+        let (l0_files, l1_files) = {
+            let vs = version_set.read().unwrap();
+            let current = vs.current();
+            let l0_files = current.get_files(0).to_vec();
+            if l0_files.len() <= 4 {
+                return;
+            }
+            let Some((smallest, largest)) = Self::user_key_range(&l0_files) else {
+                warn!("Skip L0->L1 compaction due to invalid L0 file key range");
+                return;
+            };
+            let l1_files = current
+                .get_files(1)
+                .iter()
+                .filter(|f| {
+                    f.smallest_user_key() <= largest.as_slice()
+                        && f.largest_user_key() >= smallest.as_slice()
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (l0_files, l1_files)
+        };
+
+        let merged = match Self::merge_compaction_inputs(sstable_paths, &l0_files, &l1_files) {
+            Ok(merged) => merged,
+            Err(e) => {
+                error!("L0->L1 compaction read failed: {}", e);
+                return;
+            }
+        };
+
+        let (file_id, next_file_number, base_last_sequence) = {
+            let mut vs = version_set.write().unwrap();
+            let file_id = vs.allocate_file_number();
+            let next_file_number = vs.next_file_number();
+            let last_sequence = vs.last_sequence();
+            (file_id, next_file_number, last_sequence)
+        };
+
+        let (new_props, max_seq) = if merged.is_empty() {
+            (None, 0)
+        } else {
+            match Self::build_compacted_sstable(file_id, sstable_paths, &merged) {
+                Ok(result) => (Some(result.0), result.1),
+                Err(e) => {
+                    error!("L0->L1 compaction build failed: {}", e);
+                    return;
+                }
+            }
+        };
+
+        let mut version_edit = VersionEdit::new();
+        for file in &l0_files {
+            version_edit.delete_file(0, file.file_id);
+        }
+        for file in &l1_files {
+            version_edit.delete_file(1, file.file_id);
+        }
+        if let Some(props) = new_props {
+            version_edit.add_file(1, NewFile::new_with_props(file_id, props));
+        }
+        version_edit.set_next_file_number(next_file_number);
+        version_edit.set_last_sequence(std::cmp::max(base_last_sequence, max_seq));
+
+        let current_version = {
+            let mut vs = version_set.write().unwrap();
+            match vs.apply_edit(version_edit) {
+                Ok(()) => vs.current(),
+                Err(e) => {
+                    error!("L0->L1 compaction apply edit failed: {}", e);
+                    return;
+                }
+            }
+        };
+
+        let mut state = lsm_state.write().unwrap();
+        state.version = current_version;
+    }
+
+    fn user_key_range(files: &[Arc<FileMetadata>]) -> Option<(Vec<u8>, Vec<u8>)> {
+        let mut smallest: Option<Vec<u8>> = None;
+        let mut largest: Option<Vec<u8>> = None;
+        for file in files {
+            let s = file.smallest_key();
+            let l = file.largest_key();
+            if s.len() < 8 || l.len() < 8 {
+                return None;
+            }
+            let s_user = s[..s.len() - 8].to_vec();
+            let l_user = l[..l.len() - 8].to_vec();
+            smallest = Some(match smallest {
+                Some(cur) => cur.min(s_user),
+                None => s_user,
+            });
+            largest = Some(match largest {
+                Some(cur) => cur.max(l_user),
+                None => l_user,
+            });
+        }
+        Some((smallest?, largest?))
+    }
+
+    fn merge_compaction_inputs(
+        sstable_paths: &SstablePaths,
+        l0_files: &[Arc<FileMetadata>],
+        l1_files: &[Arc<FileMetadata>],
+    ) -> GoatResult<Vec<(InternalKey, Vec<u8>)>> {
+        let mut latest = BTreeMap::<Vec<u8>, (InternalKey, Vec<u8>)>::new();
+        for file in l0_files.iter().chain(l1_files.iter()) {
+            let path = sstable_paths.sstable_path_by_id(file.file_id);
+            let mut reader = SSTableReader::open(&path).map_err(|e| {
+                GoatError::internal_with_source(
+                    "l0_l1_compaction_open_sstable",
+                    format!("failed to open sstable {:?}", path),
+                    e,
+                )
+            })?;
+            let entries = reader.scan_all().map_err(|e| {
+                GoatError::internal_with_source(
+                    "l0_l1_compaction_scan_sstable",
+                    format!("failed to scan sstable {:?}", path),
+                    e,
+                )
+            })?;
+            for (internal_key, value) in entries {
+                let user_key = internal_key.user_key().to_vec();
+                let should_replace = latest
+                    .get(&user_key)
+                    .map(|(existing, _)| {
+                        internal_key.sequence_number() > existing.sequence_number()
+                    })
+                    .unwrap_or(true);
+                if should_replace {
+                    latest.insert(user_key, (internal_key, value));
+                }
+            }
+        }
+        Ok(latest.into_values().collect())
+    }
+
+    fn build_compacted_sstable(
+        file_id: u64,
+        sstable_paths: &SstablePaths,
+        entries: &[(InternalKey, Vec<u8>)],
+    ) -> GoatResult<(TableProperties, u64)> {
+        let mut builder = SSTableBuilder::new(file_id, sstable_paths)?;
+        let mut max_seq = 0u64;
+        for (internal_key, value) in entries {
+            max_seq = max_seq.max(internal_key.sequence_number());
+            let key = internal_key.serialize();
+            builder.write(&key, value)?;
+        }
+        let props = builder.finish()?;
+        Ok((props, max_seq))
     }
 }
 
