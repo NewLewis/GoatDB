@@ -255,3 +255,24 @@ where
         Self::new()
     }
 }
+
+impl<K> Drop for SkipList<K>
+where
+    K: UserKey,
+{
+    fn drop(&mut self) {
+        // Safety:
+        // - All nodes are allocated from `arena` and stay valid until `arena` drops.
+        // - We walk level-0 forward pointers exactly once and drop each data node.
+        // - The head node stores uninitialized key/value fields by design, so it must
+        //   never be dropped as `Node<K>`.
+        let mut current = unsafe { self.head.as_ref().next(0) };
+        while let Some(node_ptr) = current {
+            unsafe {
+                let raw = node_ptr.as_ptr();
+                current = (*raw).next(0);
+                std::ptr::drop_in_place(raw);
+            }
+        }
+    }
+}

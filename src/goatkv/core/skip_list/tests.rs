@@ -1,6 +1,8 @@
 use bytes::Bytes;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
-use super::SkipList;
+use super::{SkipList, UserKey};
 use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
 
 fn make_key(key: &[u8], seq: u64) -> InternalKey {
@@ -113,4 +115,72 @@ fn test_large_scale() {
     }
 
     tracing::info!("Memory usage: {} bytes", sl.memory_usage());
+}
+
+struct DropKey {
+    data: Vec<u8>,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl Clone for DropKey {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            dropped: Arc::clone(&self.dropped),
+        }
+    }
+}
+
+impl PartialEq for DropKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data
+    }
+}
+
+impl Eq for DropKey {}
+
+impl PartialOrd for DropKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DropKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.data.cmp(&other.data)
+    }
+}
+
+impl Drop for DropKey {
+    fn drop(&mut self) {
+        self.dropped.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl UserKey for DropKey {
+    fn user_key(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+#[test]
+fn test_drop_reclaims_node_keys() {
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let total = 1024usize;
+    {
+        let mut sl: SkipList<DropKey> = SkipList::new();
+        for i in 0..total {
+            sl.insert(
+                DropKey {
+                    data: format!("key_{:04}", i).into_bytes(),
+                    dropped: Arc::clone(&dropped),
+                },
+                Bytes::from_static(b"v"),
+            );
+        }
+        assert_eq!(sl.len(), total);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    }
+
+    assert_eq!(dropped.load(Ordering::SeqCst), total);
 }

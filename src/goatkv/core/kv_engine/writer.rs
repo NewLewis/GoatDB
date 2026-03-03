@@ -9,7 +9,7 @@ use bytes::Bytes;
 use crate::goatkv::core::lsm_state::LSMState;
 use crate::goatkv::core::sequence_number::SequenceNumber;
 use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
-use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
+use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind, SEQUENCE_NUMBER_MAX};
 use crate::goatkv::storage::wal::WalWriter;
 use crate::goatkv::utils::options::KvEngineOptions;
 
@@ -194,6 +194,16 @@ pub struct KvWriter {
     flush_requested: AtomicBool,
 }
 
+pub struct FlushBarrierGuard<'a> {
+    writer: &'a KvWriter,
+}
+
+impl Drop for FlushBarrierGuard<'_> {
+    fn drop(&mut self) {
+        self.writer.end_flush_barrier();
+    }
+}
+
 impl KvWriter {
     pub fn new(
         wal_writer: Arc<WalWriter>,
@@ -271,28 +281,14 @@ impl KvWriter {
         result
     }
 
-    /// 关闭写入入口并快速失败仍在队列中的请求。
+    /// 关闭写入入口（拒绝新写），并允许已接收请求继续完成。
     pub(crate) fn close(&self) {
-        // close 是“准入关闭”，不是完整事务栅栏：
-        // 会拒绝新请求，并失败掉仍在排队的请求。
-        let pending = {
-            let mut state = self.state.lock().unwrap();
-            if state.is_closed() {
-                return;
-            }
-            state.closed_reason = Some(CloseReason::Manual);
-            state.flush_blocked = false;
-            let pending = Self::drain_all_queued(&mut state);
-            self.state_cv.notify_all();
-            pending
-        };
-
-        for req in pending {
-            req.complete(Err(GoatError::unavailable(
-                "write_coordinator",
-                "write coordinator closed",
-            )));
+        let mut state = self.state.lock().unwrap();
+        if state.is_closed() {
+            return;
         }
+        state.closed_reason = Some(CloseReason::Manual);
+        self.state_cv.notify_all();
     }
 
     /// 进入 flush 屏障：阻塞新写入，并等待队列与 inflight group 全部排空。
@@ -309,6 +305,11 @@ impl KvWriter {
         while state.has_pending_work() {
             state = self.state_cv.wait(state).unwrap();
         }
+    }
+
+    pub(crate) fn enter_flush_barrier(&self) -> FlushBarrierGuard<'_> {
+        self.begin_flush_barrier();
+        FlushBarrierGuard { writer: self }
     }
 
     /// 退出 flush 屏障，恢复写入准入。
@@ -560,7 +561,12 @@ impl KvWriter {
         // 阶段 B：为整个 group 分配连续序列号，并将
         // WriteOp 转为 WAL/Mem 阶段共用的 (InternalKey, value)。
         let mut wal_records = Vec::with_capacity(total_ops as usize);
-        let mut seq = self.sequence_number.allocate_range(total_ops);
+        let mut seq = self
+            .sequence_number
+            .try_allocate_range(total_ops, SEQUENCE_NUMBER_MAX)
+            .ok_or_else(|| {
+                GoatError::unavailable("sequence_number", "sequence number exhausted")
+            })?;
         for (req, ops) in group.iter().zip(ops_groups.into_iter()) {
             let mut req_records = Vec::with_capacity(ops.len());
             let mut req_max_seq = None;
@@ -578,7 +584,9 @@ impl KvWriter {
                 req_max_seq = Some(seq);
                 wal_records.push(record.clone());
                 req_records.push(record);
-                seq = seq.saturating_add(1);
+                seq = seq.checked_add(1).ok_or_else(|| {
+                    GoatError::unavailable("sequence_number", "sequence overflow")
+                })?;
             }
 
             // 保存每个请求的 Mem 阶段载荷。
@@ -601,7 +609,9 @@ impl KvWriter {
             loop {
                 // 在交接到 Mem 阶段时，writer 可能已关闭/故障。
                 if let Some(reason) = state.closed_reason.clone() {
-                    return Err(Self::close_reason_to_error(reason));
+                    if matches!(reason, CloseReason::Failed(_)) {
+                        return Err(Self::close_reason_to_error(reason));
+                    }
                 }
                 if !self.mem_queue_backpressured(&state, req.approx_bytes) {
                     break;
@@ -698,7 +708,7 @@ impl KvWriter {
         // - 失败掉所有排队请求。
         let pending = {
             let mut state = self.state.lock().unwrap();
-            if state.is_closed() {
+            if matches!(state.closed_reason, Some(CloseReason::Failed(_))) {
                 return;
             }
             state.closed_reason = Some(CloseReason::Failed(message.clone()));
@@ -750,5 +760,65 @@ impl KvWriter {
             }
             CloseReason::Failed(message) => GoatError::internal("write_coordinator", message),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KvWriter, WriteOp};
+    use crate::goatkv::core::lsm_state::LSMState;
+    use crate::goatkv::core::mem_table::MemTable;
+    use crate::goatkv::core::sequence_number::SequenceNumber;
+    use crate::goatkv::error::ErrorKind;
+    use crate::goatkv::format::internal_key::SEQUENCE_NUMBER_MAX;
+    use crate::goatkv::metadata::version::Version;
+    use crate::goatkv::storage::wal::{WalWriter, WalWriterConfig};
+    use crate::goatkv::utils::options::KvEngineOptions;
+    use crate::goatkv::utils::paths::SstablePaths;
+    use std::sync::{Arc, RwLock};
+    use tempfile::NamedTempFile;
+
+    fn build_writer_with_start(start: u64) -> KvWriter {
+        let wal_file = NamedTempFile::new().expect("create temp wal");
+        let wal_writer = WalWriter::new(
+            wal_file.path().to_path_buf(),
+            WalWriterConfig { wal_sync: false },
+        )
+        .expect("open wal writer");
+        let mem = Arc::new(MemTable::new(1024 * 1024));
+        let sstable_paths = Arc::new(SstablePaths::new(
+            std::env::temp_dir().join("goatdb_writer_test_data"),
+            std::env::temp_dir().join("goatdb_writer_test_tmp"),
+        ));
+        let version = Arc::new(Version::new(7, sstable_paths));
+        let lsm_state = Arc::new(RwLock::new(LSMState::new(mem, version)));
+        let write_gate = Arc::new(RwLock::new(()));
+        let options = Arc::new(KvEngineOptions::for_test());
+        KvWriter::new(
+            Arc::new(wal_writer),
+            Arc::new(SequenceNumber::with_start(start)),
+            lsm_state,
+            write_gate,
+            options,
+        )
+    }
+
+    #[test]
+    fn sequence_overflow_returns_error_instead_of_panic() {
+        let writer = build_writer_with_start(SEQUENCE_NUMBER_MAX);
+        let result = writer.submit_write(
+            vec![
+                WriteOp::Put(b"k1".to_vec(), b"v1".to_vec()),
+                WriteOp::Put(b"k2".to_vec(), b"v2".to_vec()),
+            ],
+            || {},
+        );
+
+        assert!(result.is_err());
+        let err = result.expect_err("overflow write should fail");
+        assert!(matches!(
+            err.kind(),
+            ErrorKind::Internal | ErrorKind::Unavailable
+        ));
     }
 }
