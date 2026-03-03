@@ -73,6 +73,9 @@ cargo bench --bench goatkv_bench --features rocksdb -- --directory ./bench_data 
 - E2E tests require binding a loopback TCP port (`127.0.0.1:0`) to launch the test gRPC server.
 - In sandboxed/restricted environments where loopback bind is denied (`PermissionDenied`), E2E tests now return early and are treated as skipped.
 - This skip behavior is implemented in `tests/common/test_server.rs` via `should_skip_network_e2e()` and is checked at the beginning of each E2E test.
+- When E2E is skipped, use non-network coverage as fallback:
+  - `cargo test --lib`
+  - `cargo test --test integration_recovery`
 
 ## Architecture
 

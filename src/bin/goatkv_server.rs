@@ -113,28 +113,14 @@ impl GoatKvService for GoatKVServiceImpl {
             return Err(Status::invalid_argument("Key cannot be empty"));
         }
 
-        // 检查 key 是否存在
-        if self
-            .engine
-            .get(&req.key)
-            .map_err(Self::map_engine_err)?
-            .is_none()
-        {
-            let reply = UpdateResponse {
-                success: false,
-                message: "Key not found, cannot update".to_string(),
-            };
-            return Ok(Response::new(reply));
-        }
-
-        // 更新 key 的值
+        // update 采用 upsert 语义：并发下不依赖先读后写。
         self.engine
             .put(req.key, req.value)
             .map_err(Self::map_engine_err)?;
 
         let reply = UpdateResponse {
             success: true,
-            message: "Updated successfully".to_string(),
+            message: "Updated successfully (upsert)".to_string(),
         };
 
         Ok(Response::new(reply))

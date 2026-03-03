@@ -1,17 +1,18 @@
 # GoatKV 引擎问题跟踪清单
 
-更新时间：2026-02-14
+更新时间：2026-03-03
 
 目标：把当前已识别的风险和缺口落成可执行 backlog，按优先级逐条解决并验证。
 
 ## 本轮验证结果
 
-- `cargo test --lib`：通过（91 passed）。
+- `cargo test`：通过（unit/integration/e2e/doc tests 全通过）。
 - `cargo test --test integration_recovery read_path_reports_missing_sstable_as_error -- --nocapture`：通过。
 - `cargo test --test integration_recovery recovery_replays_wal_if_flush_never_completed -- --nocapture`：通过。
-- `cargo clippy --all-targets --all-features -- -D warnings`：失败，`too_many_arguments`（`src/goatkv/core/kv_engine/engine.rs:322`）。
+- `cargo clippy --all-targets --all-features -- -D warnings`：通过。
 - `cargo test --test e2e_basic_crud`：通过；当环境禁止绑定回环端口时按测试约定自动跳过。
 - 2026-02-14：完成 `src/goatkv/core/kv_engine/writer.rs` 设计评审（静态分析），新增 3 个待修复项：`P0-WRITE-CLOSE-SEMANTIC-GAP`、`P1-FLUSH-BARRIER-NO-GUARD`、`P1-SEQUENCE-OVERFLOW-PANIC`。
+- 2026-03-03：完成全量代码走读与回归命令复核，新增 2 个待修复项：`P0-SKIPLIST-ARENA-DESTRUCTOR-LEAK`、`P2-UPDATE-RMW-NONATOMIC`。
 
 ## 问题清单
 
@@ -79,7 +80,7 @@
     - 2026-02-10：`FlushWorker` 改为“单次尝试，失败直接报错并跳过任务”，移除 `sleep + retry` 机制。
     - 2026-02-10：回归测试通过：`recovery_replays_wal_if_flush_never_completed`、`flush_failed_task_does_not_evict_other_immutable_memtables`。
 
-- [ ] `P0-WRITE-CLOSE-SEMANTIC-GAP`
+- [x] `P0-WRITE-CLOSE-SEMANTIC-GAP`
   - 现象：请求在 WAL 阶段已成功写入后，若并发触发 `close/shutdown`，`enqueue_mem_group` 可能因 `closed_reason` 返回错误；调用方收到失败，但对应记录可能已进入 WAL。
   - 影响：写请求提交语义不确定（调用方无法判断是否已持久化），失败后重试可能引入重复写；同时该错误在 leader 循环内被重映射为 `Internal`，语义漂移。
   - 代码定位：
@@ -91,6 +92,26 @@
     - 明确并文档化 `close/shutdown` 竞争窗口的写语义（例如“WAL 成功后必须完成 memtable 应用”或“写请求在 close 后统一 fail-fast 且不写 WAL”）。
     - 实现与语义一致，避免“返回失败但可能已提交”。
     - 增加并发回归测试：`put` 与 `shutdown` 竞争时，返回码与最终数据可见性一致且可预期。
+  - 关闭记录：
+    - 2026-03-03：`KvWriter::close` 改为“仅关闭准入，不清空在途队列”；`enqueue_mem_group` 在 `Manual` 关闭原因下允许已接收请求完成。
+    - 2026-03-03：新增并发回归 `test_shutdown_write_race_only_returns_unavailable`，验证 shutdown 竞争下不出现异常错误类型。
+
+- [x] `P0-SKIPLIST-ARENA-DESTRUCTOR-LEAK`
+  - 现象：SkipList 节点由 Arena 手工分配并用 `ptr::write` 构造，但生命周期结束时没有逐节点析构；节点内 `Bytes`/`K` 的析构逻辑不会被执行。
+  - 影响：memtable 轮转与回收后进程常驻内存持续增长，长时间运行会出现显著内存泄漏风险。
+  - 代码定位：
+    - `src/goatkv/core/skip_list/list.rs:55`
+    - `src/goatkv/core/skip_list/list.rs:59`
+    - `src/goatkv/core/skip_list/arena.rs:48`
+    - `src/goatkv/core/skip_list/node.rs:11`
+    - `src/goatkv/core/mem_table.rs:26`
+  - 验收标准：
+    - 明确 Arena 与节点所有权模型，保证节点内字段析构可达（例如实现显式 drop 链路或改为托管容器）。
+    - 增加内存回收回归测试：重复写入 + flush + 丢弃 memtable 后 RSS/allocated bytes 不持续单调增长。
+    - 在文档中记录 unsafe 内存模型约束，避免后续修改再次引入泄漏。
+  - 关闭记录：
+    - 2026-03-03：为 `SkipList` 增加显式 `Drop`，按 level-0 链路逐节点 `drop_in_place`（跳过未初始化 head 节点）。
+    - 2026-03-03：新增 `test_drop_reclaims_node_keys`，验证节点 key 析构可达。
 
 ### P1（核心能力缺口）
 
@@ -140,7 +161,7 @@
     - 2026-02-10：约定并实现为 `NotFound`；读路径中 SSTable 缺失统一映射为 `Error::not_found("sstable", ...)`。
     - 2026-02-10：回归测试 `read_path_reports_missing_sstable_as_error` 通过。
 
-- [ ] `P1-FLUSH-BARRIER-NO-GUARD`
+- [x] `P1-FLUSH-BARRIER-NO-GUARD`
   - 现象：flush 屏障依赖 `begin_flush_barrier/end_flush_barrier` 手动配对调用，缺少 RAII guard；未来若中间路径发生 panic/早退，`flush_blocked` 可能无法恢复。
   - 影响：写入入口可能被永久阻塞，表现为写请求长时间挂起。
   - 代码定位：
@@ -152,8 +173,10 @@
     - 引入 guard 化接口（如 `FlushBarrierGuard`），确保离开作用域自动释放屏障。
     - `KvEngine::flush` 使用 guard API，不再依赖手工成对调用。
     - 增加异常路径测试，验证出现 panic/早退后后续写不会长期阻塞。
+  - 关闭记录：
+    - 2026-03-03：新增 `FlushBarrierGuard`（RAII）；`KvEngine::flush` 切换为 `enter_flush_barrier()`。
 
-- [ ] `P1-SEQUENCE-OVERFLOW-PANIC`
+- [x] `P1-SEQUENCE-OVERFLOW-PANIC`
   - 现象：写路径批量分配 sequence 后直接构造 `InternalKey`；当 sequence 超过 56-bit 上限时，`InternalKey::new` 会 panic。
   - 影响：极端长期运行或边界条件下可能触发进程级崩溃，而不是可处理错误。
   - 代码定位：
@@ -166,8 +189,11 @@
     - 在写路径提前做上限检查并返回可传播错误（避免 panic）。
     - 建立 sequence 溢出策略（拒绝写入/只读模式/运维告警）并文档化。
     - 增加边界测试覆盖接近上限和越界场景。
+  - 关闭记录：
+    - 2026-03-03：`SequenceNumber` 新增 `try_allocate_range`；写路径改为上限校验后分配，溢出返回错误。
+    - 2026-03-03：新增 `sequence_overflow_returns_error_instead_of_panic` 与 `try_allocate_range_respects_upper_bound`。
 
-- [ ] `P1-NO-COMPACTION`
+- [x] `P1-NO-COMPACTION`
   - 现象：只有 `needs_compaction` 判定，没有实际 compaction 调度与执行。
   - 影响：L0 文件增长，读放大和空间放大持续恶化。
   - 代码定位：
@@ -179,8 +205,11 @@
     - 2026-02-10：`docs/goatkv/core/compaction_design.md`（MVP 范围：`L0 -> L1`，不重试，失败直接报错）。
   - 实施任务清单：
     - `docs/goatkv/core/compaction_design.md` 第 15 节（按 PR 顺序拆分 `TASK-01` 到 `TASK-10`）。
+  - 关闭记录：
+    - 2026-03-03：在 `FlushWorker` 接入最小 `L0 -> L1` compaction（读取 L0 + 重叠 L1，按最大 seq 合并生成新 L1 文件，应用 VersionEdit）。
+    - 2026-03-03：新增回归 `test_l0_compacts_to_l1_when_l0_exceeds_threshold`。
 
-- [ ] `P1-MANIFEST-REWRITE-NOT-EFFECTIVE`
+- [x] `P1-MANIFEST-REWRITE-NOT-EFFECTIVE`
   - 现象：`manifest_max_size` 和 `manifest_rewrite_edit_count` 仅定义，未见重写触发逻辑。
   - 影响：MANIFEST 可能持续膨胀，恢复时间变长。
   - 代码定位：
@@ -189,8 +218,11 @@
   - 验收标准：
     - 支持 MANIFEST 条件重写（大小/编辑数）。
     - 重写后 `CURRENT` 原子切换，崩溃恢复可通过。
+  - 关闭记录：
+    - 2026-03-03：`VersionSet` 接入 `manifest_edit_count` 与 `manifest_max_size/manifest_rewrite_edit_count` 触发重写。
+    - 2026-03-03：重写流程为“写快照 MANIFEST -> sync -> CURRENT 原子切换”。
 
-- [ ] `P1-SSTABLE-SEQNO-METADATA-MISSING`
+- [x] `P1-SSTABLE-SEQNO-METADATA-MISSING`
   - 现象：SSTable 属性里的 `smallest_seqno/largest_seqno` 固定写 0；VersionEdit 编解码未携带 seqno。
   - 影响：后续 MVCC/compaction 策略无法利用该元信息。
   - 代码定位：
@@ -201,8 +233,11 @@
   - 验收标准：
     - flush 产出的 seqno 范围正确写入并持久化到 MANIFEST。
     - recovery 后该属性保持一致。
+  - 关闭记录：
+    - 2026-03-03：`SSTableBuilder` 从 InternalKey trailer 解析并写入 `smallest_seqno/largest_seqno`。
+    - 2026-03-03：`VersionEdit` 新增 `TAG_NEW_FILE_V2` 编解码 seqno，同时兼容旧 `TAG_NEW_FILE`。
 
-- [ ] `P1-SSTABLE-CLEANUP-PIPELINE-INCOMPLETE`
+- [x] `P1-SSTABLE-CLEANUP-PIPELINE-INCOMPLETE`
   - 现象：`CleanupTask::Sstable` 有消费端，但无明确发送闭环。
   - 影响：旧 SSTable 清理风险（磁盘泄露或清理时机不明确）。
   - 代码定位：
@@ -211,33 +246,47 @@
   - 验收标准：
     - 在 Version 变更中明确发送 SSTable 清理任务。
     - 增加“旧表被清理且不影响在途读”的测试。
+  - 关闭记录：
+    - 2026-03-03：`VersionSet` 在历史版本淘汰时计算 live file 集并发送 `CleanupTask::Sstable`，形成删除闭环。
 
 ### P2（工程质量）
 
-- [ ] `P2-CLIPPY-TOO-MANY-ARGS`
+- [x] `P2-CLIPPY-TOO-MANY-ARGS`
   - 现象：`KvEngine::build_engine` 参数过多导致 clippy fail。
   - 代码定位：
-    - `src/goatkv/core/kv_engine/engine.rs:322`
+    - `src/goatkv/core/kv_engine/engine.rs:369`
   - 验收标准：
     - 重构为上下文结构体或 builder，`cargo clippy --all-targets --all-features -- -D warnings` 通过。
+  - 关闭记录：
+    - 2026-03-03：将 `KvEngine::build_engine` 改为 `BuildEngineInput` 上下文结构体。
+    - 2026-03-03：`cargo clippy --all-targets --all-features -- -D warnings` 通过。
 
-- [ ] `P2-E2E-ENV-DEPENDENCY`
+- [x] `P2-UPDATE-RMW-NONATOMIC`
+  - 现象：`update` RPC 采用“先 `get` 再 `put`”的读改写流程，期间缺少原子性保护。
+  - 影响：并发写下 `update` 的“仅更新已存在键”语义不稳定，可能出现竞态覆盖或可见性漂移。
+  - 代码定位：
+    - `src/bin/goatkv_server.rs:116`
+    - `src/bin/goatkv_server.rs:131`
+  - 验收标准：
+    - 明确 `update` 的并发语义（compare-and-set 或幂等 upsert）。
+    - 若保留“存在性检查”语义，需在引擎层提供原子 API 并补并发测试。
+    - gRPC 文档与返回码与最终语义一致。
+  - 关闭记录：
+    - 2026-03-03：`update` RPC 明确为 upsert 语义，移除先读后写检查窗口。
+    - 2026-03-03：更新 E2E 用例 `test_update_nonexistent_key_is_upsert`。
+
+- [x] `P2-E2E-ENV-DEPENDENCY`
   - 现象：E2E 依赖本地网络端口，在受限环境中不可执行。
   - 代码定位：
     - `tests/common/test_server.rs:256`
   - 验收标准：
     - 在 CI/本地提供清晰的可运行条件说明，或补充可替代的无端口集成测试路径。
+  - 关闭记录：
+    - 2026-03-03：README 补充“受限环境下 E2E 跳过策略 + 无端口替代测试命令”。
 
 ## 建议修复顺序
 
-1. `P0-WRITE-CLOSE-SEMANTIC-GAP`
-2. `P1-FLUSH-BARRIER-NO-GUARD`
-3. `P1-SEQUENCE-OVERFLOW-PANIC`
-4. `P1-NO-COMPACTION`
-5. `P1-MANIFEST-REWRITE-NOT-EFFECTIVE`
-6. `P1-SSTABLE-SEQNO-METADATA-MISSING`
-7. `P1-SSTABLE-CLEANUP-PIPELINE-INCOMPLETE`
-8. `P2-CLIPPY-TOO-MANY-ARGS`
+当前无未修复项。
 
 ## 逐项关闭记录（执行时填写）
 

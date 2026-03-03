@@ -57,7 +57,7 @@ async fn test_rejects_empty_key_requests() {
 }
 
 #[tokio::test]
-async fn test_update_nonexistent_key_returns_failure() {
+async fn test_update_nonexistent_key_is_upsert() {
     if should_skip_network_e2e() {
         return;
     }
@@ -73,7 +73,7 @@ async fn test_update_nonexistent_key_returns_failure() {
         .await
         .unwrap()
         .into_inner();
-    assert!(!resp.success);
+    assert!(resp.success);
 
     let get_resp = client
         .get(GetRequest {
@@ -82,7 +82,8 @@ async fn test_update_nonexistent_key_returns_failure() {
         .await
         .unwrap()
         .into_inner();
-    assert!(!get_resp.success);
+    assert!(get_resp.success);
+    assert_eq!(get_resp.value, b"value".to_vec());
 }
 
 #[tokio::test]
