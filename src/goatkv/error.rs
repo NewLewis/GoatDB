@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn maps_unavailable_to_status() {
-        let err = Error::unavailable("wal_manager", "closed");
+        let err = Error::unavailable("wal_writer", "closed");
         let status = err.to_status();
         assert_eq!(status.code(), Code::Unavailable);
         assert_eq!(status.message(), "service unavailable");

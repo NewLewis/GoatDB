@@ -20,7 +20,7 @@ use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::metadata::version::Version;
 use crate::goatkv::metadata::version_set::{VersionSet, VersionSetOptions};
 use crate::goatkv::storage::wal::{
-    replay_wal_file, WalHandle, WalManager, WalManagerConfig, WalPaths, WalReplayStats,
+    replay_wal_file, WalHandle, WalPaths, WalReplayStats, WalWriter, WalWriterConfig,
 };
 use crate::goatkv::utils::cleanup_task::CleanupTask;
 use crate::goatkv::utils::options::KvEngineOptions;
@@ -34,7 +34,7 @@ const SHUTDOWN_FLUSH_WAIT_INTERVAL_MS: u64 = 10;
 #[derive(Debug)]
 pub struct KvEngine {
     /// WAL 写入器，负责写前日志
-    wal_manager: Arc<WalManager>,
+    wal_writer: Arc<WalWriter>,
     /// 清理任务发送端
     cleanup_sender: UnboundedSender<CleanupTask>,
     /// 是否允许删除 WAL（关闭时禁用）
@@ -134,11 +134,11 @@ impl KvEngine {
         }
 
         let current_log_number = Self::select_start_log_number(&version_set, wal_max_number);
-        let wal_manager = Self::open_wal_manager(&options, &wal_paths, current_log_number)?;
+        let wal_writer = Self::open_wal_writer(&options, &wal_paths, current_log_number)?;
         let sequence_number = Self::init_sequence_number(&version_set, wal_stats.max_sequence);
 
         let engine = Self::build_engine(
-            wal_manager,
+            wal_writer,
             sequence_number,
             lsm_state,
             version_set,
@@ -202,8 +202,12 @@ impl KvEngine {
     }
 
     pub fn flush(&self) {
-        let _gate = self.write_gate.write().unwrap();
-        self.flush_inner();
+        self.writer.begin_flush_barrier();
+        {
+            let _gate = self.write_gate.write().unwrap();
+            self.flush_inner();
+        }
+        self.writer.end_flush_barrier();
     }
 
     /// 优雅停机：
@@ -212,10 +216,7 @@ impl KvEngine {
     /// 3) 等待 immutable 队列清空（后台 flush 完成）。
     pub fn shutdown(&self) -> GoatResult<()> {
         self.writer.close();
-        {
-            let _gate = self.write_gate.write().unwrap();
-            self.flush_inner();
-        }
+        self.flush();
         if let Err(e) =
             self.wait_for_immutable_memtables(Duration::from_millis(SHUTDOWN_FLUSH_WAIT_TIMEOUT_MS))
         {
@@ -339,23 +340,20 @@ impl KvEngine {
         log_number
     }
 
-    fn open_wal_manager(
+    fn open_wal_writer(
         options: &KvEngineOptions,
         wal_paths: &WalPaths,
         log_number: u64,
-    ) -> GoatResult<WalManager> {
+    ) -> GoatResult<WalWriter> {
         let wal_path = wal_paths.wal_path_by_id(log_number);
-        WalManager::new(
+        WalWriter::new(
             wal_path,
-            WalManagerConfig {
+            WalWriterConfig {
                 wal_sync: options.wal_sync,
-                sync_interval_ms: options.wal_sync_interval_ms,
-                sync_bytes: options.wal_sync_bytes,
-                max_buffer_bytes: options.wal_max_buffer_bytes,
             },
         )
         .map_err(|e| {
-            GoatError::internal_with_source("open_wal_manager", "failed to open wal manager", e)
+            GoatError::internal_with_source("open_wal_writer", "failed to open wal writer", e)
         })
     }
 
@@ -369,7 +367,7 @@ impl KvEngine {
     }
 
     fn build_engine(
-        wal_manager: WalManager,
+        wal_writer: WalWriter,
         sequence_number: Arc<SequenceNumber>,
         lsm_state: Arc<RwLock<LSMState>>,
         version_set: Arc<RwLock<VersionSet>>,
@@ -387,11 +385,11 @@ impl KvEngine {
             version_set.clone(),
             sstable_paths.clone(),
         );
-        let wal_manager = Arc::new(wal_manager);
+        let wal_writer = Arc::new(wal_writer);
         let options = Arc::new(options);
         let write_gate = Arc::new(RwLock::new(()));
         let writer = KvWriter::new(
-            wal_manager.clone(),
+            wal_writer.clone(),
             sequence_number,
             lsm_state.clone(),
             write_gate.clone(),
@@ -399,7 +397,7 @@ impl KvEngine {
         );
         let reader = KvReader::new(lsm_state.clone());
         Self {
-            wal_manager,
+            wal_writer,
             lsm_state: lsm_state.clone(),
             version_set: version_set.clone(),
             cleanup_sender: cleanup_sender.clone(),
@@ -441,7 +439,7 @@ impl KvEngine {
 
     fn rotate_wal(&self, candidate: u64, old_log_number: u64) -> (u64, bool) {
         let new_wal_path = self.wal_paths.wal_path_by_id(candidate);
-        match self.wal_manager.rotate(new_wal_path) {
+        match self.wal_writer.rotate(new_wal_path) {
             Ok(()) => {
                 self.current_log_number.store(candidate, Ordering::SeqCst);
                 (candidate, true)

@@ -3,7 +3,6 @@ mod error;
 mod format;
 // WalPaths moved to utils/paths.rs
 mod handle;
-mod manager;
 mod reader;
 mod recovery;
 mod writer;
@@ -12,15 +11,14 @@ pub use crate::goatkv::utils::paths::WalPaths;
 pub use codec::WalCodec;
 pub use error::{WalError, WalResult};
 pub use handle::WalHandle;
-pub use manager::{WalManager, WalManagerConfig};
 pub use reader::WalReader;
 pub use recovery::{replay_wal_file, WalReplayStats};
-pub use writer::WalWriter;
+pub use writer::{WalWriter, WalWriterConfig};
 
 #[cfg(test)]
 mod tests {
     use super::format::checksum_for;
-    use super::{WalCodec, WalReader, WalWriter};
+    use super::{WalReader, WalWriter, WalWriterConfig};
     use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
     use crate::goatkv::ErrorKind;
     use std::fs;
@@ -29,23 +27,19 @@ mod tests {
     #[test]
     fn test_wal_writer_new() {
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
-        let wal_writer = WalWriter::new(temp_file.path().to_path_buf());
-        assert!(wal_writer.is_ok());
+        let wal = WalWriter::new(temp_file.path().to_path_buf(), WalWriterConfig::default());
+        assert!(wal.is_ok());
     }
 
     #[test]
     fn test_wal_writer_write_and_checksum() {
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
-        let mut wal_writer =
-            WalWriter::new(temp_file.path().to_path_buf()).expect("Failed to create WalWriter");
+        let wal = WalWriter::new(temp_file.path().to_path_buf(), WalWriterConfig::default())
+            .expect("Failed to create WalWriter");
 
         let key = InternalKey::new(b"test_key".to_vec(), 1, InternalKeyKind::Put);
         let value = b"test_value".to_vec();
-
-        let record = WalCodec::encode_record(&key, &value);
-        let result = wal_writer.write_bytes(&record);
-        assert!(result.is_ok());
-        wal_writer.flush().expect("Failed to flush WalWriter");
+        wal.append(&key, &value).expect("Failed to append to WAL");
 
         let metadata = fs::metadata(temp_file.path()).expect("Failed to get metadata");
         assert!(metadata.len() > 0);
@@ -77,22 +71,15 @@ mod tests {
         let path = temp_file.path().to_path_buf();
 
         {
-            let mut wal_writer = WalWriter::new(path.clone()).expect("Failed to create WalWriter");
+            let wal = WalWriter::new(path.clone(), WalWriterConfig::default()).expect("open wal");
 
             let key1 = InternalKey::new(b"key1".to_vec(), 1, InternalKeyKind::Put);
             let value1 = b"value1".to_vec();
-            let record1 = WalCodec::encode_record(&key1, &value1);
-            wal_writer
-                .write_bytes(&record1)
-                .expect("Failed to write key1");
+            wal.append(&key1, &value1).expect("Failed to write key1");
 
             let key2 = InternalKey::new(b"key2".to_vec(), 2, InternalKeyKind::Delete);
-            let value2 = b"".to_vec();
-            let record2 = WalCodec::encode_record(&key2, &value2);
-            wal_writer
-                .write_bytes(&record2)
-                .expect("Failed to write key2");
-            wal_writer.flush().expect("Failed to flush WalWriter");
+            let value2 = b"";
+            wal.append(&key2, value2).expect("Failed to write key2");
         }
 
         let mut reader = WalReader::new(&path).expect("Failed to create reader");
@@ -122,13 +109,11 @@ mod tests {
         let path = temp_file.path().to_path_buf();
 
         {
-            let mut wal_writer = WalWriter::new(path.clone()).expect("Failed to create WalWriter");
+            let wal = WalWriter::new(path.clone(), WalWriterConfig::default()).expect("open wal");
 
             let key = InternalKey::new(b"test".to_vec(), 1, InternalKeyKind::Put);
             let value = b"valid".to_vec();
-            let record = WalCodec::encode_record(&key, &value);
-            wal_writer.write_bytes(&record).expect("Failed to write");
-            wal_writer.flush().expect("Failed to flush WalWriter");
+            wal.append(&key, &value).expect("Failed to write");
         }
 
         {

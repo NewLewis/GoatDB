@@ -45,17 +45,45 @@ pub struct KvEngineOptions {
     /// Default: true (safer but slower)
     pub wal_sync: bool,
 
-    /// WAL sync interval in milliseconds
-    /// Default: 10ms
-    pub wal_sync_interval_ms: u64,
+    /// Maximum operation count per WAL group commit
+    /// Default: 4096
+    pub wal_max_group_ops: usize,
 
-    /// WAL sync threshold in bytes
-    /// Default: 1MB
-    pub wal_sync_bytes: usize,
+    /// Maximum encoded bytes per WAL group commit
+    /// Default: 2MB
+    pub wal_max_group_bytes: usize,
 
-    /// Maximum WAL buffer size in bytes
-    /// Default: 64MB
-    pub wal_max_buffer_bytes: usize,
+    /// Micro-wait for WAL leader to collect a larger group
+    /// Default: 20us
+    pub wal_group_wait_us: u64,
+
+    /// Maximum operation count per MemTable apply group
+    /// Default: 4096
+    pub mem_max_group_ops: usize,
+
+    /// Maximum bytes per MemTable apply group
+    /// Default: 2MB
+    pub mem_max_group_bytes: usize,
+
+    /// Micro-wait for MemTable leader to collect a larger group
+    /// Default: 0us
+    pub mem_group_wait_us: u64,
+
+    /// Maximum number of requests allowed in WAL queue
+    /// Default: 65536
+    pub max_wal_queue_reqs: usize,
+
+    /// Maximum bytes allowed in WAL queue
+    /// Default: 256MB
+    pub max_wal_queue_bytes: usize,
+
+    /// Maximum number of requests allowed in MemTable queue
+    /// Default: 65536
+    pub max_mem_queue_reqs: usize,
+
+    /// Maximum bytes allowed in MemTable queue
+    /// Default: 256MB
+    pub max_mem_queue_bytes: usize,
 
     // ===== VersionSet Options =====
     /// 保留的历史版本数量
@@ -85,9 +113,16 @@ impl Default for KvEngineOptions {
             mem_table_size: 1024 * 1024, // 1MB
             recover_from_wal: true,
             wal_sync: true,
-            wal_sync_interval_ms: 10,
-            wal_sync_bytes: 1024 * 1024,
-            wal_max_buffer_bytes: 64 * 1024 * 1024,
+            wal_max_group_ops: 4096,
+            wal_max_group_bytes: 2 * 1024 * 1024,
+            wal_group_wait_us: 20,
+            mem_max_group_ops: 4096,
+            mem_max_group_bytes: 2 * 1024 * 1024,
+            mem_group_wait_us: 0,
+            max_wal_queue_reqs: 65_536,
+            max_wal_queue_bytes: 256 * 1024 * 1024,
+            max_mem_queue_reqs: 65_536,
+            max_mem_queue_bytes: 256 * 1024 * 1024,
             // VersionSet defaults
             max_versions: 10,
             manifest_max_size: 32 * 1024 * 1024, // 32MB
@@ -127,21 +162,63 @@ impl KvEngineOptions {
         self
     }
 
-    /// Sets the WAL sync interval in milliseconds
-    pub fn with_wal_sync_interval_ms(mut self, interval_ms: u64) -> Self {
-        self.wal_sync_interval_ms = interval_ms;
+    /// Sets maximum operation count per WAL group commit
+    pub fn with_wal_max_group_ops(mut self, ops: usize) -> Self {
+        self.wal_max_group_ops = ops;
         self
     }
 
-    /// Sets the WAL sync threshold in bytes
-    pub fn with_wal_sync_bytes(mut self, bytes: usize) -> Self {
-        self.wal_sync_bytes = bytes;
+    /// Sets maximum encoded bytes per WAL group commit
+    pub fn with_wal_max_group_bytes(mut self, bytes: usize) -> Self {
+        self.wal_max_group_bytes = bytes;
         self
     }
 
-    /// Sets the WAL max buffer size in bytes
-    pub fn with_wal_max_buffer_bytes(mut self, bytes: usize) -> Self {
-        self.wal_max_buffer_bytes = bytes;
+    /// Sets WAL leader micro-wait in microseconds
+    pub fn with_wal_group_wait_us(mut self, wait_us: u64) -> Self {
+        self.wal_group_wait_us = wait_us;
+        self
+    }
+
+    /// Sets maximum operation count per MemTable apply group
+    pub fn with_mem_max_group_ops(mut self, ops: usize) -> Self {
+        self.mem_max_group_ops = ops;
+        self
+    }
+
+    /// Sets maximum bytes per MemTable apply group
+    pub fn with_mem_max_group_bytes(mut self, bytes: usize) -> Self {
+        self.mem_max_group_bytes = bytes;
+        self
+    }
+
+    /// Sets MemTable leader micro-wait in microseconds
+    pub fn with_mem_group_wait_us(mut self, wait_us: u64) -> Self {
+        self.mem_group_wait_us = wait_us;
+        self
+    }
+
+    /// Sets WAL queue request limit
+    pub fn with_max_wal_queue_reqs(mut self, reqs: usize) -> Self {
+        self.max_wal_queue_reqs = reqs;
+        self
+    }
+
+    /// Sets WAL queue byte limit
+    pub fn with_max_wal_queue_bytes(mut self, bytes: usize) -> Self {
+        self.max_wal_queue_bytes = bytes;
+        self
+    }
+
+    /// Sets MemTable queue request limit
+    pub fn with_max_mem_queue_reqs(mut self, reqs: usize) -> Self {
+        self.max_mem_queue_reqs = reqs;
+        self
+    }
+
+    /// Sets MemTable queue byte limit
+    pub fn with_max_mem_queue_bytes(mut self, bytes: usize) -> Self {
+        self.max_mem_queue_bytes = bytes;
         self
     }
 
@@ -194,9 +271,16 @@ impl KvEngineOptions {
             mem_table_size: 1024 * 1024, // 1MB
             recover_from_wal: false,     // Don't recover in tests
             wal_sync: false,             // Don't sync in tests for speed
-            wal_sync_interval_ms: 10,
-            wal_sync_bytes: 1024 * 1024,
-            wal_max_buffer_bytes: 64 * 1024 * 1024,
+            wal_max_group_ops: 4096,
+            wal_max_group_bytes: 2 * 1024 * 1024,
+            wal_group_wait_us: 0,
+            mem_max_group_ops: 4096,
+            mem_max_group_bytes: 2 * 1024 * 1024,
+            mem_group_wait_us: 0,
+            max_wal_queue_reqs: 65_536,
+            max_wal_queue_bytes: 256 * 1024 * 1024,
+            max_mem_queue_reqs: 65_536,
+            max_mem_queue_bytes: 256 * 1024 * 1024,
             // VersionSet defaults (use same defaults as production)
             max_versions: 10,
             manifest_max_size: 32 * 1024 * 1024, // 32MB

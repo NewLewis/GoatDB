@@ -1,6 +1,6 @@
 # GoatKV 引擎问题跟踪清单
 
-更新时间：2026-02-10
+更新时间：2026-02-14
 
 目标：把当前已识别的风险和缺口落成可执行 backlog，按优先级逐条解决并验证。
 
@@ -11,6 +11,7 @@
 - `cargo test --test integration_recovery recovery_replays_wal_if_flush_never_completed -- --nocapture`：通过。
 - `cargo clippy --all-targets --all-features -- -D warnings`：失败，`too_many_arguments`（`src/goatkv/core/kv_engine/engine.rs:322`）。
 - `cargo test --test e2e_basic_crud`：通过；当环境禁止绑定回环端口时按测试约定自动跳过。
+- 2026-02-14：完成 `src/goatkv/core/kv_engine/writer.rs` 设计评审（静态分析），新增 3 个待修复项：`P0-WRITE-CLOSE-SEMANTIC-GAP`、`P1-FLUSH-BARRIER-NO-GUARD`、`P1-SEQUENCE-OVERFLOW-PANIC`。
 
 ## 问题清单
 
@@ -78,6 +79,19 @@
     - 2026-02-10：`FlushWorker` 改为“单次尝试，失败直接报错并跳过任务”，移除 `sleep + retry` 机制。
     - 2026-02-10：回归测试通过：`recovery_replays_wal_if_flush_never_completed`、`flush_failed_task_does_not_evict_other_immutable_memtables`。
 
+- [ ] `P0-WRITE-CLOSE-SEMANTIC-GAP`
+  - 现象：请求在 WAL 阶段已成功写入后，若并发触发 `close/shutdown`，`enqueue_mem_group` 可能因 `closed_reason` 返回错误；调用方收到失败，但对应记录可能已进入 WAL。
+  - 影响：写请求提交语义不确定（调用方无法判断是否已持久化），失败后重试可能引入重复写；同时该错误在 leader 循环内被重映射为 `Internal`，语义漂移。
+  - 代码定位：
+    - `src/goatkv/core/kv_engine/writer.rs:508`
+    - `src/goatkv/core/kv_engine/writer.rs:513`
+    - `src/goatkv/core/kv_engine/writer.rs:519`
+    - `src/goatkv/core/kv_engine/writer.rs:289`
+  - 验收标准：
+    - 明确并文档化 `close/shutdown` 竞争窗口的写语义（例如“WAL 成功后必须完成 memtable 应用”或“写请求在 close 后统一 fail-fast 且不写 WAL”）。
+    - 实现与语义一致，避免“返回失败但可能已提交”。
+    - 增加并发回归测试：`put` 与 `shutdown` 竞争时，返回码与最终数据可见性一致且可预期。
+
 ### P1（核心能力缺口）
 
 - [x] `P1-ERROR-CONTRACT-DRIFT`
@@ -125,6 +139,33 @@
   - 关闭记录：
     - 2026-02-10：约定并实现为 `NotFound`；读路径中 SSTable 缺失统一映射为 `Error::not_found("sstable", ...)`。
     - 2026-02-10：回归测试 `read_path_reports_missing_sstable_as_error` 通过。
+
+- [ ] `P1-FLUSH-BARRIER-NO-GUARD`
+  - 现象：flush 屏障依赖 `begin_flush_barrier/end_flush_barrier` 手动配对调用，缺少 RAII guard；未来若中间路径发生 panic/早退，`flush_blocked` 可能无法恢复。
+  - 影响：写入入口可能被永久阻塞，表现为写请求长时间挂起。
+  - 代码定位：
+    - `src/goatkv/core/kv_engine/writer.rs:249`
+    - `src/goatkv/core/kv_engine/writer.rs:262`
+    - `src/goatkv/core/kv_engine/engine.rs:205`
+    - `src/goatkv/core/kv_engine/engine.rs:210`
+  - 验收标准：
+    - 引入 guard 化接口（如 `FlushBarrierGuard`），确保离开作用域自动释放屏障。
+    - `KvEngine::flush` 使用 guard API，不再依赖手工成对调用。
+    - 增加异常路径测试，验证出现 panic/早退后后续写不会长期阻塞。
+
+- [ ] `P1-SEQUENCE-OVERFLOW-PANIC`
+  - 现象：写路径批量分配 sequence 后直接构造 `InternalKey`；当 sequence 超过 56-bit 上限时，`InternalKey::new` 会 panic。
+  - 影响：极端长期运行或边界条件下可能触发进程级崩溃，而不是可处理错误。
+  - 代码定位：
+    - `src/goatkv/core/kv_engine/writer.rs:482`
+    - `src/goatkv/core/kv_engine/writer.rs:489`
+    - `src/goatkv/core/kv_engine/writer.rs:493`
+    - `src/goatkv/format/internal_key.rs:72`
+    - `src/goatkv/format/internal_key.rs:75`
+  - 验收标准：
+    - 在写路径提前做上限检查并返回可传播错误（避免 panic）。
+    - 建立 sequence 溢出策略（拒绝写入/只读模式/运维告警）并文档化。
+    - 增加边界测试覆盖接近上限和越界场景。
 
 - [ ] `P1-NO-COMPACTION`
   - 现象：只有 `needs_compaction` 判定，没有实际 compaction 调度与执行。
@@ -189,11 +230,14 @@
 
 ## 建议修复顺序
 
-1. `P1-NO-COMPACTION`
-2. `P1-MANIFEST-REWRITE-NOT-EFFECTIVE`
-3. `P1-SSTABLE-SEQNO-METADATA-MISSING`
-4. `P1-SSTABLE-CLEANUP-PIPELINE-INCOMPLETE`
-5. `P2-CLIPPY-TOO-MANY-ARGS`
+1. `P0-WRITE-CLOSE-SEMANTIC-GAP`
+2. `P1-FLUSH-BARRIER-NO-GUARD`
+3. `P1-SEQUENCE-OVERFLOW-PANIC`
+4. `P1-NO-COMPACTION`
+5. `P1-MANIFEST-REWRITE-NOT-EFFECTIVE`
+6. `P1-SSTABLE-SEQNO-METADATA-MISSING`
+7. `P1-SSTABLE-CLEANUP-PIPELINE-INCOMPLETE`
+8. `P2-CLIPPY-TOO-MANY-ARGS`
 
 ## 逐项关闭记录（执行时填写）
 
