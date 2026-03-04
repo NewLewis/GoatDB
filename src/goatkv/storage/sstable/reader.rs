@@ -4,6 +4,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+use crc32fast::Hasher;
+
 use super::block_reader::BlockReader;
 use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::format::coding;
@@ -14,6 +16,7 @@ const MAGIC_NUMBER: u64 = 0x706A725F676F6174;
 /// Footer 的固定大小：根据 SSTableBuilder 的写入，footer 固定为 48 字节
 /// 两个varint(最多20字节) + padding + magic(8字节)
 const FOOTER_SIZE: usize = 48;
+const BLOCK_CHECKSUM_SIZE: usize = 4;
 
 /// SSTable 文件的索引条目
 #[derive(Debug, Clone)]
@@ -66,6 +69,39 @@ impl SSTableReader {
         key.kind()
             .map_err(|e| Self::corruption(format!("invalid internal key kind: {}", e)))?;
         Ok(key)
+    }
+
+    fn checksum_for_block(block: &[u8]) -> u32 {
+        let mut hasher = Hasher::new();
+        hasher.update(block);
+        hasher.finalize()
+    }
+
+    fn verify_block_checksum<'a>(block: &'a [u8], block_kind: &str) -> GoatResult<&'a [u8]> {
+        if block.len() < BLOCK_CHECKSUM_SIZE {
+            return Err(Self::corruption(format!(
+                "{} is too small to contain checksum trailer",
+                block_kind
+            )));
+        }
+
+        let payload_len = block.len() - BLOCK_CHECKSUM_SIZE;
+        let (payload, checksum_bytes) = block.split_at(payload_len);
+        let expected = u32::from_le_bytes([
+            checksum_bytes[0],
+            checksum_bytes[1],
+            checksum_bytes[2],
+            checksum_bytes[3],
+        ]);
+        let actual = Self::checksum_for_block(payload);
+        if actual != expected {
+            return Err(Self::corruption(format!(
+                "{} checksum mismatch: expected {:08x}, got {:08x}",
+                block_kind, expected, actual
+            )));
+        }
+
+        Ok(payload)
     }
 
     /// 打开并解析 SSTable 文件
@@ -199,19 +235,23 @@ impl SSTableReader {
         }
 
         let index_block_size = footer_start - index_block_start;
-        if index_block_size == 0 {
+        if index_block_size <= BLOCK_CHECKSUM_SIZE as u64 {
             // 索引块可能为空（只有一个数据块的情况？）
-            return Err(Self::corruption("Index block size is zero"));
+            return Err(Self::corruption(
+                "Index block size is too small to contain checksum",
+            ));
         }
 
         file.seek(SeekFrom::Start(index_block_start))
             .map_err(|e| GoatError::io("sstable_seek_index", e))?;
-        let mut index_block_data = vec![0u8; index_block_size as usize];
-        file.read_exact(&mut index_block_data)
+        let mut index_block_data_with_checksum = vec![0u8; index_block_size as usize];
+        file.read_exact(&mut index_block_data_with_checksum)
             .map_err(|e| GoatError::io("sstable_read_index", e))?;
+        let index_block_data =
+            Self::verify_block_checksum(&index_block_data_with_checksum, "index block")?;
 
         // 解析索引块
-        let index_reader = match BlockReader::new(&index_block_data) {
+        let index_reader = match BlockReader::new(index_block_data) {
             Ok(reader) => reader,
             Err(e) => {
                 return Err(Self::corruption(format!(
@@ -303,9 +343,10 @@ impl SSTableReader {
         self.file
             .read_exact(&mut block_data)
             .map_err(|e| GoatError::io("sstable_read_data_block", e))?;
+        let block_payload = Self::verify_block_checksum(&block_data, "data block")?;
 
         // 4. 在数据块中查找 key
-        let block_reader = match BlockReader::new(&block_data) {
+        let block_reader = match BlockReader::new(block_payload) {
             Ok(reader) => reader,
             Err(e) => {
                 return Err(Self::corruption(format!(
@@ -351,7 +392,8 @@ impl SSTableReader {
             self.file
                 .read_exact(&mut block_data)
                 .map_err(|e| GoatError::io("sstable_read_scan_block", e))?;
-            let block_reader = BlockReader::new(&block_data).map_err(|e| {
+            let block_payload = Self::verify_block_checksum(&block_data, "data block")?;
+            let block_reader = BlockReader::new(block_payload).map_err(|e| {
                 Self::corruption(format!("Failed to parse data block during scan: {}", e))
             })?;
             for (k, v) in block_reader.iter() {
@@ -448,7 +490,8 @@ impl SSTableScanIterator {
                 .file
                 .read_exact(&mut block_data)
                 .map_err(|e| GoatError::io("sstable_read_scan_block", e))?;
-            let block_reader = BlockReader::new(&block_data).map_err(|e| {
+            let block_payload = SSTableReader::verify_block_checksum(&block_data, "data block")?;
+            let block_reader = BlockReader::new(block_payload).map_err(|e| {
                 SSTableReader::corruption(format!("Failed to parse data block during scan: {}", e))
             })?;
 
@@ -469,6 +512,7 @@ mod tests {
     use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
     use crate::goatkv::storage::sstable::SSTableBuilder;
     use crate::goatkv::ErrorKind;
+    use std::fs;
     use std::io::Write;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -537,10 +581,6 @@ mod tests {
         let sst_path = sstable_paths.sstable_path_by_id(1);
         let mut reader = SSTableReader::open(&sst_path).unwrap();
 
-        // 由于SSTable按key排序，我们先对测试数据排序
-        let mut sorted_data = test_data.clone();
-        sorted_data.sort_by(|a, b| a.0.cmp(&b.0));
-
         // 检查测试数据本身是否有重复
         let mut seen_keys = std::collections::HashSet::new();
         for (key, _) in &test_data {
@@ -554,30 +594,7 @@ mod tests {
         }
         info!("Unique keys in test data: {}", seen_keys.len());
 
-        // 读取所有block并遍历
-        let mut all_entries = Vec::new();
-
-        // 读取每个block的数据
-        let _file_size = std::fs::metadata(&sst_path).unwrap().len();
-        let mut _current_offset = 0;
-
-        for entry in reader.index_entries.iter() {
-            let block_offset = entry.block_offset;
-            let block_size = entry.block_size;
-
-            reader
-                .file
-                .seek(std::io::SeekFrom::Start(block_offset))
-                .unwrap();
-            let mut block_data = vec![0u8; block_size as usize];
-            reader.file.read_exact(&mut block_data).unwrap();
-
-            let block_reader = BlockReader::new(&block_data).unwrap();
-
-            for (key, value) in block_reader.iter() {
-                all_entries.push((key, value));
-            }
-        }
+        let all_entries = reader.scan_all().unwrap();
 
         info!("Total entries read: {}", all_entries.len());
         info!("Total entries expected: {}", test_data.len());
@@ -693,5 +710,33 @@ mod tests {
             .expect_err("invalid kind should be reported as corruption");
         assert_eq!(err.kind(), ErrorKind::Corruption);
         assert!(err.to_string().contains("invalid internal key kind"));
+    }
+
+    #[test]
+    fn test_sstable_reader_reports_data_block_checksum_mismatch() {
+        let (_temp_dir, sst_path) = create_test_sstable();
+        let mut file_content = fs::read(&sst_path).unwrap();
+        file_content[0] ^= 0x01;
+        fs::write(&sst_path, &file_content).unwrap();
+
+        let mut reader = SSTableReader::open(&sst_path).unwrap();
+        let err = reader
+            .get(b"apple")
+            .expect_err("corrupted data block must return corruption");
+        assert_eq!(err.kind(), ErrorKind::Corruption);
+        assert!(err.to_string().contains("data block checksum mismatch"));
+    }
+
+    #[test]
+    fn test_sstable_open_reports_index_block_checksum_mismatch() {
+        let (_temp_dir, sst_path) = create_test_sstable();
+        let mut file_content = fs::read(&sst_path).unwrap();
+        let index_tail_pos = file_content.len() - FOOTER_SIZE - 1;
+        file_content[index_tail_pos] ^= 0x01;
+        fs::write(&sst_path, &file_content).unwrap();
+
+        let err = SSTableReader::open(&sst_path).expect_err("corrupted index block must fail open");
+        assert_eq!(err.kind(), ErrorKind::Corruption);
+        assert!(err.to_string().contains("index block checksum mismatch"));
     }
 }

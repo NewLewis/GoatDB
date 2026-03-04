@@ -14,6 +14,8 @@
 - 2026-02-14：完成 `src/goatkv/core/kv_engine/writer.rs` 设计评审（静态分析），新增 3 个待修复项：`P0-WRITE-CLOSE-SEMANTIC-GAP`、`P1-FLUSH-BARRIER-NO-GUARD`、`P1-SEQUENCE-OVERFLOW-PANIC`。
 - 2026-03-03：完成全量代码走读与回归命令复核，新增 2 个待修复项：`P0-SKIPLIST-ARENA-DESTRUCTOR-LEAK`、`P2-UPDATE-RMW-NONATOMIC`。
 - 2026-03-04：完成新一轮全量静态走读（重点覆盖 compaction/manifest/recovery/读路径错误传播），新增 4 个待修复项：`P0-INTERNALKEY-KIND-PANIC-ON-CORRUPTION`、`P1-COMPACTION-ORPHAN-SSTABLE-LEAK`、`P1-COMPACTION-MEMORY-AMPLIFICATION`、`P1-FLUSH-COMPACTION-COUPLED-BACKPRESSURE`。
+- 2026-03-04：完成生产就绪差距评审（重点覆盖数据完整性/运维可观测/安全基线/接口能力），新增 9 个待修复项：`P0-SSTABLE-BLOCK-CHECKSUM-MISSING`、`P0-FLUSH-FAILURE-IMMUTABLE-BACKLOG-UNBOUNDED`、`P0-TRANSPORT-SECURITY-AUTH-MISSING`、`P1-TABLE-BLOCK-CACHE-MISSING`、`P1-OBSERVABILITY-HEALTH-GAP`、`P1-COMPACTION-POLICY-HARDCODED`、`P1-API-SCAN-SNAPSHOT-CAS-MISSING`、`P1-ONDISK-FORMAT-VERSIONING-GAP`、`P2-UNSAFE-VALIDATION-COVERAGE-GAP`。
+- 2026-03-04：完成 `P0-SSTABLE-BLOCK-CHECKSUM-MISSING` 修复与回归，`cargo test` 全量通过。
 
 ## 问题清单
 
@@ -131,6 +133,49 @@
     - 2026-03-04：`InternalKeyKind` 解码从 `From<u8>`（panic）改为 `TryFrom<u8>`（`Corruption`）。
     - 2026-03-04：`KvReader`/`SSTableReader`/`WAL format` 解码链路接入非法 kind 校验并统一返回 `Corruption`。
     - 2026-03-04：新增回归 `test_sstable_reader_reports_invalid_internal_key_kind`、`test_wal_reader_reports_invalid_internal_key_kind`、`test_wal_replay_reports_invalid_internal_key_kind`。
+
+- [x] `P0-SSTABLE-BLOCK-CHECKSUM-MISSING`
+  - 现象：SSTable 读取主要依赖 footer+magic 校验；数据块/索引块本身没有校验和，磁盘静默损坏可能在读路径晚发现或误判。
+  - 影响：坏块检测能力不足，可能导致数据错误传播或延迟暴露，影响线上可靠性。
+  - 代码定位：
+    - `src/goatkv/storage/sstable/builder.rs:309`
+    - `src/goatkv/storage/sstable/builder.rs:391`
+    - `src/goatkv/storage/sstable/builder.rs:405`
+    - `src/goatkv/storage/sstable/reader.rs:188`
+    - `src/goatkv/storage/wal/format.rs:61`（对比 WAL 已有 checksum）
+  - 验收标准：
+    - 为 SSTable 数据块/索引块增加 checksum trailer 并在读路径强校验。
+    - 坏块统一返回 `Corruption`，禁止返回伪正常结果。
+    - 增加故障注入测试：随机 bit-flip 能稳定触发校验失败。
+  - 关闭记录：
+    - 2026-03-04：`SSTableBuilder` 为数据块与索引块写入 4-byte checksum trailer，并将数据块索引长度升级为“内容+checksum”总长度。
+    - 2026-03-04：`SSTableReader` 在 open/get/scan 流程强制校验块 checksum，校验失败统一返回 `Corruption`。
+    - 2026-03-04：新增回归 `test_sstable_reader_reports_data_block_checksum_mismatch`、`test_sstable_open_reports_index_block_checksum_mismatch`。
+
+- [ ] `P0-FLUSH-FAILURE-IMMUTABLE-BACKLOG-UNBOUNDED`
+  - 现象：flush 失败时 worker 记录错误后 `continue`；系统缺少“连续失败后停写/强背压”机制，immutable 队列可持续累积。
+  - 影响：磁盘异常或权限异常场景下可能导致内存占用持续增长，最终触发 OOM 或整体不可用。
+  - 代码定位：
+    - `src/goatkv/core/flush_worker.rs:239`
+    - `src/goatkv/core/flush_worker.rs:314`
+    - `src/goatkv/core/kv_engine/engine.rs:503`
+    - `src/goatkv/core/lsm_state.rs:13`
+  - 验收标准：
+    - 引入 immutable backlog 上限与连续 flush 失败熔断策略。
+    - 超限后写入快速失败（`Unavailable`/`ResourceExhausted`），避免内存无界增长。
+    - 增加故障注入测试：模拟磁盘写失败时 backlog 与内存占用保持有界。
+
+- [ ] `P0-TRANSPORT-SECURITY-AUTH-MISSING`
+  - 现象：gRPC 服务当前未启用 TLS/mTLS，也没有认证鉴权拦截器。
+  - 影响：生产环境下存在明文传输、未授权访问与横向移动风险。
+  - 代码定位：
+    - `src/bin/goatkv_server.rs:218`
+    - `src/bin/goatkv_server.rs:220`
+    - `proto/goatkv.proto:5`
+  - 验收标准：
+    - 支持 TLS（至少 server-side TLS），并提供可选 mTLS 模式。
+    - 增加统一认证/鉴权拦截层（token/API key/证书主体映射）。
+    - 提供安全配置文档与回归测试（握手失败、未授权拒绝、证书轮换）。
 
 ### P1（核心能力缺口）
 
@@ -317,6 +362,68 @@
     - 2026-03-04：`FlushWorker` 拆分为独立 flush 线程与 compaction 线程；flush 成功后仅发送 compaction 触发信号，不在 flush 线程内执行 compaction。
     - 2026-03-04：新增/更新回归 `test_l0_compacts_to_base_level_when_l0_exceeds_threshold`、`test_compaction_cascades_to_l2_when_l1_exceeds_threshold`，验证持续 flush 下 compaction 可后台推进并保持读正确性。
 
+- [ ] `P1-TABLE-BLOCK-CACHE-MISSING`
+  - 现象：读路径未引入 table cache/block cache，SSTable 读取仍频繁打开文件与重复解码。
+  - 影响：高并发读场景下延迟与 IOPS 放大，FD 压力上升，吞吐受限。
+  - 代码定位：
+    - `src/goatkv/metadata/version.rs:103`
+    - `src/goatkv/metadata/version.rs:112`
+    - `src/goatkv/storage/sstable/reader.rs:70`
+  - 验收标准：
+    - 引入可配置 table cache 与 block cache（容量/淘汰策略可调）。
+    - 暴露缓存命中率与驱逐指标。
+    - 增加基准测试：热点读场景下延迟与吞吐显著改善。
+
+- [ ] `P1-OBSERVABILITY-HEALTH-GAP`
+  - 现象：当前仅有日志输出，缺少标准化 metrics 与健康检查接口。
+  - 影响：故障发现与容量规划依赖人工日志，缺少可观测闭环与自动告警基础。
+  - 代码定位：
+    - `src/bin/goatkv_server.rs:218`
+    - `src/goatkv/utils/logging.rs:12`
+    - `proto/goatkv.proto:5`
+  - 验收标准：
+    - 增加健康检查（liveness/readiness）接口。
+    - 增加核心指标：QPS、延迟分位数、flush/compaction backlog、错误率、队列水位。
+    - 补充运维看板与告警建议阈值。
+
+- [ ] `P1-COMPACTION-POLICY-HARDCODED`
+  - 现象：compaction 触发阈值和层级大小目标仍以内嵌常量形式存在，运行时不可调。
+  - 影响：不同硬件和业务负载下难以调优，可能导致写放大或读放大不受控。
+  - 代码定位：
+    - `src/goatkv/core/flush_worker.rs:18`
+    - `src/goatkv/core/flush_worker.rs:19`
+    - `src/goatkv/core/flush_worker.rs:20`
+    - `src/goatkv/core/flush_worker.rs:21`
+  - 验收标准：
+    - 将 compaction 关键策略参数纳入 `KvEngineOptions` 并支持持久配置。
+    - 提供合理默认值和参数边界校验。
+    - 增加回归与基准：不同配置下 compaction 收敛行为可预测。
+
+- [ ] `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
+  - 现象：对外 API 仅覆盖点查点写；缺少范围扫描、快照读、条件写（CAS）等关键能力。
+  - 影响：上层业务需要自行拼装，易引入一致性窗口和性能问题，接口可用性不足。
+  - 代码定位：
+    - `proto/goatkv.proto:5`
+    - `proto/goatkv.proto:9`
+    - `src/bin/goatkv_server.rs:38`
+  - 验收标准：
+    - 新增 `Scan`/`SnapshotGet`/`CompareAndSet`（或等价）RPC 及错误语义约定。
+    - 保证范围读取在快照下的可重复性。
+    - 增加并发一致性测试与接口文档。
+
+- [ ] `P1-ONDISK-FORMAT-VERSIONING-GAP`
+  - 现象：SSTable/MANIFEST 缺少明确的格式版本演进策略与兼容矩阵定义。
+  - 影响：后续协议变更或升级回滚时存在兼容风险，易造成恢复失败或灰度困难。
+  - 代码定位：
+    - `src/goatkv/storage/sstable/builder.rs:13`
+    - `src/goatkv/storage/sstable/reader.rs:12`
+    - `src/goatkv/metadata/manifest.rs:56`
+    - `src/goatkv/metadata/version_edit.rs:81`
+  - 验收标准：
+    - 定义并实现 on-disk format version 字段与兼容读取策略。
+    - 给出升级/回滚策略文档（forward/backward compatibility）。
+    - 增加跨版本读写兼容测试。
+
 ### P2（工程质量）
 
 - [x] `P2-CLIPPY-TOO-MANY-ARGS`
@@ -352,9 +459,29 @@
   - 关闭记录：
     - 2026-03-03：README 补充“受限环境下 E2E 跳过策略 + 无端口替代测试命令”。
 
+- [ ] `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
+  - 现象：SkipList/Arena 存在较多 `unsafe` 与 `unsafe impl Send/Sync`，但缺少系统化并发模型验证与 fuzz 覆盖。
+  - 影响：极端并发和边界输入下可能出现 UB/竞态/内存破坏，问题定位成本高。
+  - 代码定位：
+    - `src/goatkv/core/skip_list/list.rs:247`
+    - `src/goatkv/core/skip_list/list.rs:248`
+    - `src/goatkv/core/skip_list/arena.rs:74`
+    - `src/goatkv/core/skip_list/node.rs:24`
+  - 验收标准：
+    - 为 skip list 关键路径补充 Miri/Loom/Fuzz 验证流水线（至少覆盖插入/查询/迭代/析构）。
+    - 为 `unsafe` 代码块补充不变量注释与审计清单。
+    - 增加长稳压测用例并纳入 CI 的周期性任务。
+
 ## 建议修复顺序
 
-当前无未修复项。
+1. `P0-FLUSH-FAILURE-IMMUTABLE-BACKLOG-UNBOUNDED`
+2. `P0-TRANSPORT-SECURITY-AUTH-MISSING`
+3. `P1-TABLE-BLOCK-CACHE-MISSING`
+4. `P1-OBSERVABILITY-HEALTH-GAP`
+5. `P1-COMPACTION-POLICY-HARDCODED`
+6. `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
+7. `P1-ONDISK-FORMAT-VERSIONING-GAP`
+8. `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
 
 ## 逐项关闭记录（执行时填写）
 

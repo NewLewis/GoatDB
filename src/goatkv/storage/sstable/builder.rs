@@ -2,6 +2,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use crc32fast::Hasher;
+
 use super::block_builder::BlockBuilder;
 use super::bloom::BloomBuilder;
 use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
@@ -14,6 +16,7 @@ use crate::goatkv::utils::paths::SstablePaths;
 /// 用于标识文件格式，固定值为 0x706A725F676F6174
 /// 对应的ASCII字符串为 "pjr_goat"（反向）
 const MAGIC_NUMBER: u64 = 0x706A725F676F6174;
+const BLOCK_CHECKSUM_SIZE: usize = 4;
 
 /// SSTableBuilder用于构建SSTable文件
 ///
@@ -298,17 +301,16 @@ impl SSTableBuilder {
         // 索引格式：separator -> (block_offset, block_size)
         let mut separator_val = Vec::new();
         coding::put_varint64(&mut separator_val, self.offset);
-        coding::put_varint64(&mut separator_val, block_content.len() as u64);
+        coding::put_varint64(
+            &mut separator_val,
+            (block_content.len() + BLOCK_CHECKSUM_SIZE) as u64,
+        );
         self.index_block_builder
             .add(&separator.serialize(), &separator_val);
 
         // 将数据块写入文件
-        self.writer
-            .as_mut()
-            .ok_or_else(|| GoatError::internal("sstable_builder", "SSTable writer missing"))?
-            .write_all(block_content)
-            .map_err(|e| GoatError::io("sstable_write_data_block", e))?;
-        self.offset += block_content.len() as u64;
+        let block_content = block_content.to_vec();
+        self.write_block_with_checksum(&block_content, "sstable_write_data_block")?;
 
         // 重置数据块构建器，准备开始新的数据块
         self.data_block_builder.reset();
@@ -366,16 +368,15 @@ impl SSTableBuilder {
             // 注意：这里使用last_key作为separator（因为这是最后一个数据块）
             let mut separator_val = Vec::new();
             coding::put_varint64(&mut separator_val, self.offset);
-            coding::put_varint64(&mut separator_val, block_content.len() as u64);
+            coding::put_varint64(
+                &mut separator_val,
+                (block_content.len() + BLOCK_CHECKSUM_SIZE) as u64,
+            );
             self.index_block_builder.add(last_key, &separator_val);
 
             // 写入最后一个数据块
-            self.writer
-                .as_mut()
-                .ok_or_else(|| GoatError::internal("sstable_builder", "SSTable writer missing"))?
-                .write_all(block_content)
-                .map_err(|e| GoatError::io("sstable_write_last_data_block", e))?;
-            self.offset += block_content.len() as u64;
+            let block_content = block_content.to_vec();
+            self.write_block_with_checksum(&block_content, "sstable_write_last_data_block")?;
 
             // 重置数据块构建器
             self.data_block_builder.reset();
@@ -394,13 +395,9 @@ impl SSTableBuilder {
         // 写入IndexBlock
         // IndexBlock包含所有数据块的位置和大小信息
         let (block_content, _) = self.index_block_builder.finish();
-        self.writer
-            .as_mut()
-            .ok_or_else(|| GoatError::internal("sstable_builder", "SSTable writer missing"))?
-            .write_all(block_content)
-            .map_err(|e| GoatError::io("sstable_write_index", e))?;
         let index_offset = self.offset;
-        self.offset += block_content.len() as u64;
+        let block_content = block_content.to_vec();
+        self.write_block_with_checksum(&block_content, "sstable_write_index")?;
 
         // 写入Footer
         // Footer包含BloomFilter和IndexBlock的偏移量，用于读取时定位
@@ -494,6 +491,32 @@ impl SSTableBuilder {
         ]);
         let encoded = !inverted;
         Ok(encoded >> 8)
+    }
+
+    fn checksum_for_block(block_content: &[u8]) -> u32 {
+        let mut hasher = Hasher::new();
+        hasher.update(block_content);
+        hasher.finalize()
+    }
+
+    fn write_block_with_checksum(
+        &mut self,
+        block_content: &[u8],
+        io_stage: &'static str,
+    ) -> GoatResult<()> {
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| GoatError::internal("sstable_builder", "SSTable writer missing"))?;
+        writer
+            .write_all(block_content)
+            .map_err(|e| GoatError::io(io_stage, e))?;
+        let checksum = Self::checksum_for_block(block_content);
+        writer
+            .write_all(&checksum.to_le_bytes())
+            .map_err(|e| GoatError::io("sstable_write_block_checksum", e))?;
+        self.offset += (block_content.len() + BLOCK_CHECKSUM_SIZE) as u64;
+        Ok(())
     }
 
     /// 计算索引中使用的分隔符（separator）
