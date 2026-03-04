@@ -1,10 +1,11 @@
 use std::collections::VecDeque;
 use std::mem;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
 use bytes::Bytes;
+use tracing::{debug, warn};
 
 use crate::goatkv::core::lsm_state::LSMState;
 use crate::goatkv::core::sequence_number::SequenceNumber;
@@ -119,6 +120,33 @@ enum CloseReason {
     Failed(String),
 }
 
+enum WritePressureAction {
+    Allow,
+    Slowdown { delay: Duration },
+    Stop(GoatError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WritePressureLevel {
+    Normal = 0,
+    Slowdown = 1,
+    Stop = 2,
+}
+
+impl WritePressureLevel {
+    const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => Self::Slowdown,
+            2 => Self::Stop,
+            _ => Self::Normal,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct WriteState {
     // submitter -> WAL leader 的队列。
@@ -192,6 +220,8 @@ pub struct KvWriter {
     last_published_seq: AtomicU64,
     // 协作式 flush 触发标志，由请求线程在完成后消费。
     flush_requested: AtomicBool,
+    // 写入压力状态（normal/slowdown/stop），用于状态转移可观测。
+    write_pressure_level: AtomicU8,
 }
 
 pub struct FlushBarrierGuard<'a> {
@@ -222,6 +252,7 @@ impl KvWriter {
             options,
             last_published_seq: AtomicU64::new(0),
             flush_requested: AtomicBool::new(false),
+            write_pressure_level: AtomicU8::new(WritePressureLevel::Normal.as_u8()),
         }
     }
 
@@ -238,19 +269,26 @@ impl KvWriter {
 
             // 准入控制：
             // - flush 屏障开启时阻塞；
-            // - WAL 队列背压时阻塞。
-            while !state.is_closed()
-                && (state.flush_blocked
-                    || self.wal_queue_backpressured(&state, request.approx_bytes))
-            {
+            // - WAL 队列背压时阻塞；
+            // - compaction 压力触发 slowdown/stop。
+            while !state.is_closed() {
                 if let Some(err) = self.flush_backpressure_error() {
                     return Err(err);
                 }
-                state = self.state_cv.wait(state).unwrap();
-            }
 
-            if let Some(err) = self.flush_backpressure_error() {
-                return Err(err);
+                if state.flush_blocked || self.wal_queue_backpressured(&state, request.approx_bytes)
+                {
+                    state = self.state_cv.wait(state).unwrap();
+                    continue;
+                }
+
+                match self.write_pressure_action() {
+                    WritePressureAction::Allow => break,
+                    WritePressureAction::Slowdown { delay } => {
+                        state = self.state_cv.wait_timeout(state, delay).unwrap().0;
+                    }
+                    WritePressureAction::Stop(err) => return Err(err),
+                }
             }
 
             // writer 已关闭则立即拒绝写入。
@@ -775,6 +813,169 @@ impl KvWriter {
         None
     }
 
+    fn write_pressure_action(&self) -> WritePressureAction {
+        let lsm_state = self.lsm_state.read().unwrap();
+        let version = &lsm_state.version;
+
+        let l0_files = version.get_files(0).len();
+        let l0_slowdown = self.options.l0_slowdown_writes_trigger.max(1);
+        let l0_stop = self.options.l0_stop_writes_trigger.max(l0_slowdown);
+        let pending_compaction_bytes = self.estimated_pending_compaction_bytes(version);
+        let soft_limit = self.options.soft_pending_compaction_bytes_limit.max(1);
+        let hard_limit = self
+            .options
+            .hard_pending_compaction_bytes_limit
+            .max(soft_limit);
+        let l0_stop_triggered = l0_files >= l0_stop;
+        let pending_stop_triggered = pending_compaction_bytes >= hard_limit;
+        let l0_slowdown_triggered = l0_files >= l0_slowdown;
+        let pending_slowdown_triggered = pending_compaction_bytes >= soft_limit;
+
+        if l0_stop_triggered {
+            self.observe_write_pressure_transition(
+                WritePressureLevel::Stop,
+                "l0_stop_trigger",
+                l0_files,
+                pending_compaction_bytes,
+            );
+            return WritePressureAction::Stop(GoatError::unavailable(
+                "write_backpressure",
+                format!(
+                    "L0 file count {} reached stop trigger {}",
+                    l0_files, l0_stop
+                ),
+            ));
+        }
+
+        if pending_stop_triggered {
+            self.observe_write_pressure_transition(
+                WritePressureLevel::Stop,
+                "pending_compaction_hard_limit",
+                l0_files,
+                pending_compaction_bytes,
+            );
+            return WritePressureAction::Stop(GoatError::unavailable(
+                "write_backpressure",
+                format!(
+                    "pending compaction bytes {} reached hard limit {}",
+                    pending_compaction_bytes, hard_limit
+                ),
+            ));
+        }
+
+        if l0_slowdown_triggered || pending_slowdown_triggered {
+            let reason = match (l0_slowdown_triggered, pending_slowdown_triggered) {
+                (true, true) => "l0_and_pending_compaction_slowdown",
+                (true, false) => "l0_slowdown_trigger",
+                (false, true) => "pending_compaction_soft_limit",
+                (false, false) => "unknown",
+            };
+            self.observe_write_pressure_transition(
+                WritePressureLevel::Slowdown,
+                reason,
+                l0_files,
+                pending_compaction_bytes,
+            );
+            return WritePressureAction::Slowdown {
+                delay: Duration::from_millis(self.options.write_slowdown_delay_ms.max(1)),
+            };
+        }
+
+        self.observe_write_pressure_transition(
+            WritePressureLevel::Normal,
+            "below_thresholds",
+            l0_files,
+            pending_compaction_bytes,
+        );
+        WritePressureAction::Allow
+    }
+
+    fn observe_write_pressure_transition(
+        &self,
+        next_level: WritePressureLevel,
+        reason: &'static str,
+        l0_files: usize,
+        pending_compaction_bytes: u64,
+    ) {
+        let next_raw = next_level.as_u8();
+        let current_raw = self.write_pressure_level.load(Ordering::Acquire);
+        if current_raw == next_raw {
+            return;
+        }
+
+        if self
+            .write_pressure_level
+            .compare_exchange(current_raw, next_raw, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let previous_level = WritePressureLevel::from_u8(current_raw);
+        match next_level {
+            WritePressureLevel::Normal => debug!(
+                previous = ?previous_level,
+                reason,
+                l0_files,
+                pending_compaction_bytes,
+                "write pressure recovered to normal"
+            ),
+            WritePressureLevel::Slowdown => warn!(
+                previous = ?previous_level,
+                reason,
+                l0_files,
+                pending_compaction_bytes,
+                "write pressure entered slowdown state"
+            ),
+            WritePressureLevel::Stop => warn!(
+                previous = ?previous_level,
+                reason,
+                l0_files,
+                pending_compaction_bytes,
+                "write pressure entered stop state"
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    fn observed_write_pressure_level_for_test(&self) -> WritePressureLevel {
+        WritePressureLevel::from_u8(self.write_pressure_level.load(Ordering::Acquire))
+    }
+
+    fn estimated_pending_compaction_bytes(
+        &self,
+        version: &crate::goatkv::metadata::version::Version,
+    ) -> u64 {
+        let num_levels = version.num_levels();
+        if num_levels <= 1 {
+            return 0;
+        }
+
+        let base = self.options.compaction_max_bytes_for_level_base.max(1);
+        let multiplier = self
+            .options
+            .compaction_max_bytes_for_level_multiplier
+            .max(2);
+        let mut level_target = base;
+        let mut pending = 0u64;
+
+        // L1+ debt
+        for level in 1..num_levels {
+            let level_size = version.get_level_size(level);
+            if level_size > level_target {
+                pending = pending.saturating_add(level_size - level_target);
+            }
+            level_target = level_target.saturating_mul(multiplier);
+        }
+
+        // L0 debt (use level-0 size as coarse signal once file count exceeds trigger).
+        if version.get_files(0).len() > self.options.l0_compaction_file_trigger.max(1) {
+            pending = pending.saturating_add(version.get_level_size(0));
+        }
+
+        pending
+    }
+
     fn drain_all_queued(state: &mut WriteState) -> Vec<Arc<WriteRequest>> {
         // close/fail_fast 共用：重置状态并清空两个队列。
         state.wal_queue_reqs = 0;
@@ -805,12 +1006,14 @@ mod tests {
     use crate::goatkv::core::sequence_number::SequenceNumber;
     use crate::goatkv::error::ErrorKind;
     use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind, SEQUENCE_NUMBER_MAX};
+    use crate::goatkv::metadata::file_metadata::{FileMetadata, TableProperties};
     use crate::goatkv::metadata::version::Version;
     use crate::goatkv::storage::wal::{WalWriter, WalWriterConfig};
     use crate::goatkv::utils::options::KvEngineOptions;
     use crate::goatkv::utils::paths::SstablePaths;
     use std::sync::{Arc, RwLock};
     use tempfile::NamedTempFile;
+    use tokio::sync::mpsc::unbounded_channel;
 
     fn build_writer_with_start(start: u64) -> KvWriter {
         let (writer, _lsm_state) = build_writer_with_options(start, KvEngineOptions::for_test());
@@ -843,6 +1046,28 @@ mod tests {
             Arc::new(options),
         );
         (writer, lsm_state)
+    }
+
+    fn make_test_file(
+        file_id: u64,
+        smallest: &[u8],
+        largest: &[u8],
+        size_bytes: u64,
+    ) -> Arc<FileMetadata> {
+        let smallest_key =
+            InternalKey::new(smallest.to_vec(), 100, InternalKeyKind::Put).serialize();
+        let largest_key = InternalKey::new(largest.to_vec(), 90, InternalKeyKind::Put).serialize();
+        let props = TableProperties::new(size_bytes, smallest_key, largest_key, 90, 100);
+        let (tx, _rx) = unbounded_channel();
+        Arc::new(FileMetadata::from_props(file_id, props, tx))
+    }
+
+    fn install_version(lsm_state: &Arc<RwLock<LSMState>>, files: Vec<Vec<Arc<FileMetadata>>>) {
+        let sstable_paths = Arc::new(SstablePaths::new(
+            std::env::temp_dir().join("goatdb_writer_test_ver_data"),
+            std::env::temp_dir().join("goatdb_writer_test_ver_tmp"),
+        ));
+        lsm_state.write().unwrap().version = Arc::new(Version::from_files(files, 0, sstable_paths));
     }
 
     #[test]
@@ -905,5 +1130,85 @@ mod tests {
             .expect_err("write should fail when flush circuit is open");
         assert_eq!(err.kind(), ErrorKind::Unavailable);
         assert!(err.to_string().contains("flush circuit open"));
+    }
+
+    #[test]
+    fn submit_write_fails_fast_when_l0_reaches_stop_trigger() {
+        let options = KvEngineOptions::for_test()
+            .with_l0_slowdown_writes_trigger(2)
+            .with_l0_stop_writes_trigger(3);
+        let (writer, lsm_state) = build_writer_with_options(1, options);
+
+        let mut files = vec![Vec::new(); 7];
+        files[0].push(make_test_file(1, b"a", b"b", 8 * 1024));
+        files[0].push(make_test_file(2, b"c", b"d", 8 * 1024));
+        files[0].push(make_test_file(3, b"e", b"f", 8 * 1024));
+        install_version(&lsm_state, files);
+
+        let err = writer
+            .submit_write(vec![WriteOp::Put(b"k4".to_vec(), b"v4".to_vec())], || {})
+            .expect_err("write should fail when L0 file count reaches stop trigger");
+        assert_eq!(err.kind(), ErrorKind::Unavailable);
+        assert!(err.to_string().contains("L0 file count"));
+        assert_eq!(
+            writer.observed_write_pressure_level_for_test(),
+            super::WritePressureLevel::Stop
+        );
+    }
+
+    #[test]
+    fn write_pressure_action_reports_slowdown_before_stop() {
+        let options = KvEngineOptions::for_test()
+            .with_l0_slowdown_writes_trigger(2)
+            .with_l0_stop_writes_trigger(4)
+            .with_write_slowdown_delay_ms(1);
+        let (writer, lsm_state) = build_writer_with_options(1, options);
+
+        let mut files = vec![Vec::new(); 7];
+        files[0].push(make_test_file(10, b"a", b"b", 8 * 1024));
+        files[0].push(make_test_file(11, b"c", b"d", 8 * 1024));
+        install_version(&lsm_state, files);
+
+        assert!(matches!(
+            writer.write_pressure_action(),
+            super::WritePressureAction::Slowdown { .. }
+        ));
+        assert_eq!(
+            writer.observed_write_pressure_level_for_test(),
+            super::WritePressureLevel::Slowdown
+        );
+
+        install_version(&lsm_state, vec![Vec::new(); 7]);
+        assert!(matches!(
+            writer.write_pressure_action(),
+            super::WritePressureAction::Allow
+        ));
+        assert_eq!(
+            writer.observed_write_pressure_level_for_test(),
+            super::WritePressureLevel::Normal
+        );
+    }
+
+    #[test]
+    fn submit_write_fails_fast_when_pending_compaction_bytes_reaches_hard_limit() {
+        let options = KvEngineOptions::for_test()
+            .with_hard_pending_compaction_bytes_limit(1)
+            .with_soft_pending_compaction_bytes_limit(1);
+        let (writer, lsm_state) = build_writer_with_options(1, options);
+
+        let mut files = vec![Vec::new(); 7];
+        // level-1 target default is 64KB, put 256KB to guarantee pending compaction debt > 0
+        files[1].push(make_test_file(21, b"aa", b"zz", 256 * 1024));
+        install_version(&lsm_state, files);
+
+        let err = writer
+            .submit_write(vec![WriteOp::Put(b"k5".to_vec(), b"v5".to_vec())], || {})
+            .expect_err("write should fail when pending compaction bytes reach hard limit");
+        assert_eq!(err.kind(), ErrorKind::Unavailable);
+        assert!(err.to_string().contains("pending compaction bytes"));
+        assert_eq!(
+            writer.observed_write_pressure_level_for_test(),
+            super::WritePressureLevel::Stop
+        );
     }
 }

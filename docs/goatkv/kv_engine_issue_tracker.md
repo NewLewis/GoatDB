@@ -21,6 +21,7 @@
 - 2026-03-04：完成 `P1-TABLE-BLOCK-CACHE-MISSING` 修复与回归，新增可配置 table/block cache、缓存指标快照与热点读基准命令；`cargo test` 与 `cargo clippy --all-targets --all-features -- -D warnings` 通过。
 - 2026-03-04：完成 RocksDB 对齐差距评审，新增 7 个待修复项：`P1-WRITE-STALL-BY-COMPACTION-PRESSURE`、`P1-PREFIX-BLOOM-PARTITIONED-FILTER`、`P1-READAHEAD-ITERATOR-OPT`、`P1-MULTIGET-BATCH-READ-PATH`、`P1-PARALLEL-COMPACTION-SUBCOMPACTION`、`P1-PER-LEVEL-COMPRESSION`、`P2-WAL-PREALLOC-BYTES-PER-SYNC`。
 - 2026-03-04：完成 `P1-COMPACTION-POLICY-HARDCODED` 修复与回归，compaction 关键阈值已由 `KvEngineOptions` 配置驱动；`cargo test test_l0_compacts_to_base_level_when_l0_exceeds_threshold`、`cargo test test_compaction_cascades_to_l2_when_l1_exceeds_threshold` 通过。
+- 2026-03-04：完成 `P1-WRITE-STALL-BY-COMPACTION-PRESSURE` 修复与回归，新增 L0/pending-compaction 两级 slowdown/stop 策略、可配置阈值与写压状态转移日志；`cargo test --lib`、`cargo clippy --all-targets --all-features -- -D warnings` 通过。
 
 ## 问题清单
 
@@ -456,7 +457,7 @@
     - 给出升级/回滚策略文档（forward/backward compatibility）。
     - 增加跨版本读写兼容测试。
 
-- [ ] `P1-WRITE-STALL-BY-COMPACTION-PRESSURE`
+- [x] `P1-WRITE-STALL-BY-COMPACTION-PRESSURE`
   - 现象：当前写入背压主要基于 WAL/Mem 队列与 immutable backlog，缺少基于 `L0` 文件数和 compaction debt 的分级限速/停写策略。
   - 影响：高写入+compaction 落后时，可能出现 L0 快速膨胀、读放大恶化、尾延迟抖动，且恢复速度不可预测。
   - 代码定位：
@@ -468,6 +469,10 @@
     - 增加 `L0` 与 pending compaction bytes 维度的 slowdown/stop 两级策略。
     - 将阈值纳入配置并提供默认值与边界校验。
     - 压测下 L0 与写延迟保持有界，策略触发可观测。
+  - 关闭记录：
+    - 2026-03-04：`KvWriter::submit_write` 准入阶段新增 compaction pressure 判定，支持 `Allow/Slowdown/Stop` 三级行为；L0 或 pending compaction bytes 达硬阈值时 fail-fast 返回 `Unavailable`。
+    - 2026-03-04：`KvEngineOptions` 新增 `l0_slowdown_writes_trigger`、`l0_stop_writes_trigger`、`soft_pending_compaction_bytes_limit`、`hard_pending_compaction_bytes_limit`、`write_slowdown_delay_ms`，并对输入做下限归一化（`>=1`）。
+    - 2026-03-04：新增写压状态转移日志（normal/slowdown/stop）与回归测试：`submit_write_fails_fast_when_l0_reaches_stop_trigger`、`write_pressure_action_reports_slowdown_before_stop`、`submit_write_fails_fast_when_pending_compaction_bytes_reaches_hard_limit`、`test_with_write_stall_thresholds`。
 
 - [ ] `P1-PREFIX-BLOOM-PARTITIONED-FILTER`
   - 现象：当前 BloomFilter 为单体 bitmap，且未引入 prefix extractor/partitioned filter-index。

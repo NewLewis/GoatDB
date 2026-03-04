@@ -134,6 +134,26 @@ pub struct KvEngineOptions {
     /// grandparent overlap 限制因子
     /// Default: 10
     pub compaction_max_grandparent_overlap_bytes_factor: u64,
+
+    /// L0 文件数达到该阈值时进入写入减速（slowdown）
+    /// Default: 20
+    pub l0_slowdown_writes_trigger: usize,
+
+    /// L0 文件数达到该阈值时停止写入（stop）
+    /// Default: 36
+    pub l0_stop_writes_trigger: usize,
+
+    /// Pending compaction bytes 软阈值（超过进入 slowdown）
+    /// Default: 64MB
+    pub soft_pending_compaction_bytes_limit: u64,
+
+    /// Pending compaction bytes 硬阈值（超过 stop）
+    /// Default: 256MB
+    pub hard_pending_compaction_bytes_limit: u64,
+
+    /// slowdown 时每轮等待时长（毫秒）
+    /// Default: 1ms
+    pub write_slowdown_delay_ms: u64,
 }
 
 impl Default for KvEngineOptions {
@@ -169,6 +189,11 @@ impl Default for KvEngineOptions {
             compaction_max_bytes_for_level_base: 64 * 1024,
             compaction_max_bytes_for_level_multiplier: 10,
             compaction_max_grandparent_overlap_bytes_factor: 10,
+            l0_slowdown_writes_trigger: 20,
+            l0_stop_writes_trigger: 36,
+            soft_pending_compaction_bytes_limit: 64 * 1024 * 1024,
+            hard_pending_compaction_bytes_limit: 256 * 1024 * 1024,
+            write_slowdown_delay_ms: 1,
         }
     }
 }
@@ -335,6 +360,36 @@ impl KvEngineOptions {
         self
     }
 
+    /// Sets L0 slowdown trigger for writes.
+    pub fn with_l0_slowdown_writes_trigger(mut self, trigger: usize) -> Self {
+        self.l0_slowdown_writes_trigger = trigger.max(1);
+        self
+    }
+
+    /// Sets L0 stop trigger for writes.
+    pub fn with_l0_stop_writes_trigger(mut self, trigger: usize) -> Self {
+        self.l0_stop_writes_trigger = trigger.max(1);
+        self
+    }
+
+    /// Sets soft pending compaction bytes limit.
+    pub fn with_soft_pending_compaction_bytes_limit(mut self, bytes: u64) -> Self {
+        self.soft_pending_compaction_bytes_limit = bytes.max(1);
+        self
+    }
+
+    /// Sets hard pending compaction bytes limit.
+    pub fn with_hard_pending_compaction_bytes_limit(mut self, bytes: u64) -> Self {
+        self.hard_pending_compaction_bytes_limit = bytes.max(1);
+        self
+    }
+
+    /// Sets write slowdown delay in milliseconds.
+    pub fn with_write_slowdown_delay_ms(mut self, delay_ms: u64) -> Self {
+        self.write_slowdown_delay_ms = delay_ms.max(1);
+        self
+    }
+
     /// Creates options suitable for testing
     ///
     /// This creates a KvEngineOptions with a temporary data directory
@@ -383,6 +438,11 @@ impl KvEngineOptions {
             compaction_max_bytes_for_level_base: 64 * 1024,
             compaction_max_bytes_for_level_multiplier: 10,
             compaction_max_grandparent_overlap_bytes_factor: 10,
+            l0_slowdown_writes_trigger: 20,
+            l0_stop_writes_trigger: 36,
+            soft_pending_compaction_bytes_limit: 64 * 1024 * 1024,
+            hard_pending_compaction_bytes_limit: 256 * 1024 * 1024,
+            write_slowdown_delay_ms: 1,
         }
     }
 }
@@ -475,6 +535,42 @@ mod tests {
         assert_eq!(options.compaction_max_bytes_for_level_base, 256 * 1024);
         assert_eq!(options.compaction_max_bytes_for_level_multiplier, 12);
         assert_eq!(options.compaction_max_grandparent_overlap_bytes_factor, 7);
+    }
+
+    #[test]
+    fn test_with_write_stall_thresholds() {
+        let options = KvEngineOptions::default()
+            .with_l0_slowdown_writes_trigger(10)
+            .with_l0_stop_writes_trigger(20)
+            .with_soft_pending_compaction_bytes_limit(8 * 1024 * 1024)
+            .with_hard_pending_compaction_bytes_limit(32 * 1024 * 1024)
+            .with_write_slowdown_delay_ms(5);
+        assert_eq!(options.l0_slowdown_writes_trigger, 10);
+        assert_eq!(options.l0_stop_writes_trigger, 20);
+        assert_eq!(options.soft_pending_compaction_bytes_limit, 8 * 1024 * 1024);
+        assert_eq!(
+            options.hard_pending_compaction_bytes_limit,
+            32 * 1024 * 1024
+        );
+        assert_eq!(options.write_slowdown_delay_ms, 5);
+    }
+
+    #[test]
+    fn test_with_l0_write_triggers_clamp_lower_bound() {
+        let options = KvEngineOptions::default()
+            .with_l0_slowdown_writes_trigger(0)
+            .with_l0_stop_writes_trigger(0);
+        assert_eq!(options.l0_slowdown_writes_trigger, 1);
+        assert_eq!(options.l0_stop_writes_trigger, 1);
+    }
+
+    #[test]
+    fn test_with_pending_compaction_limits_clamp_lower_bound() {
+        let options = KvEngineOptions::default()
+            .with_soft_pending_compaction_bytes_limit(0)
+            .with_hard_pending_compaction_bytes_limit(0);
+        assert_eq!(options.soft_pending_compaction_bytes_limit, 1);
+        assert_eq!(options.hard_pending_compaction_bytes_limit, 1);
     }
 
     #[test]
