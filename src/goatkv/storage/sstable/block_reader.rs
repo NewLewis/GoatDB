@@ -10,8 +10,18 @@ pub struct BlockReader<'a> {
     data: &'a [u8],
     /// 重启点数组
     restarts: Vec<u32>,
+    /// 每个重启点对应的完整 key（解码缓存，避免查找时重复解码）
+    restart_keys: Vec<Vec<u8>>,
     /// 数据部分的结束位置（不包括重启点数组）
     data_end: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DecodedEntryView<'a> {
+    shared: u32,
+    unshared_key: &'a [u8],
+    value: &'a [u8],
+    total_len: usize,
 }
 
 impl<'a> BlockReader<'a> {
@@ -39,6 +49,7 @@ impl<'a> BlockReader<'a> {
             return Ok(Self {
                 data,
                 restarts: Vec::new(),
+                restart_keys: Vec::new(),
                 data_end: data.len() - 4,
             });
         }
@@ -69,12 +80,21 @@ impl<'a> BlockReader<'a> {
             restarts.push(restart_point);
         }
 
+        // 兼容当前 block 编码：restart 数组不包含首段 0 偏移，这里补一个虚拟 0，
+        // 让 restart-based 查找也能覆盖第一段数据。
+        if restarts.first().copied() != Some(0) {
+            restarts.insert(0, 0);
+        }
+
         // data_end should be restart_start to exclude restart array from iteration
-        Ok(Self {
+        let mut reader = Self {
             data,
             restarts,
+            restart_keys: Vec::new(),
             data_end: restart_start,
-        })
+        };
+        reader.restart_keys = reader.collect_restart_keys();
+        Ok(reader)
     }
 
     /// 获取块中的条目数量
@@ -129,6 +149,100 @@ impl<'a> BlockReader<'a> {
         // 没有在重启点找到精确匹配，在最后的候选区间进行线性搜索
         left = left.saturating_sub(1);
         self.linear_search_from_restart(left, key)
+    }
+
+    /// 在块中按 UserKey 查找第一个匹配条目。
+    /// 返回 (InternalKey原始字节, value)。
+    pub fn get_by_user_key(&self, user_key: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        if self.restarts.is_empty() {
+            return self.linear_search_from_start_by_user_key(user_key);
+        }
+        if self.restart_keys.len() != self.restarts.len() {
+            return self.linear_search_full_by_user_key(user_key);
+        }
+
+        // 热点 key 常落在块头：先快速判断是否命中前缀区间，避免每次都做完整二分。
+        let prefix_probe = (self.restarts.len() - 1).min(8);
+        if prefix_probe > 0 {
+            let cmp = match self.restart_user_key_cmp(prefix_probe, user_key) {
+                Some(cmp) => cmp,
+                None => return self.linear_search_full_by_user_key(user_key),
+            };
+            if cmp == Ordering::Greater {
+                let end_pos = self.restarts[prefix_probe] as usize;
+                return self.linear_search_range_by_user_key(0, end_pos, user_key);
+            }
+        }
+
+        // 在 restart key 上做 lower_bound，定位到第一个 restart_user >= user_key
+        let mut left = 0usize;
+        let mut right = self.restarts.len();
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let cmp = match self.restart_user_key_cmp(mid, user_key) {
+                Some(cmp) => cmp,
+                None => return self.linear_search_full_by_user_key(user_key),
+            };
+
+            if cmp == Ordering::Less {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+
+        if left >= self.restarts.len() {
+            return self.linear_search_from_restart_by_user_key(self.restarts.len() - 1, user_key);
+        }
+
+        let cmp_at_left = match self.restart_user_key_cmp(left, user_key) {
+            Some(cmp) => cmp,
+            None => return self.linear_search_full_by_user_key(user_key),
+        };
+
+        match cmp_at_left {
+            Ordering::Greater => {
+                // target 落在前一个 interval；无需扫描 left interval。
+                self.linear_search_from_restart_by_user_key(left.saturating_sub(1), user_key)
+            }
+            Ordering::Equal => {
+                // 可能存在跨 interval 的同 user_key 版本链，先查前一个再查当前。
+                if left > 0 {
+                    if let Some(found) =
+                        self.linear_search_from_restart_by_user_key(left - 1, user_key)
+                    {
+                        return Some(found);
+                    }
+                }
+                self.linear_search_from_restart_by_user_key(left, user_key)
+            }
+            Ordering::Less => {
+                // lower_bound 下理论不会出现，保守回退当前 interval。
+                self.linear_search_from_restart_by_user_key(left, user_key)
+            }
+        }
+    }
+
+    fn restart_user_key_cmp(&self, restart_index: usize, user_key: &[u8]) -> Option<Ordering> {
+        let restart_key = self.restart_keys.get(restart_index)?;
+        let restart_user_key = Self::user_key_of_internal_key(restart_key)?;
+        Some(restart_user_key.cmp(user_key))
+    }
+
+    fn collect_restart_keys(&self) -> Vec<Vec<u8>> {
+        let mut keys = Vec::with_capacity(self.restarts.len());
+        for &restart in &self.restarts {
+            let restart_pos = restart as usize;
+            if restart_pos >= self.data_end {
+                keys.push(Vec::new());
+                continue;
+            }
+            match self.decode_entry_view_at(restart_pos) {
+                Ok(entry) if entry.shared == 0 => keys.push(entry.unshared_key.to_vec()),
+                _ => keys.push(Vec::new()),
+            }
+        }
+        keys
     }
 
     /// 从指定的重启点开始线性搜索
@@ -190,6 +304,20 @@ impl<'a> BlockReader<'a> {
         None
     }
 
+    fn linear_search_from_restart_by_user_key(
+        &self,
+        restart_index: usize,
+        user_key: &[u8],
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let restart_pos = self.restarts[restart_index] as usize;
+        let end_pos = if restart_index + 1 < self.restarts.len() {
+            self.restarts[restart_index + 1] as usize
+        } else {
+            self.data_end
+        };
+        self.linear_search_range_by_user_key(restart_pos, end_pos, user_key)
+    }
+
     /// 从块开头进行线性搜索
     fn linear_search_from_start(&self, key: &[u8]) -> Option<Vec<u8>> {
         let mut current_pos = 0;
@@ -245,6 +373,10 @@ impl<'a> BlockReader<'a> {
         None
     }
 
+    fn linear_search_from_start_by_user_key(&self, user_key: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.linear_search_range_by_user_key(0, self.data_end, user_key)
+    }
+
     /// 在整个块中进行线性搜索（回退策略）
     fn linear_search_full(&self, key: &[u8]) -> Option<Vec<u8>> {
         let iter = self.iter();
@@ -278,8 +410,79 @@ impl<'a> BlockReader<'a> {
         None
     }
 
-    /// 解码指定位置的条目
-    fn decode_entry_at(&self, pos: usize) -> GoatResult<(u32, Vec<u8>, Vec<u8>)> {
+    fn linear_search_full_by_user_key(&self, user_key: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        let iter = self.iter();
+
+        for (full_key, value) in iter {
+            let full_user_key = match Self::user_key_of_internal_key(&full_key) {
+                Some(k) => k,
+                None => continue,
+            };
+
+            match full_user_key.cmp(user_key) {
+                Ordering::Less => {}
+                Ordering::Equal => return Some((full_key, value)),
+                Ordering::Greater => return None,
+            }
+        }
+
+        None
+    }
+
+    fn linear_search_range_by_user_key(
+        &self,
+        start_pos: usize,
+        end_pos: usize,
+        user_key: &[u8],
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let mut current_pos = start_pos;
+        let mut prev_key = Vec::new();
+
+        while current_pos < end_pos {
+            let entry = self.decode_entry_view_at(current_pos).ok()?;
+            if entry.unshared_key.is_empty() && entry.value.is_empty() {
+                return None;
+            }
+
+            if prev_key.is_empty() {
+                if entry.shared != 0 {
+                    return None;
+                }
+                prev_key.extend_from_slice(entry.unshared_key);
+            } else {
+                let shared = entry.shared as usize;
+                if shared > prev_key.len() {
+                    return None;
+                }
+                prev_key.truncate(shared);
+                prev_key.extend_from_slice(entry.unshared_key);
+            }
+
+            let full_user_key = match Self::user_key_of_internal_key(&prev_key) {
+                Some(k) => k,
+                None => {
+                    current_pos += entry.total_len;
+                    continue;
+                }
+            };
+
+            match full_user_key.cmp(user_key) {
+                Ordering::Less => {
+                    current_pos += entry.total_len;
+                }
+                Ordering::Equal => {
+                    return Some((prev_key.clone(), entry.value.to_vec()));
+                }
+                Ordering::Greater => {
+                    return None;
+                }
+            }
+        }
+
+        None
+    }
+
+    fn decode_entry_view_at(&self, pos: usize) -> GoatResult<DecodedEntryView<'_>> {
         if pos >= self.data_end {
             return Err(GoatError::corruption(
                 "block_reader",
@@ -289,73 +492,51 @@ impl<'a> BlockReader<'a> {
 
         let mut offset = pos;
 
-        // 解码共享长度
         let (shared, bytes_read) = self.decode_varint_at(offset)?;
         offset += bytes_read;
 
-        // 解码非共享长度
         let (unshared, bytes_read) = self.decode_varint_at(offset)?;
         offset += bytes_read;
 
-        // 解码值长度
         let (value_len, bytes_read) = self.decode_varint_at(offset)?;
         offset += bytes_read;
 
-        // 检查边界
-        if offset + unshared as usize + value_len as usize > self.data_end {
+        let unshared = unshared as usize;
+        let value_len = value_len as usize;
+        let end = offset + unshared + value_len;
+        if end > self.data_end {
             return Err(GoatError::corruption(
                 "block_reader",
                 "entry exceeds block boundary",
             ));
         }
 
-        // 读取非共享的key部分
-        let unshared_key = &self.data[offset..offset + unshared as usize];
-        offset += unshared as usize;
+        let unshared_key = &self.data[offset..offset + unshared];
+        let value = &self.data[offset + unshared..end];
 
-        // 读取值
-        let value = &self.data[offset..offset + value_len as usize];
+        Ok(DecodedEntryView {
+            shared: shared as u32,
+            unshared_key,
+            value,
+            total_len: end - pos,
+        })
+    }
 
-        Ok((shared as u32, unshared_key.to_vec(), value.to_vec()))
+    /// 解码指定位置的条目
+    fn decode_entry_at(&self, pos: usize) -> GoatResult<(u32, Vec<u8>, Vec<u8>)> {
+        let entry = self.decode_entry_view_at(pos)?;
+        Ok((
+            entry.shared,
+            entry.unshared_key.to_vec(),
+            entry.value.to_vec(),
+        ))
     }
 
     /// 计算指定位置条目的总大小
     fn entry_size_at(&self, pos: usize) -> Option<usize> {
-        if pos >= self.data_end {
-            return None;
-        }
-
-        let mut offset = pos;
-        let mut total_size = 0;
-
-        // 解码共享长度并累加大小
-        match self.decode_varint_at(offset) {
-            Ok((_, bytes_read)) => {
-                total_size += bytes_read;
-                offset += bytes_read;
-            }
-            Err(_) => return None,
-        }
-
-        // 解码非共享长度并累加大小
-        match self.decode_varint_at(offset) {
-            Ok((unshared, bytes_read)) => {
-                total_size += bytes_read;
-                offset += bytes_read;
-
-                // 解码值长度并累加大小
-                match self.decode_varint_at(offset) {
-                    Ok((value_len, bytes_read)) => {
-                        total_size += bytes_read;
-                        total_size += unshared as usize + value_len as usize;
-                    }
-                    Err(_) => return None,
-                }
-            }
-            Err(_) => return None,
-        }
-
-        Some(total_size)
+        self.decode_entry_view_at(pos)
+            .ok()
+            .map(|entry| entry.total_len)
     }
 
     /// 在指定位置解码varint
@@ -386,6 +567,10 @@ impl<'a> BlockReader<'a> {
         }
 
         shared as u32
+    }
+
+    fn user_key_of_internal_key(raw: &[u8]) -> Option<&[u8]> {
+        raw.get(..raw.len().checked_sub(8)?)
     }
 
     /// 创建块的迭代器
@@ -467,6 +652,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
     use crate::goatkv::storage::sstable::BlockBuilder;
 
     #[test]
@@ -617,5 +803,51 @@ mod tests {
         data[96..100].copy_from_slice(&100u32.to_le_bytes());
         let reader = BlockReader::new(&data);
         assert!(reader.is_err(), "Invalid restart count should return error");
+    }
+
+    #[test]
+    fn test_block_reader_get_by_user_key_with_versions() {
+        let mut builder = BlockBuilder::new();
+        let k1_latest = InternalKey::new(b"k1".to_vec(), 30, InternalKeyKind::Put).serialize();
+        let k1_old = InternalKey::new(b"k1".to_vec(), 20, InternalKeyKind::Put).serialize();
+        let k2_latest = InternalKey::new(b"k2".to_vec(), 10, InternalKeyKind::Put).serialize();
+        builder.add(&k1_latest, b"v30");
+        builder.add(&k1_old, b"v20");
+        builder.add(&k2_latest, b"v10");
+        let (data, _) = builder.finish();
+
+        let reader = BlockReader::new(data).unwrap();
+        let (raw_key, value) = reader.get_by_user_key(b"k1").unwrap();
+        assert_eq!(raw_key, k1_latest);
+        assert_eq!(value, b"v30".to_vec());
+        assert!(reader.get_by_user_key(b"absent").is_none());
+    }
+
+    #[test]
+    fn test_block_reader_get_by_user_key_cross_restart_boundary() {
+        let mut builder = BlockBuilder::new();
+
+        // 前15个条目是 "aa"，第16个开始是 "bb"，确保 "bb" 跨越 restart 边界。
+        for seq in (86u64..=100u64).rev() {
+            let key = InternalKey::new(b"aa".to_vec(), seq, InternalKeyKind::Put).serialize();
+            let value = format!("aa_{}", seq).into_bytes();
+            builder.add(&key, &value);
+        }
+
+        let mut expected_latest_bb_key = Vec::new();
+        for seq in (180u64..=200u64).rev() {
+            let key = InternalKey::new(b"bb".to_vec(), seq, InternalKeyKind::Put).serialize();
+            if seq == 200 {
+                expected_latest_bb_key = key.clone();
+            }
+            let value = format!("bb_{}", seq).into_bytes();
+            builder.add(&key, &value);
+        }
+
+        let (data, _) = builder.finish();
+        let reader = BlockReader::new(data).unwrap();
+        let (raw_key, value) = reader.get_by_user_key(b"bb").unwrap();
+        assert_eq!(raw_key, expected_latest_bb_key);
+        assert_eq!(value, b"bb_200".to_vec());
     }
 }

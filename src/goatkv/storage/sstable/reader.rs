@@ -1,9 +1,13 @@
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 
 use crc32fast::Hasher;
 
@@ -39,7 +43,7 @@ pub struct SSTableReader {
     /// SSTable 文件 id（可选，用于 block cache key）
     file_id: Option<u64>,
     /// 文件句柄
-    file: Mutex<File>,
+    file: File,
     /// BloomFilter
     bloom_filter: super::bloom::BloomFilter,
     /// 索引条目列表，按分隔键排序
@@ -49,6 +53,37 @@ pub struct SSTableReader {
 }
 
 impl SSTableReader {
+    fn read_exact_at(
+        file: &File,
+        mut offset: u64,
+        mut buf: &mut [u8],
+        op: &'static str,
+    ) -> GoatResult<()> {
+        while !buf.is_empty() {
+            #[cfg(unix)]
+            let bytes = file
+                .read_at(buf, offset)
+                .map_err(|e| GoatError::io(op, e))?;
+            #[cfg(windows)]
+            let bytes = file
+                .seek_read(buf, offset)
+                .map_err(|e| GoatError::io(op, e))?;
+
+            if bytes == 0 {
+                return Err(GoatError::corruption(
+                    "sstable_read_at",
+                    "unexpected EOF while reading at offset",
+                ));
+            }
+
+            let (_, rest) = buf.split_at_mut(bytes);
+            buf = rest;
+            offset += bytes as u64;
+        }
+
+        Ok(())
+    }
+
     fn corruption(message: impl Into<String>) -> GoatError {
         GoatError::corruption("sstable_reader", message.into())
     }
@@ -129,7 +164,7 @@ impl SSTableReader {
         block_cache: Option<Arc<BlockCache>>,
     ) -> GoatResult<Self> {
         let path_ref = path.as_ref();
-        let mut file = File::open(path_ref).map_err(|e| GoatError::io("sstable_open", e))?;
+        let file = File::open(path_ref).map_err(|e| GoatError::io("sstable_open", e))?;
 
         // 1. 读取文件大小
         let file_size = file
@@ -143,11 +178,9 @@ impl SSTableReader {
         }
 
         // 2. 读取最后的 FOOTER_SIZE 字节
-        file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))
-            .map_err(|e| GoatError::io("sstable_seek_footer", e))?;
+        let footer_offset = file_size - FOOTER_SIZE as u64;
         let mut footer = vec![0u8; FOOTER_SIZE];
-        file.read_exact(&mut footer)
-            .map_err(|e| GoatError::io("sstable_read_footer", e))?;
+        Self::read_exact_at(&file, footer_offset, &mut footer, "sstable_read_footer")?;
 
         // 3. 首先验证 Magic Number（最后8字节）
         let magic_bytes = &footer[footer.len() - 8..];
@@ -233,13 +266,10 @@ impl SSTableReader {
         }
 
         // 5. 读取 BloomFilter
-        file.seek(SeekFrom::Start(bloom_offset))
-            .map_err(|e| GoatError::io("sstable_seek_bloom", e))?;
         // BloomFilter 的大小是 index_offset - bloom_offset
         let bloom_filter_size = index_offset - bloom_offset;
         let mut bloom_bitmap = vec![0u8; bloom_filter_size as usize];
-        file.read_exact(&mut bloom_bitmap)
-            .map_err(|e| GoatError::io("sstable_read_bloom", e))?;
+        Self::read_exact_at(&file, bloom_offset, &mut bloom_bitmap, "sstable_read_bloom")?;
         let bloom_filter = super::bloom::BloomFilter::new(bloom_bitmap);
 
         // 6. 读取和解析索引块
@@ -264,11 +294,13 @@ impl SSTableReader {
             ));
         }
 
-        file.seek(SeekFrom::Start(index_block_start))
-            .map_err(|e| GoatError::io("sstable_seek_index", e))?;
         let mut index_block_data_with_checksum = vec![0u8; index_block_size as usize];
-        file.read_exact(&mut index_block_data_with_checksum)
-            .map_err(|e| GoatError::io("sstable_read_index", e))?;
+        Self::read_exact_at(
+            &file,
+            index_block_start,
+            &mut index_block_data_with_checksum,
+            "sstable_read_index",
+        )?;
         let index_block_data =
             Self::verify_block_checksum(&index_block_data_with_checksum, "index block")?;
 
@@ -331,7 +363,7 @@ impl SSTableReader {
         Ok(Self {
             file_path: path_ref.to_string_lossy().to_string(),
             file_id,
-            file: Mutex::new(file),
+            file,
             bloom_filter,
             index_entries,
             block_cache,
@@ -344,12 +376,13 @@ impl SSTableReader {
     }
 
     fn read_block_from_file(&self, block_offset: u64, block_size: u64) -> GoatResult<Vec<u8>> {
-        let mut file = self.file.lock().unwrap();
-        file.seek(SeekFrom::Start(block_offset))
-            .map_err(|e| GoatError::io("sstable_seek_data_block", e))?;
         let mut block_data = vec![0u8; block_size as usize];
-        file.read_exact(&mut block_data)
-            .map_err(|e| GoatError::io("sstable_read_data_block", e))?;
+        Self::read_exact_at(
+            &self.file,
+            block_offset,
+            &mut block_data,
+            "sstable_read_data_block",
+        )?;
         Ok(block_data)
     }
 
@@ -403,26 +436,8 @@ impl SSTableReader {
             }
         };
 
-        // Iterate block looking for UserKey match
-        for (k, v) in block_reader.iter() {
-            // k is InternalKey bytes.
-            if k.len() < 8 {
-                continue;
-            }
-            let user_key_part = &k[..k.len() - 8];
-
-            // Compare User Key
-            match user_key_part.cmp(key) {
-                Ordering::Less => continue, // Keep looking
-                Ordering::Equal => {
-                    // Found match! First match is newest version.
-                    return Ok(Some((Self::decode_internal_key(&k)?, v)));
-                }
-                Ordering::Greater => {
-                    // Moved past target user key
-                    return Ok(None);
-                }
-            }
+        if let Some((raw_internal_key, value)) = block_reader.get_by_user_key(key) {
+            return Ok(Some((Self::decode_internal_key(&raw_internal_key)?, value)));
         }
 
         Ok(None)

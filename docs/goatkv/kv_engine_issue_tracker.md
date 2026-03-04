@@ -19,6 +19,7 @@
 - 2026-03-04：完成 `P0-FLUSH-FAILURE-IMMUTABLE-BACKLOG-UNBOUNDED` 修复与回归，`cargo test` 与 `cargo clippy --all-targets --all-features -- -D warnings` 通过。
 - 2026-03-04：完成 `P0-TRANSPORT-SECURITY-AUTH-MISSING` 修复与回归，新增 server TLS/mTLS 选项、token 鉴权拦截器与 README 安全部署说明；`cargo test` 与 `cargo clippy --all-targets --all-features -- -D warnings` 通过。
 - 2026-03-04：完成 `P1-TABLE-BLOCK-CACHE-MISSING` 修复与回归，新增可配置 table/block cache、缓存指标快照与热点读基准命令；`cargo test` 与 `cargo clippy --all-targets --all-features -- -D warnings` 通过。
+- 2026-03-04：完成 RocksDB 对齐差距评审，新增 7 个待修复项：`P1-WRITE-STALL-BY-COMPACTION-PRESSURE`、`P1-PREFIX-BLOOM-PARTITIONED-FILTER`、`P1-READAHEAD-ITERATOR-OPT`、`P1-MULTIGET-BATCH-READ-PATH`、`P1-PARALLEL-COMPACTION-SUBCOMPACTION`、`P1-PER-LEVEL-COMPRESSION`、`P2-WAL-PREALLOC-BYTES-PER-SYNC`。
 
 ## 问题清单
 
@@ -449,6 +450,84 @@
     - 给出升级/回滚策略文档（forward/backward compatibility）。
     - 增加跨版本读写兼容测试。
 
+- [ ] `P1-WRITE-STALL-BY-COMPACTION-PRESSURE`
+  - 现象：当前写入背压主要基于 WAL/Mem 队列与 immutable backlog，缺少基于 `L0` 文件数和 compaction debt 的分级限速/停写策略。
+  - 影响：高写入+compaction 落后时，可能出现 L0 快速膨胀、读放大恶化、尾延迟抖动，且恢复速度不可预测。
+  - 代码定位：
+    - `src/goatkv/core/kv_engine/writer.rs:244`
+    - `src/goatkv/core/kv_engine/writer.rs:733`
+    - `src/goatkv/core/kv_engine/writer.rs:751`
+    - `src/goatkv/core/lsm_state.rs:18`
+  - 验收标准：
+    - 增加 `L0` 与 pending compaction bytes 维度的 slowdown/stop 两级策略。
+    - 将阈值纳入配置并提供默认值与边界校验。
+    - 压测下 L0 与写延迟保持有界，策略触发可观测。
+
+- [ ] `P1-PREFIX-BLOOM-PARTITIONED-FILTER`
+  - 现象：当前 BloomFilter 为单体 bitmap，且未引入 prefix extractor/partitioned filter-index。
+  - 影响：点查 miss 与高扇出查询下，过滤效率与缓存局部性弱于 RocksDB 常见配置。
+  - 代码定位：
+    - `src/goatkv/storage/sstable/bloom.rs:5`
+    - `src/goatkv/storage/sstable/builder.rs:186`
+    - `src/goatkv/storage/sstable/builder.rs:390`
+    - `src/goatkv/storage/sstable/reader.rs:273`
+  - 验收标准：
+    - 支持可配置 prefix extractor 与 prefix bloom。
+    - 支持 partitioned filter/index，避免一次加载整段过滤器。
+    - 增加误报率与点查基准，验证 miss 路径 I/O 降低。
+
+- [ ] `P1-READAHEAD-ITERATOR-OPT`
+  - 现象：SSTable 迭代读取仍按块同步拉取，缺少 readahead/prefetch 机制和顺序扫描专项优化。
+  - 影响：范围扫描与混合负载下系统调用与随机 I/O 偏高，吞吐受限。
+  - 代码定位：
+    - `src/goatkv/storage/sstable/reader.rs:378`
+    - `src/goatkv/storage/sstable/reader.rs:386`
+    - `src/goatkv/storage/sstable/reader.rs:463`
+    - `src/goatkv/storage/sstable/reader.rs:529`
+  - 验收标准：
+    - 引入扫描路径 readahead/prefetch 策略（可配阈值）。
+    - 减少顺序扫描中的重复 decode/读取开销。
+    - scan benchmark 吞吐提升且点查延迟不回退。
+
+- [ ] `P1-MULTIGET-BATCH-READ-PATH`
+  - 现象：对外接口与内部读路径以单 key 查询为主，缺少 MultiGet 批量探测/复用路径。
+  - 影响：批量读场景重复 table/block probe 成本高，吞吐与 CPU 利用率偏低。
+  - 代码定位：
+    - `proto/goatkv.proto:4`
+    - `proto/goatkv.proto:5`
+    - `src/goatkv/metadata/version.rs:130`
+    - `src/goatkv/storage/sstable/reader.rs:409`
+  - 验收标准：
+    - 增加 MultiGet API 与引擎批量读入口。
+    - 批量路径复用 table/block cache probe 与文件打开结果。
+    - 增加 batch size 梯度基准，验证吞吐提升。
+
+- [ ] `P1-PARALLEL-COMPACTION-SUBCOMPACTION`
+  - 现象：当前 compaction 由单线程循环串行执行，未支持 subcompaction 并行拆分。
+  - 影响：大 compaction debt 时后台追赶速度不足，易形成写放大与读放大叠加。
+  - 代码定位：
+    - `src/goatkv/core/flush_worker.rs:154`
+    - `src/goatkv/core/flush_worker.rs:360`
+    - `src/goatkv/core/flush_worker.rs:415`
+    - `src/goatkv/core/flush_worker.rs:681`
+  - 验收标准：
+    - 支持按 key range 切片并行执行 subcompaction。
+    - 保证输出文件范围不重叠且 VersionEdit 提交一致。
+    - 在高写入压测下 compaction backlog 能持续下降。
+
+- [ ] `P1-PER-LEVEL-COMPRESSION`
+  - 现象：SSTable 数据块当前未支持按层压缩策略（如 LZ4/ZSTD/Snappy）。
+  - 影响：磁盘占用与读 I/O 放大偏高，难以针对冷热层级做空间/CPU 权衡。
+  - 代码定位：
+    - `src/goatkv/storage/sstable/builder.rs:313`
+    - `src/goatkv/storage/sstable/reader.rs:386`
+    - `src/goatkv/utils/options.rs:31`
+    - `src/goatkv/metadata/version_set.rs:141`
+  - 验收标准：
+    - 支持 per-level compression 配置并持久化格式标记。
+    - 读取路径兼容解压并保留校验逻辑。
+    - 给出空间占用/读延迟基准对比。
+
 ### P2（工程质量）
 
 - [x] `P2-CLIPPY-TOO-MANY-ARGS`
@@ -497,13 +576,33 @@
     - 为 `unsafe` 代码块补充不变量注释与审计清单。
     - 增加长稳压测用例并纳入 CI 的周期性任务。
 
+- [ ] `P2-WAL-PREALLOC-BYTES-PER-SYNC`
+  - 现象：WAL 写入缺少预分配与 `bytes_per_sync` 类节流参数，当前批次写入后通常直接 flush/sync。
+  - 影响：高吞吐写入下 fsync 抖动与文件扩容碎片化风险较高，尾延迟不稳定。
+  - 代码定位：
+    - `src/goatkv/storage/wal/writer.rs:17`
+    - `src/goatkv/storage/wal/writer.rs:89`
+    - `src/goatkv/storage/wal/writer.rs:125`
+    - `src/goatkv/storage/wal/writer.rs:131`
+  - 验收标准：
+    - 增加 WAL 预分配与 `bytes_per_sync` 参数配置。
+    - 增加周期性 sync 策略并验证崩溃恢复正确性不回退。
+    - 压测下写入尾延迟波动收敛。
+
 ## 建议修复顺序
 
-1. `P1-OBSERVABILITY-HEALTH-GAP`
-2. `P1-COMPACTION-POLICY-HARDCODED`
-3. `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
+1. `P1-COMPACTION-POLICY-HARDCODED`
+2. `P1-WRITE-STALL-BY-COMPACTION-PRESSURE`
+3. `P1-OBSERVABILITY-HEALTH-GAP`
 4. `P1-ONDISK-FORMAT-VERSIONING-GAP`
-5. `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
+5. `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
+6. `P1-PREFIX-BLOOM-PARTITIONED-FILTER`
+7. `P1-READAHEAD-ITERATOR-OPT`
+8. `P1-MULTIGET-BATCH-READ-PATH`
+9. `P1-PARALLEL-COMPACTION-SUBCOMPACTION`
+10. `P1-PER-LEVEL-COMPRESSION`
+11. `P2-WAL-PREALLOC-BYTES-PER-SYNC`
+12. `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
 
 ## 逐项关闭记录（执行时填写）
 
