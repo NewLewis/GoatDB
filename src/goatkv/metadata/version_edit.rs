@@ -119,6 +119,11 @@ impl VersionEdit {
         self.deleted_files.insert((level, file_id));
     }
 
+    // 更新某一层的 compaction pointer（记录下一次优先开始的 user key）
+    pub fn set_compact_pointer(&mut self, level: Level, key: Vec<u8>) {
+        self.compact_pointers.push((level, key));
+    }
+
     // 记录新生成的文件
     // 注意：这里传入 FileMetadata，通常在 Compaction 完成后构建
     pub fn add_file(&mut self, level: Level, file: NewFile) {

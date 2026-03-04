@@ -952,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn test_l0_compacts_to_l1_when_l0_exceeds_threshold() {
+    fn test_l0_compacts_to_base_level_when_l0_exceeds_threshold() {
         let rt = test_runtime();
         let _guard = rt.enter();
         let engine = KvEngine::new_for_test();
@@ -969,18 +969,70 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            let (l0_len, l1_len) = {
+            let (l0_len, non_l0_file_count) = {
                 let vs = engine.version_set.read().unwrap();
                 let v = vs.current();
-                (v.get_files(0).len(), v.get_files(1).len())
+                let non_l0_file_count = (1..v.num_levels())
+                    .map(|level| v.get_files(level).len())
+                    .sum::<usize>();
+                (v.get_files(0).len(), non_l0_file_count)
             };
-            if l0_len <= 4 && l1_len > 0 {
+            if l0_len <= 4 && non_l0_file_count > 0 {
                 break;
             }
             if Instant::now() >= deadline {
-                panic!("timeout waiting compaction: l0={}, l1={}", l0_len, l1_len);
+                panic!(
+                    "timeout waiting base-level compaction: l0={}, non_l0_files={}",
+                    l0_len, non_l0_file_count
+                );
             }
             thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn test_compaction_cascades_to_l2_when_l1_exceeds_threshold() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        let big_value = vec![b'v'; 16 * 1024];
+        let total = 25usize;
+        for i in 0..total {
+            engine
+                .put(format!("cascade_k{:02}", i).into_bytes(), big_value.clone())
+                .unwrap();
+            engine.flush();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (l0_len, l1_len, l2_len) = {
+                let vs = engine.version_set.read().unwrap();
+                let v = vs.current();
+                (
+                    v.get_files(0).len(),
+                    v.get_files(1).len(),
+                    v.get_files(2).len(),
+                )
+            };
+            if l0_len <= 4 && l1_len <= 4 && l2_len > 0 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timeout waiting multi-level compaction: l0={}, l1={}, l2={}",
+                    l0_len, l1_len, l2_len
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        for i in 0..total {
+            let key = format!("cascade_k{:02}", i).into_bytes();
+            let expected = big_value.clone();
+            let got = engine.get(&key).unwrap();
+            assert_eq!(got, Some(expected), "value mismatch for key {}", i);
         }
     }
 }

@@ -78,6 +78,8 @@ pub struct VersionSet {
     /// - 保证 MVCC 语义下的单调序列号；
     /// - 用于恢复与读路径可见性判断。
     last_sequence: u64,
+    /// 每层 compaction pointer（记录下一次优先开始的 user key）
+    compact_pointers: Vec<Option<Vec<u8>>>,
 
     /// 待物理删除的文件列表。
     /// 建议直接存 FileMetadata 或 file_number。
@@ -161,6 +163,7 @@ impl VersionSet {
             log_number: 0,
             next_file_number: 1,
             last_sequence: 0,
+            compact_pointers: vec![None; options.num_levels],
             obsolete_sender,
             manifest_paths,
             sstable_paths,
@@ -479,6 +482,7 @@ impl VersionSet {
         if let Some(last_seq) = edit.last_sequence {
             self.last_sequence = last_seq;
         }
+        self.apply_compact_pointers(&edit)?;
 
         // 4. 基于 edit 创建新的 Version（不可变快照）
         //
@@ -503,6 +507,8 @@ impl VersionSet {
 
     /// 验证 VersionEdit 的合法性
     fn validate_edit(&self, edit: &VersionEdit) -> GoatResult<()> {
+        let mut seen_new_file_ids = std::collections::HashSet::new();
+
         // 检查删除的文件是否存在
         for (level, file_num) in &edit.deleted_files {
             if !self.contains_file(*level, *file_num) {
@@ -518,6 +524,13 @@ impl VersionSet {
 
         // 检查新增文件的 ID 是否有效
         for (level, new_file) in &edit.new_files {
+            if !seen_new_file_ids.insert(new_file.file_id) {
+                return Err(GoatError::conflict(
+                    "version_edit",
+                    format!("Duplicate new file id {} in one edit", new_file.file_id),
+                ));
+            }
+
             if *level >= self.options.num_levels {
                 return Err(GoatError::conflict(
                     "version_edit",
@@ -526,7 +539,11 @@ impl VersionSet {
             }
 
             // 检查文件 ID 是否已被使用
-            if self.contains_file_any_level(new_file.file_id) {
+            let reused_after_delete = edit
+                .deleted_files
+                .iter()
+                .any(|(_, deleted_id)| *deleted_id == new_file.file_id);
+            if self.contains_file_any_level(new_file.file_id) && !reused_after_delete {
                 return Err(GoatError::conflict(
                     "version_edit",
                     format!("File ID {} already exists", new_file.file_id),
@@ -542,6 +559,18 @@ impl VersionSet {
             }
         }
 
+        for (level, _) in &edit.compact_pointers {
+            if *level >= self.options.num_levels {
+                return Err(GoatError::conflict(
+                    "version_edit",
+                    format!(
+                        "Invalid compact pointer level {} (max {})",
+                        level, self.options.num_levels
+                    ),
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -550,6 +579,8 @@ impl VersionSet {
         edit: &VersionEdit,
         files: &[Vec<Arc<FileMetadata>>],
     ) -> GoatResult<()> {
+        let mut seen_new_file_ids = std::collections::HashSet::new();
+
         for (level, file_num) in &edit.deleted_files {
             if !Self::contains_file_in_files(files, *level, *file_num) {
                 return Err(GoatError::conflict(
@@ -563,6 +594,13 @@ impl VersionSet {
         }
 
         for (level, new_file) in &edit.new_files {
+            if !seen_new_file_ids.insert(new_file.file_id) {
+                return Err(GoatError::conflict(
+                    "version_edit",
+                    format!("Duplicate new file id {} in one edit", new_file.file_id),
+                ));
+            }
+
             if *level >= self.options.num_levels {
                 return Err(GoatError::conflict(
                     "version_edit",
@@ -570,7 +608,13 @@ impl VersionSet {
                 ));
             }
 
-            if Self::contains_file_any_level_in_files(files, new_file.file_id) {
+            let reused_after_delete = edit
+                .deleted_files
+                .iter()
+                .any(|(_, deleted_id)| *deleted_id == new_file.file_id);
+            if Self::contains_file_any_level_in_files(files, new_file.file_id)
+                && !reused_after_delete
+            {
                 return Err(GoatError::conflict(
                     "version_edit",
                     format!("File ID {} already exists", new_file.file_id),
@@ -581,6 +625,18 @@ impl VersionSet {
                 return Err(GoatError::conflict(
                     "version_edit",
                     "Invalid key range: smallest > largest",
+                ));
+            }
+        }
+
+        for (level, _) in &edit.compact_pointers {
+            if *level >= self.options.num_levels {
+                return Err(GoatError::conflict(
+                    "version_edit",
+                    format!(
+                        "Invalid compact pointer level {} (max {})",
+                        level, self.options.num_levels
+                    ),
                 ));
             }
         }
@@ -720,6 +776,11 @@ impl VersionSet {
         edit.set_log_number(self.log_number);
         edit.set_next_file_number(self.next_file_number);
         edit.set_last_sequence(self.last_sequence);
+        for (level, key) in self.compact_pointers.iter().enumerate() {
+            if let Some(key) = key {
+                edit.compact_pointers.push((level, key.clone()));
+            }
+        }
         for (level, file) in self.current.all_files() {
             edit.add_file(
                 level,
@@ -768,6 +829,7 @@ impl VersionSet {
         if let Some(last_seq) = edit.last_sequence {
             self.last_sequence = last_seq;
         }
+        self.apply_compact_pointers(&edit)?;
 
         for (level, file_num) in edit.deleted_files {
             if level < files.len() {
@@ -840,5 +902,32 @@ impl VersionSet {
     /// 获取最后序列号
     pub fn last_sequence(&self) -> u64 {
         self.last_sequence
+    }
+
+    /// 获取某层 compaction pointer（user key）
+    pub fn compact_pointer(&self, level: usize) -> Option<Vec<u8>> {
+        self.compact_pointers.get(level).and_then(|k| k.clone())
+    }
+
+    /// 获取 compaction pointers 快照
+    pub fn compact_pointers_snapshot(&self) -> Vec<Option<Vec<u8>>> {
+        self.compact_pointers.clone()
+    }
+
+    fn apply_compact_pointers(&mut self, edit: &VersionEdit) -> GoatResult<()> {
+        for (level, key) in &edit.compact_pointers {
+            if *level >= self.compact_pointers.len() {
+                return Err(GoatError::conflict(
+                    "version_edit",
+                    format!(
+                        "Invalid compact pointer level {} (max {})",
+                        level,
+                        self.compact_pointers.len()
+                    ),
+                ));
+            }
+            self.compact_pointers[*level] = Some(key.clone());
+        }
+        Ok(())
     }
 }

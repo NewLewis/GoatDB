@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -41,6 +42,30 @@ pub struct SSTableReader {
 impl SSTableReader {
     fn corruption(message: impl Into<String>) -> GoatError {
         GoatError::corruption("sstable_reader", message.into())
+    }
+
+    fn decode_internal_key(raw_key: &[u8]) -> GoatResult<InternalKey> {
+        if raw_key.len() < 8 {
+            return Err(Self::corruption(
+                "invalid internal key length in data block",
+            ));
+        }
+        let n = raw_key.len();
+        let inverted = u64::from_be_bytes([
+            raw_key[n - 8],
+            raw_key[n - 7],
+            raw_key[n - 6],
+            raw_key[n - 5],
+            raw_key[n - 4],
+            raw_key[n - 3],
+            raw_key[n - 2],
+            raw_key[n - 1],
+        ]);
+        let encoded = !inverted;
+        let key = InternalKey::from_encoded(raw_key[..n - 8].to_vec(), encoded);
+        key.kind()
+            .map_err(|e| Self::corruption(format!("invalid internal key kind: {}", e)))?;
+        Ok(key)
     }
 
     /// 打开并解析 SSTable 文件
@@ -303,26 +328,7 @@ impl SSTableReader {
                 Ordering::Less => continue, // Keep looking
                 Ordering::Equal => {
                     // Found match! First match is newest version.
-                    // Check kind
-                    let be_bytes = [
-                        k[k.len() - 8],
-                        k[k.len() - 7],
-                        k[k.len() - 6],
-                        k[k.len() - 5],
-                        k[k.len() - 4],
-                        k[k.len() - 3],
-                        k[k.len() - 2],
-                        k[k.len() - 1],
-                    ];
-                    // 1. Decode Big Endian
-                    let inverted_seq = u64::from_be_bytes(be_bytes);
-                    // 2. Invert back to get real encoded seq
-                    let encoded_seq = !inverted_seq;
-
-                    return Ok(Some((
-                        InternalKey::from_encoded(user_key_part.to_vec(), encoded_seq),
-                        v,
-                    )));
+                    return Ok(Some((Self::decode_internal_key(&k)?, v)));
                 }
                 Ordering::Greater => {
                     // Moved past target user key
@@ -349,27 +355,15 @@ impl SSTableReader {
                 Self::corruption(format!("Failed to parse data block during scan: {}", e))
             })?;
             for (k, v) in block_reader.iter() {
-                if k.len() < 8 {
-                    return Err(Self::corruption(
-                        "invalid internal key length in data block",
-                    ));
-                }
-                let n = k.len();
-                let inverted = u64::from_be_bytes([
-                    k[n - 8],
-                    k[n - 7],
-                    k[n - 6],
-                    k[n - 5],
-                    k[n - 4],
-                    k[n - 3],
-                    k[n - 2],
-                    k[n - 1],
-                ]);
-                let encoded = !inverted;
-                entries.push((InternalKey::from_encoded(k[..n - 8].to_vec(), encoded), v));
+                entries.push((Self::decode_internal_key(&k)?, v));
             }
         }
         Ok(entries)
+    }
+
+    /// Convert reader into a streaming iterator that yields entries block by block.
+    pub fn into_scan_iterator(self) -> SSTableScanIterator {
+        SSTableScanIterator::new(self)
     }
 
     /// 查找包含指定 key 的数据块
@@ -419,12 +413,62 @@ impl SSTableReader {
     }
 }
 
+pub struct SSTableScanIterator {
+    reader: SSTableReader,
+    block_index: usize,
+    pending_entries: VecDeque<(InternalKey, Vec<u8>)>,
+}
+
+impl SSTableScanIterator {
+    fn new(reader: SSTableReader) -> Self {
+        Self {
+            reader,
+            block_index: 0,
+            pending_entries: VecDeque::new(),
+        }
+    }
+
+    pub fn next_entry(&mut self) -> GoatResult<Option<(InternalKey, Vec<u8>)>> {
+        loop {
+            if let Some(entry) = self.pending_entries.pop_front() {
+                return Ok(Some(entry));
+            }
+
+            if self.block_index >= self.reader.index_entries.len() {
+                return Ok(None);
+            }
+
+            let entry = &self.reader.index_entries[self.block_index];
+            self.reader
+                .file
+                .seek(SeekFrom::Start(entry.block_offset))
+                .map_err(|e| GoatError::io("sstable_seek_scan_block", e))?;
+            let mut block_data = vec![0u8; entry.block_size as usize];
+            self.reader
+                .file
+                .read_exact(&mut block_data)
+                .map_err(|e| GoatError::io("sstable_read_scan_block", e))?;
+            let block_reader = BlockReader::new(&block_data).map_err(|e| {
+                SSTableReader::corruption(format!("Failed to parse data block during scan: {}", e))
+            })?;
+
+            self.pending_entries.clear();
+            for (k, v) in block_reader.iter() {
+                self.pending_entries
+                    .push_back((SSTableReader::decode_internal_key(&k)?, v));
+            }
+            self.block_index += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::goatkv::core::kv_engine::KvEngine;
     use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
     use crate::goatkv::storage::sstable::SSTableBuilder;
+    use crate::goatkv::ErrorKind;
     use std::io::Write;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -628,5 +672,26 @@ mod tests {
 
         let reader = SSTableReader::open(&file_path);
         assert!(reader.is_err());
+    }
+
+    #[test]
+    fn test_sstable_reader_reports_invalid_internal_key_kind() {
+        let temp_dir = TempDir::new().unwrap();
+        let (_, sstable_paths, _) = KvEngine::init_db_paths(temp_dir.path()).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &sstable_paths).unwrap();
+
+        let mut raw_key = b"bad_kind".to_vec();
+        let encoded_sequence_with_invalid_kind = (42u64 << 8) | 2u64;
+        raw_key.extend_from_slice(&(!encoded_sequence_with_invalid_kind).to_be_bytes());
+        builder.write(&raw_key, b"value").unwrap();
+        builder.finish().unwrap();
+
+        let sst_path = sstable_paths.sstable_path_by_id(1);
+        let mut reader = SSTableReader::open(&sst_path).unwrap();
+        let err = reader
+            .get(b"bad_kind")
+            .expect_err("invalid kind should be reported as corruption");
+        assert_eq!(err.kind(), ErrorKind::Corruption);
+        assert!(err.to_string().contains("invalid internal key kind"));
     }
 }
