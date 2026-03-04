@@ -7,6 +7,10 @@ use crate::goatkv::error::Result as GoatResult;
 
 use super::reader::SSTableReader;
 
+const TABLE_CACHE_MAX_SHARDS: usize = 16;
+const BLOCK_CACHE_MAX_SHARDS: usize = 16;
+const MIN_BLOCK_BYTES_PER_SHARD: usize = 64 * 1024;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReadCacheMetrics {
     pub table_hits: u64,
@@ -20,7 +24,8 @@ pub struct ReadCacheMetrics {
 #[derive(Debug)]
 pub struct TableCache {
     capacity: usize,
-    state: Mutex<TableCacheState>,
+    shards: Vec<Mutex<TableCacheState>>,
+    shard_capacities: Vec<usize>,
     block_cache: Arc<BlockCache>,
     table_hits: AtomicU64,
     table_misses: AtomicU64,
@@ -29,40 +34,145 @@ pub struct TableCache {
 
 #[derive(Debug, Default)]
 struct TableCacheState {
-    clock: u64,
     entries: HashMap<u64, TableCacheEntry>,
+    clock_keys: Vec<u64>,
+    hand: usize,
 }
 
 #[derive(Debug, Clone)]
 struct TableCacheEntry {
     reader: Arc<SSTableReader>,
-    last_access: u64,
+    referenced: bool,
+    hot: bool,
 }
 
 impl TableCacheState {
-    fn touch(&mut self) -> u64 {
-        self.clock = self.clock.saturating_add(1);
-        self.clock
+    fn mark_hit(&mut self, file_id: u64) -> Option<Arc<SSTableReader>> {
+        let entry = self.entries.get_mut(&file_id)?;
+        entry.referenced = true;
+        entry.hot = true;
+        Some(entry.reader.clone())
     }
 
-    fn evict_lru_file_id(&self) -> Option<u64> {
-        self.entries
-            .iter()
-            .min_by_key(|(_, entry)| entry.last_access)
-            .map(|(file_id, _)| *file_id)
+    fn insert_new(&mut self, file_id: u64, reader: Arc<SSTableReader>) {
+        self.entries.insert(
+            file_id,
+            TableCacheEntry {
+                reader,
+                referenced: true,
+                // 新条目先按 cold 处理，避免“永久热”占位。
+                hot: false,
+            },
+        );
+        self.clock_keys.push(file_id);
+    }
+
+    fn advance_hand(&mut self) {
+        if self.clock_keys.is_empty() {
+            self.hand = 0;
+        } else {
+            self.hand = (self.hand + 1) % self.clock_keys.len();
+        }
+    }
+
+    fn remove_hand_slot(&mut self) {
+        if self.clock_keys.is_empty() {
+            self.hand = 0;
+            return;
+        }
+        self.clock_keys.swap_remove(self.hand);
+        if self.hand >= self.clock_keys.len() && !self.clock_keys.is_empty() {
+            self.hand = 0;
+        }
+    }
+
+    fn evict_one(&mut self) -> Option<u64> {
+        if self.entries.is_empty() {
+            return None;
+        }
+
+        // HyperClock 风格：referenced -> 清引用；hot -> 降级为 cold；cold 且未引用 -> 淘汰。
+        let max_scan = self.clock_keys.len().saturating_mul(3).max(1);
+        for _ in 0..max_scan {
+            if self.clock_keys.is_empty() {
+                return None;
+            }
+            if self.hand >= self.clock_keys.len() {
+                self.hand = 0;
+            }
+            let file_id = self.clock_keys[self.hand];
+            let mut should_evict = false;
+            let mut missing = false;
+
+            match self.entries.get_mut(&file_id) {
+                Some(entry) => {
+                    if entry.referenced {
+                        entry.referenced = false;
+                        self.advance_hand();
+                    } else if entry.hot {
+                        entry.hot = false;
+                        self.advance_hand();
+                    } else {
+                        should_evict = true;
+                    }
+                }
+                None => {
+                    missing = true;
+                }
+            }
+
+            if missing {
+                self.remove_hand_slot();
+                continue;
+            }
+
+            if should_evict {
+                self.entries.remove(&file_id);
+                self.remove_hand_slot();
+                return Some(file_id);
+            }
+        }
+
+        // 兜底：强制回收一个条目，保证容量约束可收敛。
+        while !self.clock_keys.is_empty() {
+            if self.hand >= self.clock_keys.len() {
+                self.hand = 0;
+            }
+            let file_id = self.clock_keys[self.hand];
+            self.remove_hand_slot();
+            if self.entries.remove(&file_id).is_some() {
+                return Some(file_id);
+            }
+        }
+        None
     }
 }
 
 impl TableCache {
     pub fn new(capacity: usize, block_cache_capacity_bytes: usize) -> Self {
+        let table_shard_count = if capacity == 0 {
+            1
+        } else {
+            capacity.clamp(1, TABLE_CACHE_MAX_SHARDS)
+        };
+        let shard_capacities = split_capacity(capacity, table_shard_count);
+        let shards = (0..table_shard_count)
+            .map(|_| Mutex::new(TableCacheState::default()))
+            .collect();
+
         Self {
             capacity,
-            state: Mutex::new(TableCacheState::default()),
+            shards,
+            shard_capacities,
             block_cache: Arc::new(BlockCache::new(block_cache_capacity_bytes)),
             table_hits: AtomicU64::new(0),
             table_misses: AtomicU64::new(0),
             table_evictions: AtomicU64::new(0),
         }
+    }
+
+    fn table_shard_index(&self, file_id: u64) -> usize {
+        shard_index_from_u64(file_id, self.shards.len())
     }
 
     pub fn get_or_open<P: AsRef<Path>>(
@@ -71,12 +181,13 @@ impl TableCache {
         path: P,
     ) -> GoatResult<Arc<SSTableReader>> {
         if self.capacity > 0 {
-            let mut state = self.state.lock().unwrap();
-            let access = state.touch();
-            if let Some(entry) = state.entries.get_mut(&file_id) {
-                entry.last_access = access;
-                self.table_hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(entry.reader.clone());
+            let shard_idx = self.table_shard_index(file_id);
+            if self.shard_capacities[shard_idx] > 0 {
+                let mut state = self.shards[shard_idx].lock().unwrap();
+                if let Some(reader) = state.mark_hit(file_id) {
+                    self.table_hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(reader);
+                }
             }
         }
 
@@ -92,31 +203,24 @@ impl TableCache {
             return Ok(opened);
         }
 
-        let mut state = self.state.lock().unwrap();
-        let access = state.touch();
-        if let Some(entry) = state.entries.get_mut(&file_id) {
-            entry.last_access = access;
-            self.table_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(entry.reader.clone());
+        let shard_idx = self.table_shard_index(file_id);
+        let shard_capacity = self.shard_capacities[shard_idx];
+        if shard_capacity == 0 {
+            return Ok(opened);
         }
 
-        state.entries.insert(
-            file_id,
-            TableCacheEntry {
-                reader: opened.clone(),
-                last_access: access,
-            },
-        );
+        let mut state = self.shards[shard_idx].lock().unwrap();
+        if let Some(reader) = state.mark_hit(file_id) {
+            self.table_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(reader);
+        }
 
-        while state.entries.len() > self.capacity {
-            let Some(victim) = state.evict_lru_file_id() else {
-                break;
-            };
-            if state.entries.remove(&victim).is_some() {
-                self.table_evictions.fetch_add(1, Ordering::Relaxed);
-            } else {
+        state.insert_new(file_id, opened.clone());
+        while state.entries.len() > shard_capacity {
+            if state.evict_one().is_none() {
                 break;
             }
+            self.table_evictions.fetch_add(1, Ordering::Relaxed);
         }
 
         Ok(opened)
@@ -138,7 +242,8 @@ impl TableCache {
 #[derive(Debug)]
 pub(crate) struct BlockCache {
     capacity_bytes: usize,
-    state: Mutex<BlockCacheState>,
+    shards: Vec<Mutex<BlockCacheState>>,
+    shard_capacities: Vec<usize>,
     block_hits: AtomicU64,
     block_misses: AtomicU64,
     block_evictions: AtomicU64,
@@ -146,22 +251,124 @@ pub(crate) struct BlockCache {
 
 #[derive(Debug, Default)]
 struct BlockCacheState {
-    clock: u64,
     used_bytes: usize,
     entries: HashMap<BlockCacheKey, BlockCacheEntry>,
+    clock_keys: Vec<BlockCacheKey>,
+    hand: usize,
 }
 
 impl BlockCacheState {
-    fn touch(&mut self) -> u64 {
-        self.clock = self.clock.saturating_add(1);
-        self.clock
+    fn mark_hit(&mut self, key: &BlockCacheKey) -> Option<Arc<Vec<u8>>> {
+        let entry = self.entries.get_mut(key)?;
+        entry.referenced = true;
+        entry.hot = true;
+        Some(entry.payload.clone())
     }
 
-    fn evict_lru_key(&self) -> Option<BlockCacheKey> {
-        self.entries
-            .iter()
-            .min_by_key(|(_, entry)| entry.last_access)
-            .map(|(key, _)| key.clone())
+    fn insert_or_update(&mut self, key: BlockCacheKey, payload: Arc<Vec<u8>>, bytes: usize) {
+        if let Some(entry) = self.entries.get_mut(&key) {
+            self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
+            self.used_bytes = self.used_bytes.saturating_add(bytes);
+            entry.payload = payload;
+            entry.bytes = bytes;
+            entry.referenced = true;
+            entry.hot = true;
+            return;
+        }
+
+        self.used_bytes = self.used_bytes.saturating_add(bytes);
+        self.entries.insert(
+            key.clone(),
+            BlockCacheEntry {
+                payload,
+                bytes,
+                referenced: true,
+                // 新条目先按 cold 处理，避免 cache 污染。
+                hot: false,
+            },
+        );
+        self.clock_keys.push(key);
+    }
+
+    fn advance_hand(&mut self) {
+        if self.clock_keys.is_empty() {
+            self.hand = 0;
+        } else {
+            self.hand = (self.hand + 1) % self.clock_keys.len();
+        }
+    }
+
+    fn remove_hand_slot(&mut self) {
+        if self.clock_keys.is_empty() {
+            self.hand = 0;
+            return;
+        }
+        self.clock_keys.swap_remove(self.hand);
+        if self.hand >= self.clock_keys.len() && !self.clock_keys.is_empty() {
+            self.hand = 0;
+        }
+    }
+
+    fn evict_one(&mut self) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+
+        let max_scan = self.clock_keys.len().saturating_mul(3).max(1);
+        for _ in 0..max_scan {
+            if self.clock_keys.is_empty() {
+                return false;
+            }
+            if self.hand >= self.clock_keys.len() {
+                self.hand = 0;
+            }
+            let key = self.clock_keys[self.hand].clone();
+            let mut should_evict = false;
+            let mut missing = false;
+
+            match self.entries.get_mut(&key) {
+                Some(entry) => {
+                    if entry.referenced {
+                        entry.referenced = false;
+                        self.advance_hand();
+                    } else if entry.hot {
+                        entry.hot = false;
+                        self.advance_hand();
+                    } else {
+                        should_evict = true;
+                    }
+                }
+                None => {
+                    missing = true;
+                }
+            }
+
+            if missing {
+                self.remove_hand_slot();
+                continue;
+            }
+
+            if should_evict {
+                if let Some(removed) = self.entries.remove(&key) {
+                    self.used_bytes = self.used_bytes.saturating_sub(removed.bytes);
+                }
+                self.remove_hand_slot();
+                return true;
+            }
+        }
+
+        while !self.clock_keys.is_empty() {
+            if self.hand >= self.clock_keys.len() {
+                self.hand = 0;
+            }
+            let key = self.clock_keys[self.hand].clone();
+            self.remove_hand_slot();
+            if let Some(removed) = self.entries.remove(&key) {
+                self.used_bytes = self.used_bytes.saturating_sub(removed.bytes);
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -180,24 +387,45 @@ impl BlockCacheKey {
             block_size,
         }
     }
+
+    fn shard_hash(&self) -> u64 {
+        let mut x = self.file_id.rotate_left(17);
+        x ^= self.block_offset.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x ^= self.block_size.rotate_left(9);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        x ^ (x >> 33)
+    }
 }
 
 #[derive(Debug, Clone)]
 struct BlockCacheEntry {
     payload: Arc<Vec<u8>>,
     bytes: usize,
-    last_access: u64,
+    referenced: bool,
+    hot: bool,
 }
 
 impl BlockCache {
     fn new(capacity_bytes: usize) -> Self {
+        let block_shard_count = shard_count_for_bytes(capacity_bytes);
+        let shard_capacities = split_capacity(capacity_bytes, block_shard_count);
+        let shards = (0..block_shard_count)
+            .map(|_| Mutex::new(BlockCacheState::default()))
+            .collect();
+
         Self {
             capacity_bytes,
-            state: Mutex::new(BlockCacheState::default()),
+            shards,
+            shard_capacities,
             block_hits: AtomicU64::new(0),
             block_misses: AtomicU64::new(0),
             block_evictions: AtomicU64::new(0),
         }
+    }
+
+    fn shard_index(&self, key: &BlockCacheKey) -> usize {
+        shard_index_from_u64(key.shard_hash(), self.shards.len())
     }
 
     pub(crate) fn get(&self, key: &BlockCacheKey) -> Option<Arc<Vec<u8>>> {
@@ -206,12 +434,16 @@ impl BlockCache {
             return None;
         }
 
-        let mut state = self.state.lock().unwrap();
-        let access = state.touch();
-        if let Some(entry) = state.entries.get_mut(key) {
-            entry.last_access = access;
+        let shard_idx = self.shard_index(key);
+        if self.shard_capacities[shard_idx] == 0 {
+            self.block_misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
+        let mut state = self.shards[shard_idx].lock().unwrap();
+        if let Some(payload) = state.mark_hit(key) {
             self.block_hits.fetch_add(1, Ordering::Relaxed);
-            Some(entry.payload.clone())
+            Some(payload)
         } else {
             self.block_misses.fetch_add(1, Ordering::Relaxed);
             None
@@ -221,37 +453,24 @@ impl BlockCache {
     pub(crate) fn insert(&self, key: BlockCacheKey, payload: Vec<u8>) -> Arc<Vec<u8>> {
         let payload = Arc::new(payload);
         let bytes = payload.len();
-        if self.capacity_bytes == 0 || bytes > self.capacity_bytes {
+        if self.capacity_bytes == 0 {
             return payload;
         }
 
-        let mut state = self.state.lock().unwrap();
-        let access = state.touch();
-
-        if let Some(prev) = state.entries.remove(&key) {
-            state.used_bytes = state.used_bytes.saturating_sub(prev.bytes);
+        let shard_idx = self.shard_index(&key);
+        let shard_capacity = self.shard_capacities[shard_idx];
+        if shard_capacity == 0 || bytes > shard_capacity {
+            return payload;
         }
 
-        state.used_bytes = state.used_bytes.saturating_add(bytes);
-        state.entries.insert(
-            key,
-            BlockCacheEntry {
-                payload: payload.clone(),
-                bytes,
-                last_access: access,
-            },
-        );
+        let mut state = self.shards[shard_idx].lock().unwrap();
+        state.insert_or_update(key, payload.clone(), bytes);
 
-        while state.used_bytes > self.capacity_bytes {
-            let Some(victim) = state.evict_lru_key() else {
-                break;
-            };
-            if let Some(removed) = state.entries.remove(&victim) {
-                state.used_bytes = state.used_bytes.saturating_sub(removed.bytes);
-                self.block_evictions.fetch_add(1, Ordering::Relaxed);
-            } else {
+        while state.used_bytes > shard_capacity {
+            if !state.evict_one() {
                 break;
             }
+            self.block_evictions.fetch_add(1, Ordering::Relaxed);
         }
 
         payload
@@ -267,6 +486,35 @@ impl BlockCache {
             block_evictions: self.block_evictions.load(Ordering::Relaxed),
         }
     }
+}
+
+fn split_capacity(total: usize, shards: usize) -> Vec<usize> {
+    if shards == 0 {
+        return Vec::new();
+    }
+    let base = total / shards;
+    let rem = total % shards;
+    let mut caps = Vec::with_capacity(shards);
+    for i in 0..shards {
+        let extra = usize::from(i < rem);
+        caps.push(base + extra);
+    }
+    caps
+}
+
+fn shard_count_for_bytes(total_bytes: usize) -> usize {
+    if total_bytes == 0 {
+        return 1;
+    }
+    let by_size = (total_bytes / MIN_BLOCK_BYTES_PER_SHARD).max(1);
+    by_size.clamp(1, BLOCK_CACHE_MAX_SHARDS)
+}
+
+fn shard_index_from_u64(hash: u64, shard_count: usize) -> usize {
+    debug_assert!(shard_count > 0);
+    // simple 64->usize mix
+    let x = hash ^ (hash >> 33);
+    (x as usize) % shard_count
 }
 
 #[cfg(test)]
