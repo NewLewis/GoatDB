@@ -505,7 +505,9 @@ impl VersionSet {
             self.log_number = log_num;
         }
         if let Some(next_file) = edit.next_file_number {
-            self.next_file_number = next_file;
+            // 并发 flush/compaction 可能提交“过期”的 next_file_number。
+            // 这里必须单调推进，避免文件号回退后重复分配同一 file_id。
+            self.next_file_number = self.next_file_number.max(next_file);
         }
         if let Some(last_seq) = edit.last_sequence {
             self.last_sequence = last_seq;
@@ -853,7 +855,8 @@ impl VersionSet {
             self.log_number = log_num;
         }
         if let Some(next_file) = edit.next_file_number {
-            self.next_file_number = next_file;
+            // 恢复阶段同样保证单调推进，避免 MANIFEST 中过期值导致回退。
+            self.next_file_number = self.next_file_number.max(next_file);
         }
         if let Some(last_seq) = edit.last_sequence {
             self.last_sequence = last_seq;
@@ -958,5 +961,65 @@ impl VersionSet {
             self.compact_pointers[*level] = Some(key.clone());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VersionEdit, VersionSet, VersionSetOptions};
+    use crate::goatkv::core::kv_engine::KvEngine;
+    use crate::goatkv::utils::cleanup_task::CleanupTask;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    fn open_version_set(base: &std::path::Path) -> VersionSet {
+        let (_wal_paths, sstable_paths, manifest_paths) =
+            KvEngine::init_db_paths(base).expect("init db paths");
+        let (obsolete_tx, _obsolete_rx) = unbounded_channel::<CleanupTask>();
+        VersionSet::open(
+            manifest_paths,
+            sstable_paths,
+            VersionSetOptions::default(),
+            obsolete_tx,
+        )
+        .expect("open version set")
+    }
+
+    #[test]
+    fn next_file_number_never_moves_backward_on_stale_edit() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let mut version_set = open_version_set(temp_dir.path());
+
+        let mut edit_high = VersionEdit::new();
+        edit_high.set_next_file_number(32);
+        version_set.apply_edit(edit_high).expect("apply high edit");
+        assert_eq!(version_set.next_file_number(), 32);
+
+        let mut edit_stale = VersionEdit::new();
+        edit_stale.set_next_file_number(5);
+        version_set
+            .apply_edit(edit_stale)
+            .expect("apply stale edit should not roll back");
+        assert_eq!(version_set.next_file_number(), 32);
+    }
+
+    #[test]
+    fn recovery_keeps_next_file_number_monotonic_with_stale_manifest_edits() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+
+        let mut version_set = open_version_set(temp_dir.path());
+        let mut edit_high = VersionEdit::new();
+        edit_high.set_next_file_number(64);
+        version_set.apply_edit(edit_high).expect("apply high edit");
+
+        let mut edit_stale = VersionEdit::new();
+        edit_stale.set_next_file_number(7);
+        version_set
+            .apply_edit(edit_stale)
+            .expect("apply stale edit should not roll back");
+        drop(version_set);
+
+        let reopened = open_version_set(temp_dir.path());
+        assert_eq!(reopened.next_file_number(), 64);
     }
 }
