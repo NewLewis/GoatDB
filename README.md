@@ -38,6 +38,32 @@ cargo build --release
 cargo run --bin goatkv_server
 ```
 
+### Run Server with TLS/Auth
+
+```bash
+# Server-side TLS
+cargo run --bin goatkv_server -- \
+  --tls-cert-path /path/to/server.crt \
+  --tls-key-path /path/to/server.key
+
+# Optional mTLS (client cert required)
+cargo run --bin goatkv_server -- \
+  --tls-cert-path /path/to/server.crt \
+  --tls-key-path /path/to/server.key \
+  --tls-client-ca-path /path/to/clients_ca.crt
+
+# Token auth (repeatable)
+cargo run --bin goatkv_server -- \
+  --auth-token tokenA \
+  --auth-token tokenB
+```
+
+- If `--auth-token` is configured, requests must carry either:
+  - `authorization: Bearer <token>`
+  - `x-api-key: <token>`
+- `--tls-cert-path` and `--tls-key-path` must be provided together.
+- `--tls-client-ca-path` requires TLS to be enabled.
+
 ### Run Client
 
 ```bash

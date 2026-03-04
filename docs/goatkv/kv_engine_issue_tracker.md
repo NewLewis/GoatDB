@@ -17,6 +17,7 @@
 - 2026-03-04：完成生产就绪差距评审（重点覆盖数据完整性/运维可观测/安全基线/接口能力），新增 9 个待修复项：`P0-SSTABLE-BLOCK-CHECKSUM-MISSING`、`P0-FLUSH-FAILURE-IMMUTABLE-BACKLOG-UNBOUNDED`、`P0-TRANSPORT-SECURITY-AUTH-MISSING`、`P1-TABLE-BLOCK-CACHE-MISSING`、`P1-OBSERVABILITY-HEALTH-GAP`、`P1-COMPACTION-POLICY-HARDCODED`、`P1-API-SCAN-SNAPSHOT-CAS-MISSING`、`P1-ONDISK-FORMAT-VERSIONING-GAP`、`P2-UNSAFE-VALIDATION-COVERAGE-GAP`。
 - 2026-03-04：完成 `P0-SSTABLE-BLOCK-CHECKSUM-MISSING` 修复与回归，`cargo test` 全量通过。
 - 2026-03-04：完成 `P0-FLUSH-FAILURE-IMMUTABLE-BACKLOG-UNBOUNDED` 修复与回归，`cargo test` 与 `cargo clippy --all-targets --all-features -- -D warnings` 通过。
+- 2026-03-04：完成 `P0-TRANSPORT-SECURITY-AUTH-MISSING` 修复与回归，新增 server TLS/mTLS 选项、token 鉴权拦截器与 README 安全部署说明；`cargo test` 与 `cargo clippy --all-targets --all-features -- -D warnings` 通过。
 
 ## 问题清单
 
@@ -171,17 +172,25 @@
     - 2026-03-04：`KvEngineOptions` 新增可配置项 `max_immutable_memtables`、`flush_failure_streak_limit`（测试环境默认放宽 backlog 上限）。
     - 2026-03-04：新增回归 `flush_failure_streak_opens_and_success_resets_circuit`、`submit_write_fails_fast_when_immutable_backlog_reaches_limit`、`submit_write_fails_fast_when_flush_circuit_is_open`。
 
-- [ ] `P0-TRANSPORT-SECURITY-AUTH-MISSING`
+- [x] `P0-TRANSPORT-SECURITY-AUTH-MISSING`
   - 现象：gRPC 服务当前未启用 TLS/mTLS，也没有认证鉴权拦截器。
   - 影响：生产环境下存在明文传输、未授权访问与横向移动风险。
   - 代码定位：
-    - `src/bin/goatkv_server.rs:218`
-    - `src/bin/goatkv_server.rs:220`
-    - `proto/goatkv.proto:5`
+    - `src/bin/goatkv_server.rs:182`
+    - `src/bin/goatkv_server.rs:241`
+    - `src/bin/goatkv_server.rs:262`
+    - `src/bin/goatkv_server.rs:356`
+    - `README.md:42`
   - 验收标准：
     - 支持 TLS（至少 server-side TLS），并提供可选 mTLS 模式。
     - 增加统一认证/鉴权拦截层（token/API key/证书主体映射）。
     - 提供安全配置文档与回归测试（握手失败、未授权拒绝、证书轮换）。
+  - 关闭记录：
+    - 2026-03-04：`goatkv_server` 新增 `--tls-cert-path/--tls-key-path/--tls-client-ca-path`，支持 server TLS 与可选 mTLS；参数组合非法时 fail-fast 返回 `InvalidArgument`。
+    - 2026-03-04：新增认证拦截器 `authorize_request`；支持 `authorization: Bearer <token>` 与 `x-api-key`，未授权请求返回 `Unauthenticated`。
+    - 2026-03-04：`Cargo.toml` 启用 `tonic` `tls-ring` feature；README 增加 TLS/mTLS 与 token 鉴权启动示例。
+    - 2026-03-04：新增单测 `authorize_request_*` 与 `load_tls_config_*`，并通过 `cargo test --bin goatkv_server`。
+    - 2026-03-04：当前 mTLS 采用 CA 信任链校验客户端证书，尚未引入证书主体到租户/账号的细粒度映射（如有多租户需求可拆分后续 issue）。
 
 ### P1（核心能力缺口）
 
@@ -480,13 +489,12 @@
 
 ## 建议修复顺序
 
-1. `P0-TRANSPORT-SECURITY-AUTH-MISSING`
-2. `P1-TABLE-BLOCK-CACHE-MISSING`
-3. `P1-OBSERVABILITY-HEALTH-GAP`
-4. `P1-COMPACTION-POLICY-HARDCODED`
-5. `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
-6. `P1-ONDISK-FORMAT-VERSIONING-GAP`
-7. `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
+1. `P1-TABLE-BLOCK-CACHE-MISSING`
+2. `P1-OBSERVABILITY-HEALTH-GAP`
+3. `P1-COMPACTION-POLICY-HARDCODED`
+4. `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
+5. `P1-ONDISK-FORMAT-VERSIONING-GAP`
+6. `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
 
 ## 逐项关闭记录（执行时填写）
 
