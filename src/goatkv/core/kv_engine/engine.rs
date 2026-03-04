@@ -12,7 +12,7 @@ use tracing::{error, warn};
 use super::reader::KvReader;
 use super::writer::{KvWriter, WriteOp};
 use crate::goatkv::core::cleanup_worker::CleanupWorker;
-use crate::goatkv::core::flush_worker::{FlushTask, FlushWorker};
+use crate::goatkv::core::flush_worker::{CompactionConfig, FlushTask, FlushWorker};
 use crate::goatkv::core::lsm_state::{ImmutableMemTableEntry, LSMState};
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
 use crate::goatkv::core::sequence_number::SequenceNumber;
@@ -415,6 +415,13 @@ impl KvEngine {
             version_set.clone(),
             sstable_paths.clone(),
             options.flush_failure_streak_limit,
+            CompactionConfig {
+                l0_compaction_file_trigger: options.l0_compaction_file_trigger,
+                max_bytes_for_level_base: options.compaction_max_bytes_for_level_base,
+                max_bytes_for_level_multiplier: options.compaction_max_bytes_for_level_multiplier,
+                max_grandparent_overlap_bytes_factor: options
+                    .compaction_max_grandparent_overlap_bytes_factor,
+            },
         );
         let wal_writer = Arc::new(wal_writer);
         let options = Arc::new(options);

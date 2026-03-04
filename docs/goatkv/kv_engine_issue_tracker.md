@@ -20,6 +20,7 @@
 - 2026-03-04：完成 `P0-TRANSPORT-SECURITY-AUTH-MISSING` 修复与回归，新增 server TLS/mTLS 选项、token 鉴权拦截器与 README 安全部署说明；`cargo test` 与 `cargo clippy --all-targets --all-features -- -D warnings` 通过。
 - 2026-03-04：完成 `P1-TABLE-BLOCK-CACHE-MISSING` 修复与回归，新增可配置 table/block cache、缓存指标快照与热点读基准命令；`cargo test` 与 `cargo clippy --all-targets --all-features -- -D warnings` 通过。
 - 2026-03-04：完成 RocksDB 对齐差距评审，新增 7 个待修复项：`P1-WRITE-STALL-BY-COMPACTION-PRESSURE`、`P1-PREFIX-BLOOM-PARTITIONED-FILTER`、`P1-READAHEAD-ITERATOR-OPT`、`P1-MULTIGET-BATCH-READ-PATH`、`P1-PARALLEL-COMPACTION-SUBCOMPACTION`、`P1-PER-LEVEL-COMPRESSION`、`P2-WAL-PREALLOC-BYTES-PER-SYNC`。
+- 2026-03-04：完成 `P1-COMPACTION-POLICY-HARDCODED` 修复与回归，compaction 关键阈值已由 `KvEngineOptions` 配置驱动；`cargo test test_l0_compacts_to_base_level_when_l0_exceeds_threshold`、`cargo test test_compaction_cascades_to_l2_when_l1_exceeds_threshold` 通过。
 
 ## 问题清单
 
@@ -412,7 +413,7 @@
     - 增加核心指标：QPS、延迟分位数、flush/compaction backlog、错误率、队列水位。
     - 补充运维看板与告警建议阈值。
 
-- [ ] `P1-COMPACTION-POLICY-HARDCODED`
+- [x] `P1-COMPACTION-POLICY-HARDCODED`
   - 现象：compaction 触发阈值和层级大小目标仍以内嵌常量形式存在，运行时不可调。
   - 影响：不同硬件和业务负载下难以调优，可能导致写放大或读放大不受控。
   - 代码定位：
@@ -424,6 +425,11 @@
     - 将 compaction 关键策略参数纳入 `KvEngineOptions` 并支持持久配置。
     - 提供合理默认值和参数边界校验。
     - 增加回归与基准：不同配置下 compaction 收敛行为可预测。
+  - 关闭记录：
+    - 2026-03-04：新增 `KvEngineOptions` 参数 `l0_compaction_file_trigger`、`compaction_max_bytes_for_level_base`、`compaction_max_bytes_for_level_multiplier`、`compaction_max_grandparent_overlap_bytes_factor`，并提供 builder API。
+    - 2026-03-04：`FlushWorker` compaction 策略改为由 `CompactionConfig` 注入，移除对硬编码常量的依赖并增加参数归一化保护。
+    - 2026-03-04：`KvEngine` 初始化将 options 映射到 `CompactionConfig`，默认行为保持与改动前一致。
+    - 2026-03-04：回归通过 `test_l0_compacts_to_base_level_when_l0_exceeds_threshold`、`test_compaction_cascades_to_l2_when_l1_exceeds_threshold`、`test_with_l0_compaction_file_trigger`、`test_with_compaction_level_targets`。
 
 - [ ] `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
   - 现象：对外 API 仅覆盖点查点写；缺少范围扫描、快照读、条件写（CAS）等关键能力。
@@ -591,18 +597,17 @@
 
 ## 建议修复顺序
 
-1. `P1-COMPACTION-POLICY-HARDCODED`
-2. `P1-WRITE-STALL-BY-COMPACTION-PRESSURE`
-3. `P1-OBSERVABILITY-HEALTH-GAP`
-4. `P1-ONDISK-FORMAT-VERSIONING-GAP`
-5. `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
-6. `P1-PREFIX-BLOOM-PARTITIONED-FILTER`
-7. `P1-READAHEAD-ITERATOR-OPT`
-8. `P1-MULTIGET-BATCH-READ-PATH`
-9. `P1-PARALLEL-COMPACTION-SUBCOMPACTION`
-10. `P1-PER-LEVEL-COMPRESSION`
-11. `P2-WAL-PREALLOC-BYTES-PER-SYNC`
-12. `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
+1. `P1-WRITE-STALL-BY-COMPACTION-PRESSURE`
+2. `P1-OBSERVABILITY-HEALTH-GAP`
+3. `P1-ONDISK-FORMAT-VERSIONING-GAP`
+4. `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
+5. `P1-PREFIX-BLOOM-PARTITIONED-FILTER`
+6. `P1-READAHEAD-ITERATOR-OPT`
+7. `P1-MULTIGET-BATCH-READ-PATH`
+8. `P1-PARALLEL-COMPACTION-SUBCOMPACTION`
+9. `P1-PER-LEVEL-COMPRESSION`
+10. `P2-WAL-PREALLOC-BYTES-PER-SYNC`
+11. `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
 
 ## 逐项关闭记录（执行时填写）
 

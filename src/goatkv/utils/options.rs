@@ -118,6 +118,22 @@ pub struct KvEngineOptions {
     /// LSM 层级数量
     /// Default: 7
     pub num_levels: usize,
+
+    /// L0 文件数达到该阈值后触发 L0 compaction
+    /// Default: 4
+    pub l0_compaction_file_trigger: usize,
+
+    /// L1 基础目标大小（字节）
+    /// Default: 64KB
+    pub compaction_max_bytes_for_level_base: u64,
+
+    /// 各层级目标大小倍数（L{n+1} = L{n} * multiplier）
+    /// Default: 10
+    pub compaction_max_bytes_for_level_multiplier: u64,
+
+    /// grandparent overlap 限制因子
+    /// Default: 10
+    pub compaction_max_grandparent_overlap_bytes_factor: u64,
 }
 
 impl Default for KvEngineOptions {
@@ -149,6 +165,10 @@ impl Default for KvEngineOptions {
             manifest_max_size: 32 * 1024 * 1024, // 32MB
             manifest_rewrite_edit_count: 10000,
             num_levels: 7,
+            l0_compaction_file_trigger: 4,
+            compaction_max_bytes_for_level_base: 64 * 1024,
+            compaction_max_bytes_for_level_multiplier: 10,
+            compaction_max_grandparent_overlap_bytes_factor: 10,
         }
     }
 }
@@ -291,6 +311,30 @@ impl KvEngineOptions {
         self
     }
 
+    /// Sets L0 compaction file trigger.
+    pub fn with_l0_compaction_file_trigger(mut self, trigger: usize) -> Self {
+        self.l0_compaction_file_trigger = trigger.max(1);
+        self
+    }
+
+    /// Sets compaction base bytes for level targets.
+    pub fn with_compaction_max_bytes_for_level_base(mut self, bytes: u64) -> Self {
+        self.compaction_max_bytes_for_level_base = bytes.max(1);
+        self
+    }
+
+    /// Sets compaction level size multiplier.
+    pub fn with_compaction_max_bytes_for_level_multiplier(mut self, multiplier: u64) -> Self {
+        self.compaction_max_bytes_for_level_multiplier = multiplier.max(2);
+        self
+    }
+
+    /// Sets compaction grandparent overlap bytes factor.
+    pub fn with_compaction_max_grandparent_overlap_bytes_factor(mut self, factor: u64) -> Self {
+        self.compaction_max_grandparent_overlap_bytes_factor = factor.max(1);
+        self
+    }
+
     /// Creates options suitable for testing
     ///
     /// This creates a KvEngineOptions with a temporary data directory
@@ -335,6 +379,10 @@ impl KvEngineOptions {
             manifest_max_size: 32 * 1024 * 1024, // 32MB
             manifest_rewrite_edit_count: 10000,
             num_levels: 7,
+            l0_compaction_file_trigger: 4,
+            compaction_max_bytes_for_level_base: 64 * 1024,
+            compaction_max_bytes_for_level_multiplier: 10,
+            compaction_max_grandparent_overlap_bytes_factor: 10,
         }
     }
 }
@@ -410,6 +458,23 @@ mod tests {
     fn test_with_block_cache_capacity_bytes() {
         let options = KvEngineOptions::default().with_block_cache_capacity_bytes(8 * 1024 * 1024);
         assert_eq!(options.block_cache_capacity_bytes, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_with_l0_compaction_file_trigger() {
+        let options = KvEngineOptions::default().with_l0_compaction_file_trigger(8);
+        assert_eq!(options.l0_compaction_file_trigger, 8);
+    }
+
+    #[test]
+    fn test_with_compaction_level_targets() {
+        let options = KvEngineOptions::default()
+            .with_compaction_max_bytes_for_level_base(256 * 1024)
+            .with_compaction_max_bytes_for_level_multiplier(12)
+            .with_compaction_max_grandparent_overlap_bytes_factor(7);
+        assert_eq!(options.compaction_max_bytes_for_level_base, 256 * 1024);
+        assert_eq!(options.compaction_max_bytes_for_level_multiplier, 12);
+        assert_eq!(options.compaction_max_grandparent_overlap_bytes_factor, 7);
     }
 
     #[test]

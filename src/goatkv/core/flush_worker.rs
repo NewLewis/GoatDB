@@ -15,10 +15,35 @@ use crate::goatkv::storage::sstable::{SSTableBuilder, SSTableReader, SSTableScan
 use crate::goatkv::utils::paths::SstablePaths;
 use tracing::{error, warn};
 
-const L0_COMPACTION_FILE_TRIGGER: usize = 4;
-const MAX_BYTES_FOR_LEVEL_BASE: u64 = 64 * 1024;
-const MAX_BYTES_FOR_LEVEL_MULTIPLIER: u64 = 10;
-const MAX_GRANDPARENT_OVERLAP_BYTES_FACTOR: u64 = 10;
+#[derive(Debug, Clone, Copy)]
+pub struct CompactionConfig {
+    pub l0_compaction_file_trigger: usize,
+    pub max_bytes_for_level_base: u64,
+    pub max_bytes_for_level_multiplier: u64,
+    pub max_grandparent_overlap_bytes_factor: u64,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            l0_compaction_file_trigger: 4,
+            max_bytes_for_level_base: 64 * 1024,
+            max_bytes_for_level_multiplier: 10,
+            max_grandparent_overlap_bytes_factor: 10,
+        }
+    }
+}
+
+impl CompactionConfig {
+    fn normalized(mut self) -> Self {
+        self.l0_compaction_file_trigger = self.l0_compaction_file_trigger.max(1);
+        self.max_bytes_for_level_base = self.max_bytes_for_level_base.max(1);
+        self.max_bytes_for_level_multiplier = self.max_bytes_for_level_multiplier.max(2);
+        self.max_grandparent_overlap_bytes_factor =
+            self.max_grandparent_overlap_bytes_factor.max(1);
+        self
+    }
+}
 
 /// 刷盘任务
 #[derive(Debug)]
@@ -155,17 +180,25 @@ impl FlushWorker {
         version_set: Arc<RwLock<VersionSet>>,
         sstable_paths: Arc<SstablePaths>,
         flush_failure_streak_limit: usize,
+        compaction_config: CompactionConfig,
     ) -> Self {
         let (flush_tx, flush_rx) = mpsc::channel();
         let (compaction_tx, compaction_rx) = mpsc::channel();
         let flush_failure_streak_limit = flush_failure_streak_limit.max(1);
+        let compaction_config = compaction_config.normalized();
 
         let compaction_handle = {
             let lsm_state = Arc::clone(&lsm_state);
             let version_set = Arc::clone(&version_set);
             let sstable_paths = Arc::clone(&sstable_paths);
             thread::spawn(move || {
-                Self::run_compaction_loop(compaction_rx, lsm_state, version_set, sstable_paths);
+                Self::run_compaction_loop(
+                    compaction_rx,
+                    lsm_state,
+                    version_set,
+                    sstable_paths,
+                    compaction_config,
+                );
             })
         };
 
@@ -362,9 +395,10 @@ impl FlushWorker {
         lsm_state: Arc<RwLock<LSMState>>,
         version_set: Arc<RwLock<VersionSet>>,
         sstable_paths: Arc<SstablePaths>,
+        compaction_config: CompactionConfig,
     ) {
         while rx.recv().is_ok() {
-            Self::maybe_compact_levels(&lsm_state, &version_set, &sstable_paths);
+            Self::maybe_compact_levels(&lsm_state, &version_set, &sstable_paths, compaction_config);
         }
     }
 
@@ -416,13 +450,14 @@ impl FlushWorker {
         lsm_state: &Arc<RwLock<LSMState>>,
         version_set: &Arc<RwLock<VersionSet>>,
         sstable_paths: &Arc<SstablePaths>,
+        compaction_config: CompactionConfig,
     ) {
         loop {
             let plan = {
                 let vs = version_set.read().unwrap();
                 let current = vs.current();
                 let compact_pointers = vs.compact_pointers_snapshot();
-                Self::pick_compaction_plan(&current, &compact_pointers)
+                Self::pick_compaction_plan(&current, &compact_pointers, compaction_config)
             };
             let Some(plan) = plan else {
                 break;
@@ -437,13 +472,15 @@ impl FlushWorker {
     fn pick_compaction_plan(
         current: &Version,
         compact_pointers: &[Option<Vec<u8>>],
+        compaction_config: CompactionConfig,
     ) -> Option<CompactionPlan> {
         if current.num_levels() < 2 {
             return None;
         }
 
-        let level_targets = Self::build_level_size_targets(current.num_levels());
-        let (source_level, target_level) = Self::pick_compaction_priority(current, &level_targets)?;
+        let level_targets = Self::build_level_size_targets(current.num_levels(), compaction_config);
+        let (source_level, target_level) =
+            Self::pick_compaction_priority(current, &level_targets, compaction_config)?;
         let seed_files = Self::pick_seed_files(current, source_level, compact_pointers)?;
         Self::expand_inputs_by_overlap(
             current,
@@ -451,15 +488,19 @@ impl FlushWorker {
             target_level,
             seed_files,
             &level_targets,
+            compaction_config,
         )
     }
 
-    fn build_level_size_targets(num_levels: usize) -> Vec<u64> {
+    fn build_level_size_targets(
+        num_levels: usize,
+        compaction_config: CompactionConfig,
+    ) -> Vec<u64> {
         let mut targets = vec![0; num_levels];
-        let mut target = MAX_BYTES_FOR_LEVEL_BASE;
+        let mut target = compaction_config.max_bytes_for_level_base;
         for slot in targets.iter_mut().skip(1) {
             *slot = target;
-            target = target.saturating_mul(MAX_BYTES_FOR_LEVEL_MULTIPLIER);
+            target = target.saturating_mul(compaction_config.max_bytes_for_level_multiplier);
         }
         targets
     }
@@ -467,6 +508,7 @@ impl FlushWorker {
     fn pick_compaction_priority(
         current: &Version,
         level_targets: &[u64],
+        compaction_config: CompactionConfig,
     ) -> Option<(usize, usize)> {
         let mut best_level: Option<usize> = None;
         let mut best_score = 1.0f64;
@@ -474,7 +516,8 @@ impl FlushWorker {
 
         for source_level in 0..=max_source_level {
             let score = if source_level == 0 {
-                current.get_files(0).len() as f64 / L0_COMPACTION_FILE_TRIGGER as f64
+                current.get_files(0).len() as f64
+                    / compaction_config.l0_compaction_file_trigger as f64
             } else {
                 let target_bytes = *level_targets.get(source_level).unwrap_or(&0);
                 if target_bytes == 0 {
@@ -513,13 +556,17 @@ impl FlushWorker {
         max_level
     }
 
-    fn max_grandparent_overlap_bytes(level_targets: &[u64], target_level: usize) -> u64 {
+    fn max_grandparent_overlap_bytes(
+        level_targets: &[u64],
+        target_level: usize,
+        compaction_config: CompactionConfig,
+    ) -> u64 {
         let target = *level_targets
             .get(target_level)
-            .unwrap_or(&MAX_BYTES_FOR_LEVEL_BASE);
+            .unwrap_or(&compaction_config.max_bytes_for_level_base);
         target
-            .max(MAX_BYTES_FOR_LEVEL_BASE)
-            .saturating_mul(MAX_GRANDPARENT_OVERLAP_BYTES_FACTOR)
+            .max(compaction_config.max_bytes_for_level_base)
+            .saturating_mul(compaction_config.max_grandparent_overlap_bytes_factor)
     }
 
     fn pick_seed_files(
@@ -547,6 +594,7 @@ impl FlushWorker {
         target_level: usize,
         seed_files: Vec<Arc<FileMetadata>>,
         level_targets: &[u64],
+        compaction_config: CompactionConfig,
     ) -> Option<CompactionPlan> {
         let source_level_files = current.get_files(source_level);
         let target_level_files = current.get_files(target_level);
@@ -594,7 +642,7 @@ impl FlushWorker {
             .map(|level| Self::overlapping_files(current.get_files(level), &smallest, &largest))
             .unwrap_or_default();
         let grandparent_overlap_bytes_limit =
-            Self::max_grandparent_overlap_bytes(level_targets, target_level);
+            Self::max_grandparent_overlap_bytes(level_targets, target_level, compaction_config);
 
         Some(CompactionPlan {
             source_level,
