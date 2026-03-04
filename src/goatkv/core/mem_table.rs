@@ -178,7 +178,7 @@ impl ImmutableMemTable {
 
 #[cfg(test)]
 mod tests {
-    use crate::goatkv::format::internal_key::InternalKey;
+    use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
 
     use super::MemTable;
 
@@ -189,7 +189,10 @@ mod tests {
         for i in 0..1000 {
             let key = format!("key_{:06}", i).into_bytes();
             let value = format!("value_{}", i).into_bytes();
-            memtable.put(InternalKey::new(key, 0, 1.into()), value.into());
+            memtable.put(
+                InternalKey::new(key, 0, InternalKeyKind::Delete),
+                value.into(),
+            );
         }
 
         assert_eq!(memtable.len(), 1000);

@@ -18,7 +18,7 @@ pub use writer::{WalWriter, WalWriterConfig};
 #[cfg(test)]
 mod tests {
     use super::format::checksum_for;
-    use super::{WalReader, WalWriter, WalWriterConfig};
+    use super::{replay_wal_file, WalReader, WalWriter, WalWriterConfig};
     use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
     use crate::goatkv::ErrorKind;
     use std::fs;
@@ -143,5 +143,60 @@ mod tests {
         let mut reader = reader.unwrap();
         let result = reader.next();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_wal_reader_reports_invalid_internal_key_kind() {
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let path = temp_file.path().to_path_buf();
+
+        let key = InternalKey::from_encoded(b"bad_kind".to_vec(), (7 << 8) | 2);
+        let value = b"value".to_vec();
+        let key_len = key.serialized_size() as u32;
+        let value_len = value.len() as u32;
+        let checksum = checksum_for(&key, key_len, &value, value_len);
+
+        let mut record = Vec::new();
+        record.extend_from_slice(&checksum.to_le_bytes());
+        record.extend_from_slice(&key_len.to_le_bytes());
+        record.extend_from_slice(key.user_key());
+        record.extend_from_slice(&key.encoded_sequence_number().to_le_bytes());
+        record.extend_from_slice(&value_len.to_le_bytes());
+        record.extend_from_slice(&value);
+        fs::write(&path, &record).expect("Failed to write WAL record");
+
+        let mut reader = WalReader::new(&path).expect("Failed to create reader");
+        let err = reader
+            .next()
+            .expect("Expected entry")
+            .expect_err("invalid kind should return corruption");
+        assert_eq!(err.kind(), ErrorKind::Corruption);
+        assert!(err.to_string().contains("invalid internal key kind"));
+    }
+
+    #[test]
+    fn test_wal_replay_reports_invalid_internal_key_kind() {
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let path = temp_file.path().to_path_buf();
+
+        let key = InternalKey::from_encoded(b"bad_kind".to_vec(), (11 << 8) | 2);
+        let value = b"v".to_vec();
+        let key_len = key.serialized_size() as u32;
+        let value_len = value.len() as u32;
+        let checksum = checksum_for(&key, key_len, &value, value_len);
+
+        let mut record = Vec::new();
+        record.extend_from_slice(&checksum.to_le_bytes());
+        record.extend_from_slice(&key_len.to_le_bytes());
+        record.extend_from_slice(key.user_key());
+        record.extend_from_slice(&key.encoded_sequence_number().to_le_bytes());
+        record.extend_from_slice(&value_len.to_le_bytes());
+        record.extend_from_slice(&value);
+        fs::write(&path, &record).expect("Failed to write WAL record");
+
+        let err = replay_wal_file(&path, |_key, _value| {})
+            .expect_err("invalid kind should fail WAL replay");
+        assert_eq!(err.kind(), ErrorKind::Corruption);
+        assert!(err.to_string().contains("invalid internal key kind"));
     }
 }

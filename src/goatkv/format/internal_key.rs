@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 
 use crate::goatkv::core::skip_list::UserKey;
+use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use bytes::Bytes;
 
 /// InternalKey encoding format:
@@ -26,12 +27,17 @@ pub enum InternalKeyKind {
     Delete,
 }
 
-impl From<u8> for InternalKeyKind {
-    fn from(value: u8) -> Self {
+impl TryFrom<u8> for InternalKeyKind {
+    type Error = GoatError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => InternalKeyKind::Put,
-            1 => InternalKeyKind::Delete,
-            _ => panic!("Invalid kind value: {}", value),
+            0 => Ok(InternalKeyKind::Put),
+            1 => Ok(InternalKeyKind::Delete),
+            _ => Err(GoatError::corruption(
+                "internal_key_kind",
+                format!("invalid internal key kind {}", value),
+            )),
         }
     }
 }
@@ -142,9 +148,9 @@ impl InternalKey {
     }
 
     /// Get the operation kind.
-    pub fn kind(&self) -> InternalKeyKind {
+    pub fn kind(&self) -> GoatResult<InternalKeyKind> {
         let kind_byte = (self.encoded_sequence_number & KIND_MASK) as u8;
-        kind_byte.into()
+        InternalKeyKind::try_from(kind_byte)
     }
 
     /// Get the raw encoded sequence number (including kind).
@@ -197,7 +203,7 @@ mod tests {
         let key = InternalKey::new(b"key1".to_vec(), 123, InternalKeyKind::Put);
         assert_eq!(key.user_key(), b"key1");
         assert_eq!(key.sequence_number(), 123);
-        assert_eq!(key.kind(), InternalKeyKind::Put);
+        assert_eq!(key.kind().unwrap(), InternalKeyKind::Put);
         assert_eq!(key.encoded_sequence_number(), 123 << 8);
     }
 
@@ -206,7 +212,7 @@ mod tests {
         let key = InternalKey::new(b"key2".to_vec(), 456, InternalKeyKind::Delete);
         assert_eq!(key.user_key(), b"key2");
         assert_eq!(key.sequence_number(), 456);
-        assert_eq!(key.kind(), InternalKeyKind::Delete);
+        assert_eq!(key.kind().unwrap(), InternalKeyKind::Delete);
         assert_eq!(key.encoded_sequence_number(), (456 << 8) | 1);
     }
 
@@ -227,7 +233,7 @@ mod tests {
         let encoded = (100 << 8) | 1;
         let key3 = InternalKey::from_encoded(b"key".to_vec(), encoded);
         assert_eq!(key3.sequence_number(), 100);
-        assert_eq!(key3.kind(), InternalKeyKind::Delete);
+        assert_eq!(key3.kind().unwrap(), InternalKeyKind::Delete);
     }
 
     #[test]
@@ -260,14 +266,27 @@ mod tests {
         assert_eq!(u8::from(InternalKeyKind::Put), 0);
         assert_eq!(u8::from(InternalKeyKind::Delete), 1);
 
-        assert_eq!(InternalKeyKind::from(0), InternalKeyKind::Put);
-        assert_eq!(InternalKeyKind::from(1), InternalKeyKind::Delete);
+        assert_eq!(InternalKeyKind::try_from(0).unwrap(), InternalKeyKind::Put);
+        assert_eq!(
+            InternalKeyKind::try_from(1).unwrap(),
+            InternalKeyKind::Delete
+        );
     }
 
     #[test]
-    #[should_panic(expected = "Invalid kind value")]
     fn test_invalid_kind_conversion() {
-        let _ = InternalKeyKind::from(2);
+        let invalid = InternalKeyKind::try_from(2);
+        assert!(invalid.is_err());
+    }
+
+    #[test]
+    fn test_internal_key_kind_reports_corruption_for_invalid_tag() {
+        let key = InternalKey::from_encoded(b"key".to_vec(), (1 << 8) | 2);
+        let err = key.kind().expect_err("invalid kind should return error");
+        assert!(matches!(
+            err.kind(),
+            crate::goatkv::error::ErrorKind::Corruption
+        ));
     }
 
     #[test]

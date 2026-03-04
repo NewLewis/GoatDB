@@ -20,11 +20,11 @@ impl KvReader {
     pub fn get(&self, key: &[u8]) -> GoatResult<Option<Vec<u8>>> {
         let (mem_table, immutable_mem_tables, version) = self.snapshot_read_state();
 
-        if let Some(result) = Self::get_from_memtable(&mem_table, key) {
+        if let Some(result) = Self::get_from_memtable(&mem_table, key)? {
             return Ok(result);
         }
         for entry in immutable_mem_tables.iter().rev() {
-            if let Some(result) = Self::get_from_immutable(entry, key) {
+            if let Some(result) = Self::get_from_immutable(entry, key)? {
                 return Ok(result);
             }
         }
@@ -46,33 +46,49 @@ impl KvReader {
         )
     }
 
-    fn get_from_memtable(mem_table: &Arc<MemTable>, key: &[u8]) -> Option<Option<Vec<u8>>> {
-        mem_table.get(key).map(|(internal_key, value)| {
-            if internal_key.kind() == InternalKeyKind::Delete {
-                None
-            } else {
-                Some(value)
-            }
-        })
+    fn get_from_memtable(
+        mem_table: &Arc<MemTable>,
+        key: &[u8],
+    ) -> GoatResult<Option<Option<Vec<u8>>>> {
+        mem_table
+            .get(key)
+            .map(|(internal_key, value)| {
+                Ok(if internal_key.kind()? == InternalKeyKind::Delete {
+                    None
+                } else {
+                    Some(value)
+                })
+            })
+            .transpose()
     }
 
-    fn get_from_immutable(entry: &ImmutableMemTableEntry, key: &[u8]) -> Option<Option<Vec<u8>>> {
-        entry.table.get(key).map(|(internal_key, value)| {
-            if internal_key.kind() == InternalKeyKind::Delete {
-                None
-            } else {
-                Some(value)
-            }
-        })
+    fn get_from_immutable(
+        entry: &ImmutableMemTableEntry,
+        key: &[u8],
+    ) -> GoatResult<Option<Option<Vec<u8>>>> {
+        entry
+            .table
+            .get(key)
+            .map(|(internal_key, value)| {
+                Ok(if internal_key.kind()? == InternalKeyKind::Delete {
+                    None
+                } else {
+                    Some(value)
+                })
+            })
+            .transpose()
     }
 
     fn get_from_version(version: &Arc<Version>, key: &[u8]) -> GoatResult<Option<Vec<u8>>> {
-        Ok(version.get(key)?.and_then(|(internal_key, value)| {
-            if internal_key.kind() == InternalKeyKind::Delete {
-                None
-            } else {
-                Some(value)
+        match version.get(key)? {
+            Some((internal_key, value)) => {
+                if internal_key.kind()? == InternalKeyKind::Delete {
+                    Ok(None)
+                } else {
+                    Ok(Some(value))
+                }
             }
-        }))
+            None => Ok(None),
+        }
     }
 }

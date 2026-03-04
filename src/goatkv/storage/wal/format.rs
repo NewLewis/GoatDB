@@ -2,7 +2,7 @@ use std::io::Read;
 
 use crc32fast::Hasher;
 
-use crate::goatkv::error::Result as GoatResult;
+use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::format::internal_key::InternalKey;
 use crate::goatkv::utils::io_helpers::{read_exact_or_eof, ReadOutcome};
 
@@ -98,6 +98,12 @@ pub(crate) fn read_record<R: Read>(reader: &mut R) -> GoatResult<RecordRead> {
     }
     let encoded_seq = u64::from_le_bytes(encoded_seq_bytes);
     let key = InternalKey::from_encoded(user_key, encoded_seq);
+    key.kind().map_err(|e| {
+        GoatError::corruption(
+            "wal_record_kind",
+            format!("invalid internal key kind in WAL record: {}", e),
+        )
+    })?;
 
     let mut value_len_bytes = [0u8; 4];
     if read_exact_or_eof(reader, &mut value_len_bytes)? != ReadOutcome::Complete {
