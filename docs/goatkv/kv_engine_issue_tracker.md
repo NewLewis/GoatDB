@@ -1,6 +1,6 @@
 # GoatKV 引擎问题跟踪清单
 
-更新时间：2026-03-03
+更新时间：2026-03-04
 
 目标：把当前已识别的风险和缺口落成可执行 backlog，按优先级逐条解决并验证。
 
@@ -13,6 +13,7 @@
 - `cargo test --test e2e_basic_crud`：通过；当环境禁止绑定回环端口时按测试约定自动跳过。
 - 2026-02-14：完成 `src/goatkv/core/kv_engine/writer.rs` 设计评审（静态分析），新增 3 个待修复项：`P0-WRITE-CLOSE-SEMANTIC-GAP`、`P1-FLUSH-BARRIER-NO-GUARD`、`P1-SEQUENCE-OVERFLOW-PANIC`。
 - 2026-03-03：完成全量代码走读与回归命令复核，新增 2 个待修复项：`P0-SKIPLIST-ARENA-DESTRUCTOR-LEAK`、`P2-UPDATE-RMW-NONATOMIC`。
+- 2026-03-04：完成新一轮全量静态走读（重点覆盖 compaction/manifest/recovery/读路径错误传播），新增 4 个待修复项：`P0-INTERNALKEY-KIND-PANIC-ON-CORRUPTION`、`P1-COMPACTION-ORPHAN-SSTABLE-LEAK`、`P1-COMPACTION-MEMORY-AMPLIFICATION`、`P1-FLUSH-COMPACTION-COUPLED-BACKPRESSURE`。
 
 ## 问题清单
 
@@ -112,6 +113,24 @@
   - 关闭记录：
     - 2026-03-03：为 `SkipList` 增加显式 `Drop`，按 level-0 链路逐节点 `drop_in_place`（跳过未初始化 head 节点）。
     - 2026-03-03：新增 `test_drop_reclaims_node_keys`，验证节点 key 析构可达。
+
+- [x] `P0-INTERNALKEY-KIND-PANIC-ON-CORRUPTION`
+  - 现象：`InternalKeyKind` 从字节解码遇到非法值会 `panic!`；读路径在解析磁盘记录后会调用 `kind()`，可被损坏 SST/WAL 触发进程级崩溃。
+  - 影响：数据损坏场景下服务不可用（崩溃而非返回 `Corruption`），恢复与诊断链路中断。
+  - 代码定位：
+    - `src/goatkv/format/internal_key.rs:29`
+    - `src/goatkv/format/internal_key.rs:34`
+    - `src/goatkv/core/kv_engine/reader.rs:51`
+    - `src/goatkv/storage/sstable/reader.rs:323`
+    - `src/goatkv/storage/wal/format.rs:100`
+  - 验收标准：
+    - 将 kind 解码改为可失败路径（`Result`/受控默认分支），禁止 panic。
+    - SST/WAL 读取链路对非法 kind 统一返回 `Corruption`。
+    - 增加回归测试：伪造非法 kind trailer，读请求返回错误而非崩溃。
+  - 关闭记录：
+    - 2026-03-04：`InternalKeyKind` 解码从 `From<u8>`（panic）改为 `TryFrom<u8>`（`Corruption`）。
+    - 2026-03-04：`KvReader`/`SSTableReader`/`WAL format` 解码链路接入非法 kind 校验并统一返回 `Corruption`。
+    - 2026-03-04：新增回归 `test_sstable_reader_reports_invalid_internal_key_kind`、`test_wal_reader_reports_invalid_internal_key_kind`、`test_wal_replay_reports_invalid_internal_key_kind`。
 
 ### P1（核心能力缺口）
 
@@ -248,6 +267,55 @@
     - 增加“旧表被清理且不影响在途读”的测试。
   - 关闭记录：
     - 2026-03-03：`VersionSet` 在历史版本淘汰时计算 live file 集并发送 `CleanupTask::Sstable`，形成删除闭环。
+
+- [x] `P1-COMPACTION-ORPHAN-SSTABLE-LEAK`
+  - 现象：compaction 生成新 SST 后若 `apply_edit` 失败，函数直接返回；新生成文件未入 manifest 且无主动清理路径。
+  - 影响：运行期磁盘空间泄漏（需重启后依赖 recovery 扫描才可能清理），极端情况下导致磁盘压力与写失败。
+  - 代码定位：
+    - `src/goatkv/core/flush_worker.rs:535`
+    - `src/goatkv/core/flush_worker.rs:553`
+    - `src/goatkv/core/flush_worker.rs:565`
+    - `src/goatkv/core/flush_worker.rs:572`
+  - 验收标准：
+    - `apply_edit` 失败时能同步/异步清理本次 compaction 产物（含多输出）。
+    - 增加故障注入测试：强制 manifest 提交失败后无 orphan `.sst` 残留。
+    - 日志可关联一次 compaction 的输出文件 ID 与清理结果。
+  - 关闭记录：
+    - 2026-03-04：compaction 在 `apply_edit` 失败分支新增 `cleanup_generated_sstables`，会回收本轮已生成输出文件。
+    - 2026-03-04：新增故障注入测试 `compaction_apply_edit_failure_cleans_generated_sstable`，验证提交失败后无 orphan `.sst`。
+
+- [x] `P1-COMPACTION-MEMORY-AMPLIFICATION`
+  - 现象：compaction 先 `scan_all()` 全量读入，再用 `BTreeMap` 聚合，最终再整体构建输出；内存占用与输入总键数线性增长。
+  - 影响：大范围 compaction 易出现内存峰值飙升，触发 OOM 或长时间 GC/调度抖动。
+  - 代码定位：
+    - `src/goatkv/core/flush_worker.rs:517`
+    - `src/goatkv/core/flush_worker.rs:675`
+    - `src/goatkv/core/flush_worker.rs:680`
+    - `src/goatkv/core/flush_worker.rs:690`
+  - 验收标准：
+    - 改为流式 merge（k-way iterator），避免全量物化输入。
+    - 限制单次 compaction 输入规模（文件数/字节）并提供可配置阈值。
+    - 增加压力测试：大数据 compaction 下峰值内存受控且无 OOM。
+  - 关闭记录：
+    - 2026-03-04：将 compaction 输入从 `scan_all + BTreeMap` 改为 `SSTableScanIterator + BinaryHeap` 的流式 k-way merge，移除全量物化。
+    - 2026-03-04：基于 level size target + overlap 扩展策略约束单轮 compaction 输入范围，并加入 grandparent overlap 上限切分输出。
+    - 2026-03-04：回归覆盖 `test_l0_compacts_to_base_level_when_l0_exceeds_threshold`、`test_compaction_cascades_to_l2_when_l1_exceeds_threshold`（持续写入下多层 compaction 可收敛且读一致）。
+
+- [x] `P1-FLUSH-COMPACTION-COUPLED-BACKPRESSURE`
+  - 现象：flush 与 compaction 复用同一 worker 线程；一次 flush 结束后在同线程内循环执行 `maybe_compact_levels`，新 flush 任务必须排队等待 compaction 完成。
+  - 影响：高写入下可能放大 flush 延迟与 immutable 堆积，形成写路径背压甚至超时。
+  - 代码定位：
+    - `src/goatkv/core/flush_worker.rs:97`
+    - `src/goatkv/core/flush_worker.rs:207`
+    - `src/goatkv/core/flush_worker.rs:229`
+    - `src/goatkv/core/flush_worker.rs:234`
+  - 验收标准：
+    - 将 compaction 调度/执行与 flush 解耦（独立 worker 或有界预算执行）。
+    - 为 compaction 设置单轮预算（时间/任务数），避免长期占用 flush 线程。
+    - 增加并发压测：持续写入下 flush 延迟和 immutable 队列长度保持有界。
+  - 关闭记录：
+    - 2026-03-04：`FlushWorker` 拆分为独立 flush 线程与 compaction 线程；flush 成功后仅发送 compaction 触发信号，不在 flush 线程内执行 compaction。
+    - 2026-03-04：新增/更新回归 `test_l0_compacts_to_base_level_when_l0_exceeds_threshold`、`test_compaction_cascades_to_l2_when_l1_exceeds_threshold`，验证持续 flush 下 compaction 可后台推进并保持读正确性。
 
 ### P2（工程质量）
 
