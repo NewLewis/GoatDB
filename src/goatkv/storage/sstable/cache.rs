@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use crate::goatkv::error::Result as GoatResult;
 
@@ -24,7 +24,7 @@ pub struct ReadCacheMetrics {
 #[derive(Debug)]
 pub struct TableCache {
     capacity: usize,
-    shards: Vec<Mutex<TableCacheState>>,
+    shards: Vec<RwLock<TableCacheState>>,
     shard_capacities: Vec<usize>,
     block_cache: Arc<BlockCache>,
     table_hits: AtomicU64,
@@ -39,18 +39,18 @@ struct TableCacheState {
     hand: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct TableCacheEntry {
     reader: Arc<SSTableReader>,
-    referenced: bool,
-    hot: bool,
+    referenced: AtomicBool,
+    hot: AtomicBool,
 }
 
 impl TableCacheState {
-    fn mark_hit(&mut self, file_id: u64) -> Option<Arc<SSTableReader>> {
-        let entry = self.entries.get_mut(&file_id)?;
-        entry.referenced = true;
-        entry.hot = true;
+    fn mark_hit(&self, file_id: u64) -> Option<Arc<SSTableReader>> {
+        let entry = self.entries.get(&file_id)?;
+        entry.referenced.store(true, Ordering::Relaxed);
+        entry.hot.store(true, Ordering::Relaxed);
         Some(entry.reader.clone())
     }
 
@@ -59,9 +59,9 @@ impl TableCacheState {
             file_id,
             TableCacheEntry {
                 reader,
-                referenced: true,
+                referenced: AtomicBool::new(true),
                 // 新条目先按 cold 处理，避免“永久热”占位。
-                hot: false,
+                hot: AtomicBool::new(false),
             },
         );
         self.clock_keys.push(file_id);
@@ -104,13 +104,11 @@ impl TableCacheState {
             let mut should_evict = false;
             let mut missing = false;
 
-            match self.entries.get_mut(&file_id) {
+            match self.entries.get(&file_id) {
                 Some(entry) => {
-                    if entry.referenced {
-                        entry.referenced = false;
-                        self.advance_hand();
-                    } else if entry.hot {
-                        entry.hot = false;
+                    if entry.referenced.swap(false, Ordering::Relaxed)
+                        || entry.hot.swap(false, Ordering::Relaxed)
+                    {
                         self.advance_hand();
                     } else {
                         should_evict = true;
@@ -157,7 +155,7 @@ impl TableCache {
         };
         let shard_capacities = split_capacity(capacity, table_shard_count);
         let shards = (0..table_shard_count)
-            .map(|_| Mutex::new(TableCacheState::default()))
+            .map(|_| RwLock::new(TableCacheState::default()))
             .collect();
 
         Self {
@@ -183,7 +181,7 @@ impl TableCache {
         if self.capacity > 0 {
             let shard_idx = self.table_shard_index(file_id);
             if self.shard_capacities[shard_idx] > 0 {
-                let mut state = self.shards[shard_idx].lock().unwrap();
+                let state = self.shards[shard_idx].read().unwrap();
                 if let Some(reader) = state.mark_hit(file_id) {
                     self.table_hits.fetch_add(1, Ordering::Relaxed);
                     return Ok(reader);
@@ -209,7 +207,7 @@ impl TableCache {
             return Ok(opened);
         }
 
-        let mut state = self.shards[shard_idx].lock().unwrap();
+        let mut state = self.shards[shard_idx].write().unwrap();
         if let Some(reader) = state.mark_hit(file_id) {
             self.table_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(reader);
@@ -242,7 +240,7 @@ impl TableCache {
 #[derive(Debug)]
 pub(crate) struct BlockCache {
     capacity_bytes: usize,
-    shards: Vec<Mutex<BlockCacheState>>,
+    shards: Vec<RwLock<BlockCacheState>>,
     shard_capacities: Vec<usize>,
     block_hits: AtomicU64,
     block_misses: AtomicU64,
@@ -258,10 +256,10 @@ struct BlockCacheState {
 }
 
 impl BlockCacheState {
-    fn mark_hit(&mut self, key: &BlockCacheKey) -> Option<Arc<Vec<u8>>> {
-        let entry = self.entries.get_mut(key)?;
-        entry.referenced = true;
-        entry.hot = true;
+    fn mark_hit(&self, key: &BlockCacheKey) -> Option<Arc<Vec<u8>>> {
+        let entry = self.entries.get(key)?;
+        entry.referenced.store(true, Ordering::Relaxed);
+        entry.hot.store(true, Ordering::Relaxed);
         Some(entry.payload.clone())
     }
 
@@ -271,8 +269,8 @@ impl BlockCacheState {
             self.used_bytes = self.used_bytes.saturating_add(bytes);
             entry.payload = payload;
             entry.bytes = bytes;
-            entry.referenced = true;
-            entry.hot = true;
+            entry.referenced.store(true, Ordering::Relaxed);
+            entry.hot.store(true, Ordering::Relaxed);
             return;
         }
 
@@ -282,9 +280,9 @@ impl BlockCacheState {
             BlockCacheEntry {
                 payload,
                 bytes,
-                referenced: true,
+                referenced: AtomicBool::new(true),
                 // 新条目先按 cold 处理，避免 cache 污染。
-                hot: false,
+                hot: AtomicBool::new(false),
             },
         );
         self.clock_keys.push(key);
@@ -326,13 +324,11 @@ impl BlockCacheState {
             let mut should_evict = false;
             let mut missing = false;
 
-            match self.entries.get_mut(&key) {
+            match self.entries.get(&key) {
                 Some(entry) => {
-                    if entry.referenced {
-                        entry.referenced = false;
-                        self.advance_hand();
-                    } else if entry.hot {
-                        entry.hot = false;
+                    if entry.referenced.swap(false, Ordering::Relaxed)
+                        || entry.hot.swap(false, Ordering::Relaxed)
+                    {
                         self.advance_hand();
                     } else {
                         should_evict = true;
@@ -398,12 +394,12 @@ impl BlockCacheKey {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct BlockCacheEntry {
     payload: Arc<Vec<u8>>,
     bytes: usize,
-    referenced: bool,
-    hot: bool,
+    referenced: AtomicBool,
+    hot: AtomicBool,
 }
 
 impl BlockCache {
@@ -411,7 +407,7 @@ impl BlockCache {
         let block_shard_count = shard_count_for_bytes(capacity_bytes);
         let shard_capacities = split_capacity(capacity_bytes, block_shard_count);
         let shards = (0..block_shard_count)
-            .map(|_| Mutex::new(BlockCacheState::default()))
+            .map(|_| RwLock::new(BlockCacheState::default()))
             .collect();
 
         Self {
@@ -440,7 +436,7 @@ impl BlockCache {
             return None;
         }
 
-        let mut state = self.shards[shard_idx].lock().unwrap();
+        let state = self.shards[shard_idx].read().unwrap();
         if let Some(payload) = state.mark_hit(key) {
             self.block_hits.fetch_add(1, Ordering::Relaxed);
             Some(payload)
@@ -463,7 +459,7 @@ impl BlockCache {
             return payload;
         }
 
-        let mut state = self.shards[shard_idx].lock().unwrap();
+        let mut state = self.shards[shard_idx].write().unwrap();
         state.insert_or_update(key, payload.clone(), bytes);
 
         while state.used_bytes > shard_capacity {

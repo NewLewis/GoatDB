@@ -21,8 +21,6 @@ pub struct Version {
 
     /// 该版本创建时的序列号
     creation_seqno: u64,
-    /// 路径管理器（用于定位 SSTable）
-    sstable_paths: Arc<SstablePaths>,
     /// 可选 table/block cache（跨版本共享）
     table_cache: Option<Arc<TableCache>>,
 }
@@ -78,14 +76,13 @@ impl Version {
     /// 创建一个新的空 Version（可选读缓存）
     pub fn new_with_cache(
         num_levels: usize,
-        sstable_paths: Arc<SstablePaths>,
+        _sstable_paths: Arc<SstablePaths>,
         table_cache: Option<Arc<TableCache>>,
     ) -> Self {
         Self {
             files: vec![Vec::new(); num_levels],
             level_size_bytes: vec![0; num_levels],
             creation_seqno: 0,
-            sstable_paths,
             table_cache,
         }
     }
@@ -103,7 +100,7 @@ impl Version {
     pub fn from_files_with_cache(
         files: Vec<Vec<Arc<FileMetadata>>>,
         creation_seqno: u64,
-        sstable_paths: Arc<SstablePaths>,
+        _sstable_paths: Arc<SstablePaths>,
         table_cache: Option<Arc<TableCache>>,
     ) -> Self {
         // 计算层级大小
@@ -116,7 +113,6 @@ impl Version {
             files,
             level_size_bytes,
             creation_seqno,
-            sstable_paths,
             table_cache,
         }
     }
@@ -140,13 +136,13 @@ impl Version {
             // smallest_key和largest_key都存在的是internal_key不能直接用于比较，需要转换为user_key进行比较
             if key >= file.smallest_user_key() && key <= file.largest_user_key() {
                 // key在文件范围中，说明该文件中可能包含key
-                let sstable_path = self.sstable_paths.sstable_path_by_id(file.file_id);
+                let sstable_path = file.sstable_path();
                 let reader = self
-                    .open_sstable_reader(file.file_id, &sstable_path)
-                    .map_err(|e| Self::map_sstable_open_err(&sstable_path, e))?;
+                    .open_sstable_reader(file.file_id, sstable_path)
+                    .map_err(|e| Self::map_sstable_open_err(sstable_path, e))?;
                 match reader
                     .get(key)
-                    .map_err(|e| Self::map_sstable_read_err(&sstable_path, e))?
+                    .map_err(|e| Self::map_sstable_read_err(sstable_path, e))?
                 {
                     Some(result) => return Ok(Some(result)),
                     None => continue, // Not found in this sstable, check next
@@ -157,13 +153,13 @@ impl Version {
         // 对于其他层级，由于文件不重叠且有序，可以使用二分查找
         for level in 1..self.files.len() {
             if let Some(file) = self.search_level(level, key) {
-                let sstable_path = self.sstable_paths.sstable_path_by_id(file.file_id);
+                let sstable_path = file.sstable_path();
                 let reader = self
-                    .open_sstable_reader(file.file_id, &sstable_path)
-                    .map_err(|e| Self::map_sstable_open_err(&sstable_path, e))?;
+                    .open_sstable_reader(file.file_id, sstable_path)
+                    .map_err(|e| Self::map_sstable_open_err(sstable_path, e))?;
                 return reader
                     .get(key)
-                    .map_err(|e| Self::map_sstable_read_err(&sstable_path, e));
+                    .map_err(|e| Self::map_sstable_read_err(sstable_path, e));
             }
         }
 

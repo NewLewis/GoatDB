@@ -1,5 +1,8 @@
+use std::path::{Path, PathBuf};
+
 use crate::goatkv::metadata::version_edit::NewFile;
 use crate::goatkv::utils::cleanup_task::CleanupTask;
+use crate::goatkv::utils::paths::SstablePaths;
 use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug, Clone)]
@@ -38,6 +41,7 @@ impl TableProperties {
 pub struct FileMetadata {
     pub file_id: u64,
     pub props: TableProperties,
+    sstable_path: PathBuf,
     pub obsolete_sender: UnboundedSender<CleanupTask>,
 }
 
@@ -47,18 +51,63 @@ impl FileMetadata {
         props: TableProperties,
         obsolete_sender: UnboundedSender<CleanupTask>,
     ) -> Self {
+        Self::from_props_with_paths(file_id, props, obsolete_sender, None)
+    }
+
+    pub fn from_props_with_sstable_paths(
+        file_id: u64,
+        props: TableProperties,
+        obsolete_sender: UnboundedSender<CleanupTask>,
+        sstable_paths: &SstablePaths,
+    ) -> Self {
+        Self::from_props_with_paths(file_id, props, obsolete_sender, Some(sstable_paths))
+    }
+
+    fn from_props_with_paths(
+        file_id: u64,
+        props: TableProperties,
+        obsolete_sender: UnboundedSender<CleanupTask>,
+        sstable_paths: Option<&SstablePaths>,
+    ) -> Self {
         FileMetadata {
             file_id,
             props,
+            sstable_path: Self::build_sstable_path(file_id, sstable_paths),
             obsolete_sender,
         }
     }
 
     pub fn from_new_file(new_file: NewFile, obsolete_sender: UnboundedSender<CleanupTask>) -> Self {
+        Self::from_new_file_with_paths(new_file, obsolete_sender, None)
+    }
+
+    pub fn from_new_file_with_sstable_paths(
+        new_file: NewFile,
+        obsolete_sender: UnboundedSender<CleanupTask>,
+        sstable_paths: &SstablePaths,
+    ) -> Self {
+        Self::from_new_file_with_paths(new_file, obsolete_sender, Some(sstable_paths))
+    }
+
+    fn from_new_file_with_paths(
+        new_file: NewFile,
+        obsolete_sender: UnboundedSender<CleanupTask>,
+        sstable_paths: Option<&SstablePaths>,
+    ) -> Self {
+        let file_id = new_file.file_id;
         FileMetadata {
-            file_id: new_file.file_id,
+            file_id,
             props: new_file.props,
+            sstable_path: Self::build_sstable_path(file_id, sstable_paths),
             obsolete_sender,
+        }
+    }
+
+    fn build_sstable_path(file_id: u64, sstable_paths: Option<&SstablePaths>) -> PathBuf {
+        if let Some(paths) = sstable_paths {
+            paths.sstable_path_by_id(file_id)
+        } else {
+            PathBuf::from(SstablePaths::format_sstable_filename(file_id))
         }
     }
 
@@ -82,6 +131,10 @@ impl FileMetadata {
 
     pub fn largest_key(&self) -> &[u8] {
         &self.props.largest_key
+    }
+
+    pub fn sstable_path(&self) -> &Path {
+        &self.sstable_path
     }
 }
 

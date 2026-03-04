@@ -738,9 +738,10 @@ impl VersionSet {
             if new_files.len() <= *level {
                 new_files.resize(*level + 1, Vec::new());
             }
-            new_files[*level].push(Arc::new(FileMetadata::from_new_file(
+            new_files[*level].push(Arc::new(FileMetadata::from_new_file_with_sstable_paths(
                 new_file.clone(),
                 self.obsolete_sender.clone(),
+                self.sstable_paths.as_ref(),
             )));
         }
 
@@ -873,9 +874,10 @@ impl VersionSet {
             if files.len() <= level {
                 files.resize(level + 1, Vec::new());
             }
-            files[level].push(Arc::new(FileMetadata::from_new_file(
+            files[level].push(Arc::new(FileMetadata::from_new_file_with_sstable_paths(
                 new_file,
                 self.obsolete_sender.clone(),
+                self.sstable_paths.as_ref(),
             )));
         }
 
