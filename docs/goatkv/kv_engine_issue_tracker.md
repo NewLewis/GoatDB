@@ -22,6 +22,8 @@
 - 2026-03-04：完成 RocksDB 对齐差距评审，新增 7 个待修复项：`P1-WRITE-STALL-BY-COMPACTION-PRESSURE`、`P1-PREFIX-BLOOM-PARTITIONED-FILTER`、`P1-READAHEAD-ITERATOR-OPT`、`P1-MULTIGET-BATCH-READ-PATH`、`P1-PARALLEL-COMPACTION-SUBCOMPACTION`、`P1-PER-LEVEL-COMPRESSION`、`P2-WAL-PREALLOC-BYTES-PER-SYNC`。
 - 2026-03-04：完成 `P1-COMPACTION-POLICY-HARDCODED` 修复与回归，compaction 关键阈值已由 `KvEngineOptions` 配置驱动；`cargo test test_l0_compacts_to_base_level_when_l0_exceeds_threshold`、`cargo test test_compaction_cascades_to_l2_when_l1_exceeds_threshold` 通过。
 - 2026-03-04：完成 `P1-WRITE-STALL-BY-COMPACTION-PRESSURE` 修复与回归，新增 L0/pending-compaction 两级 slowdown/stop 策略、可配置阈值与写压状态转移日志；`cargo test --lib`、`cargo clippy --all-targets --all-features -- -D warnings` 通过。
+- 2026-03-04：启动 `P1-PREFIX-BLOOM-PARTITIONED-FILTER` 修复，已落地 prefix extractor 与 partitioned bloom/filter-index（按 data-block 分区并懒加载），待补充误报率与点查 miss 路径 benchmark。
+- 2026-03-04：完成 GoatKV vs RocksDB 读路径基准对齐：`randread(times=80,key_nums=20000,threads=16)` GoatKV `1542ms` vs RocksDB `436ms`（约慢 `3.54x`）；`hotread(times=120,key_nums=20000,hotset=512,threads=16)` GoatKV `1463ms` vs RocksDB `529ms`（约慢 `2.77x`）。基于代码走读新增 3 个待修复项：`P1-POINT-GET-HOTPATH-DECODE-COPY-AMPLIFICATION`、`P1-PINNED-READ-API-MISSING`、`P1-ROW-CACHE-MISSING`。
 
 ## 问题清单
 
@@ -475,17 +477,53 @@
     - 2026-03-04：新增写压状态转移日志（normal/slowdown/stop）与回归测试：`submit_write_fails_fast_when_l0_reaches_stop_trigger`、`write_pressure_action_reports_slowdown_before_stop`、`submit_write_fails_fast_when_pending_compaction_bytes_reaches_hard_limit`、`test_with_write_stall_thresholds`。
 
 - [ ] `P1-PREFIX-BLOOM-PARTITIONED-FILTER`
-  - 现象：当前 BloomFilter 为单体 bitmap，且未引入 prefix extractor/partitioned filter-index。
-  - 影响：点查 miss 与高扇出查询下，过滤效率与缓存局部性弱于 RocksDB 常见配置。
+  - 现象：prefix extractor 与 partitioned bloom 已落地，但 filter 分区缓存仍是 reader 内部 `Mutex<HashMap<...>>`，未接入统一 block cache 的容量管理与淘汰策略。
+  - 影响：热点/高并发点查下可能出现锁竞争与分区缓存无界增长，过滤路径稳定性与可观测性弱于 RocksDB 的 metadata cache 体系。
   - 代码定位：
-    - `src/goatkv/storage/sstable/bloom.rs:5`
-    - `src/goatkv/storage/sstable/builder.rs:186`
-    - `src/goatkv/storage/sstable/builder.rs:390`
-    - `src/goatkv/storage/sstable/reader.rs:273`
+    - `src/goatkv/storage/sstable/bloom.rs:4`
+    - `src/goatkv/storage/sstable/builder.rs:512`
+    - `src/goatkv/storage/sstable/reader.rs:58`
+    - `src/goatkv/storage/sstable/reader.rs:673`
   - 验收标准：
     - 支持可配置 prefix extractor 与 prefix bloom。
-    - 支持 partitioned filter/index，避免一次加载整段过滤器。
-    - 增加误报率与点查基准，验证 miss 路径 I/O 降低。
+    - partitioned filter 分区缓存纳入统一容量治理（可配置上限/淘汰策略/指标）。
+    - 增加误报率、点查 miss 路径与高并发热点读基准，验证过滤路径 CPU 与内存占用可控。
+  - 进展：
+    - 2026-03-04：`SSTableBuilder` 已改为写入 partitioned bloom 段（按 data-block 分区），并通过 `KvEngineOptions::bloom_prefix_extractor_len` 支持 prefix bloom。
+    - 2026-03-04：`SSTableReader` 已支持 partitioned bloom 解析与按分区懒加载，`may_contain/get` 复用 data-block 索引定位 filter 分区，避免 open 时一次性读取整段 bloom。
+    - 2026-03-04：新增回归 `test_partitioned_bloom_respects_prefix_extractor`、`test_partitioned_bloom_loads_partitions_lazily`。
+
+- [ ] `P1-POINT-GET-HOTPATH-DECODE-COPY-AMPLIFICATION`
+  - 现象：点查命中路径会重复构建 `BlockReader`、重复解码 restart/entry，且 `decode_entry_at`/返回路径存在多次 `Vec` 拷贝。
+  - 影响：在 table/block cache 命中较高时，读性能主要受 CPU 解码与内存拷贝限制，导致 randread/hotread 仍明显落后 RocksDB。
+  - 代码定位：
+    - `src/goatkv/storage/sstable/reader.rs:570`
+    - `src/goatkv/storage/sstable/block_reader.rs:29`
+    - `src/goatkv/storage/sstable/block_reader.rs:526`
+    - `src/goatkv/storage/sstable/block_reader.rs:530`
+  - 验收标准：
+    - 命中路径复用已解析块结构，避免每次 `get` 重建 restart 索引。
+    - 减少 entry 解码中的临时分配与不必要拷贝（优先借用切片或延迟拷贝）。
+    - randread/hotread 基准下 CPU 占比下降且吞吐显著提升。
+  - 进展：
+    - 2026-03-04：`SSTableReader::get` 新增 data-block restart 索引复用路径：首次命中时解析并缓存 `BlockSearchIndex`，后续命中复用，避免重复构建 `BlockReader` 的 restart 索引。
+    - 2026-03-04：新增回归 `test_sstable_reader_reuses_cached_block_search_index_for_hot_get`，并通过 `cargo test --lib test_sstable_reader_reuses_cached_block_search_index_for_hot_get`、`cargo test --lib test_block_reader_get_by_user_key`。
+    - 2026-03-04：阶段 2 完成：`BlockReader::get_by_user_key` 改为直接返回 `InternalKey`，去掉命中路径 `raw_internal_key -> decode_internal_key` 的二次解码与额外拷贝；`SSTableReader::get` 保留 kind 校验语义。
+    - 2026-03-04：新增/回归验证通过：`cargo test --lib test_block_reader_get_by_user_key -- --nocapture`、`cargo test --lib test_sstable_reader_reuses_cached_block_search_index_for_hot_get -- --nocapture`、`cargo test --lib test_sstable_reader_reports_invalid_internal_key_kind -- --nocapture`。
+    - 2026-03-04：基准复测（`/tmp/goatkv_bench_cmp_stage2`）`randread`：GoatKV `1768ms` vs RocksDB `466ms`（约 `3.79x`）；`hotread`：GoatKV `1600ms` vs RocksDB `560ms`（约 `2.86x`）。同目录 GoatKV 复测（`/tmp/goatkv_bench_cmp/goatkv`）`randread=1677ms`、`hotread=1746ms`；当前阶段尚未观察到稳定收益，保持 issue open。
+
+- [ ] `P1-PINNED-READ-API-MISSING`
+  - 现象：当前引擎读接口统一返回 `Vec<u8>`，缺少 pinned/zero-copy 读取语义与生命周期管理接口。
+  - 影响：热点读下即便 block cache 命中，仍需拷贝 value，放大内存带宽与分配开销。
+  - 代码定位：
+    - `src/goatkv/core/kv_engine/reader.rs:20`
+    - `src/goatkv/metadata/version.rs:131`
+    - `src/goatkv/storage/sstable/reader.rs:554`
+    - `src/goatkv/core/mem_table.rs:30`
+  - 验收标准：
+    - 增加引擎内部 pinned value 表达（如借用切片/引用计数块句柄）。
+    - 在不破坏现有 API 的前提下提供 zero-copy 快路径（可先内部使用）。
+    - 热点读 benchmark 显示单位请求拷贝字节下降。
 
 - [ ] `P1-READAHEAD-ITERATOR-OPT`
   - 现象：SSTable 迭代读取仍按块同步拉取，缺少 readahead/prefetch 机制和顺序扫描专项优化。
@@ -512,6 +550,18 @@
     - 增加 MultiGet API 与引擎批量读入口。
     - 批量路径复用 table/block cache probe 与文件打开结果。
     - 增加 batch size 梯度基准，验证吞吐提升。
+
+- [ ] `P1-ROW-CACHE-MISSING`
+  - 现象：当前读缓存仅覆盖 table cache 与 data block cache，缺少按 user key/value 结果缓存层。
+  - 影响：热点 key 高命中场景仍需经历索引定位、块解码与版本过滤，无法获得与 RocksDB row cache 类似的短路径收益。
+  - 代码定位：
+    - `src/goatkv/storage/sstable/cache.rs:25`
+    - `src/goatkv/storage/sstable/cache.rs:241`
+    - `src/goatkv/metadata/version.rs:120`
+  - 验收标准：
+    - 增加可配置 row cache（容量、命中/驱逐指标、与 snapshot/seq 可见性约束）。
+    - 与现有 table/block cache 协同，避免重复缓存和不可控内存膨胀。
+    - hotread benchmark 在热点 key 分布下有可量化提升。
 
 - [ ] `P1-PARALLEL-COMPACTION-SUBCOMPACTION`
   - 现象：当前 compaction 由单线程循环串行执行，未支持 subcompaction 并行拆分。
@@ -602,17 +652,19 @@
 
 ## 建议修复顺序
 
-1. `P1-WRITE-STALL-BY-COMPACTION-PRESSURE`
-2. `P1-OBSERVABILITY-HEALTH-GAP`
-3. `P1-ONDISK-FORMAT-VERSIONING-GAP`
-4. `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
-5. `P1-PREFIX-BLOOM-PARTITIONED-FILTER`
-6. `P1-READAHEAD-ITERATOR-OPT`
-7. `P1-MULTIGET-BATCH-READ-PATH`
-8. `P1-PARALLEL-COMPACTION-SUBCOMPACTION`
-9. `P1-PER-LEVEL-COMPRESSION`
-10. `P2-WAL-PREALLOC-BYTES-PER-SYNC`
-11. `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
+1. `P1-OBSERVABILITY-HEALTH-GAP`
+2. `P1-ONDISK-FORMAT-VERSIONING-GAP`
+3. `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
+4. `P1-POINT-GET-HOTPATH-DECODE-COPY-AMPLIFICATION`
+5. `P1-PINNED-READ-API-MISSING`
+6. `P1-PREFIX-BLOOM-PARTITIONED-FILTER`
+7. `P1-ROW-CACHE-MISSING`
+8. `P1-READAHEAD-ITERATOR-OPT`
+9. `P1-MULTIGET-BATCH-READ-PATH`
+10. `P1-PARALLEL-COMPACTION-SUBCOMPACTION`
+11. `P1-PER-LEVEL-COMPRESSION`
+12. `P2-WAL-PREALLOC-BYTES-PER-SYNC`
+13. `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
 
 ## 逐项关闭记录（执行时填写）
 

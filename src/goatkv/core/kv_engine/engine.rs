@@ -422,6 +422,7 @@ impl KvEngine {
                 max_grandparent_overlap_bytes_factor: options
                     .compaction_max_grandparent_overlap_bytes_factor,
             },
+            options.bloom_prefix_extractor_len,
         );
         let wal_writer = Arc::new(wal_writer);
         let options = Arc::new(options);

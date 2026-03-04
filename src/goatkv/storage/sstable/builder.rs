@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use crc32fast::Hasher;
 
 use super::block_builder::BlockBuilder;
-use super::bloom::BloomBuilder;
+use super::bloom::{
+    bloom_lookup_key, BloomBuilder, PARTITIONED_BLOOM_HEADER_SIZE,
+    PARTITIONED_BLOOM_INDEX_ENTRY_SIZE, PARTITIONED_BLOOM_MAGIC, PARTITIONED_BLOOM_VERSION,
+};
 use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::format::coding;
 use crate::goatkv::format::internal_key::InternalKey;
@@ -98,9 +101,14 @@ pub struct SSTableBuilder {
     /// 用于记录每个数据块的位置和大小信息
     index_block_builder: BlockBuilder,
 
-    /// 布隆过滤器构建器
-    /// 用于快速过滤不存在的key，减少磁盘I/O
+    /// 当前 data block 对应的布隆过滤器构建器。
     bloom_builder: BloomBuilder,
+
+    /// 已完成 data block 的布隆过滤器分区（与索引块顺序一致）。
+    bloom_partitions: Vec<Vec<u8>>,
+
+    /// Bloom 前缀提取长度。0 表示使用完整 user key。
+    bloom_prefix_extractor_len: usize,
 
     /// 当前文件写入偏移量
     /// 用于跟踪文件中的写入位置，记录数据块的偏移量
@@ -154,7 +162,15 @@ impl SSTableBuilder {
     /// # }
     /// ```
     pub fn new(id: u64, sstable_paths: &SstablePaths) -> GoatResult<Self> {
-        Self::new_with_manager(id, sstable_paths)
+        Self::new_with_bloom_prefix_extractor(id, sstable_paths, 0)
+    }
+
+    pub fn new_with_bloom_prefix_extractor(
+        id: u64,
+        sstable_paths: &SstablePaths,
+        bloom_prefix_extractor_len: usize,
+    ) -> GoatResult<Self> {
+        Self::new_with_manager(id, sstable_paths, bloom_prefix_extractor_len)
     }
 
     /// 创建一个新的SSTableBuilder，使用指定的 SSTablePaths
@@ -168,7 +184,11 @@ impl SSTableBuilder {
     ///
     /// # 注意
     /// 此方法主要用于测试，允许使用临时 SSTablePaths
-    pub fn new_with_manager(id: u64, sstable_paths: &SstablePaths) -> GoatResult<Self> {
+    pub fn new_with_manager(
+        id: u64,
+        sstable_paths: &SstablePaths,
+        bloom_prefix_extractor_len: usize,
+    ) -> GoatResult<Self> {
         let sstable_path = sstable_paths.sstable_path_by_id(id);
         let tmp_path = sstable_paths.tmp_path(format!("sstable_{:06}.tmp", id));
 
@@ -184,6 +204,8 @@ impl SSTableBuilder {
             data_block_builder: BlockBuilder::new(),
             index_block_builder: BlockBuilder::new(),
             bloom_builder: BloomBuilder::new(),
+            bloom_partitions: Vec::new(),
+            bloom_prefix_extractor_len: bloom_prefix_extractor_len.min(u16::MAX as usize),
             offset: 0,
             id,
 
@@ -263,7 +285,8 @@ impl SSTableBuilder {
         // 注意：BloomFilter 应该索引 UserKey，以便于查询
         // key 是 InternalKey (UserKey + 8 bytes Seq/Kind)
         let user_key = &key[..key.len() - 8];
-        self.bloom_builder.add(user_key);
+        self.bloom_builder
+            .add(bloom_lookup_key(user_key, self.bloom_prefix_extractor_len));
         Ok(())
     }
 
@@ -311,6 +334,7 @@ impl SSTableBuilder {
         // 将数据块写入文件
         let block_content = block_content.to_vec();
         self.write_block_with_checksum(&block_content, "sstable_write_data_block")?;
+        self.finalize_current_bloom_partition();
 
         // 重置数据块构建器，准备开始新的数据块
         self.data_block_builder.reset();
@@ -377,6 +401,7 @@ impl SSTableBuilder {
             // 写入最后一个数据块
             let block_content = block_content.to_vec();
             self.write_block_with_checksum(&block_content, "sstable_write_last_data_block")?;
+            self.finalize_current_bloom_partition();
 
             // 重置数据块构建器
             self.data_block_builder.reset();
@@ -384,13 +409,14 @@ impl SSTableBuilder {
 
         // 写入BloomFilter
         // BloomFilter用于快速过滤不存在的key
+        let bloom_section = self.encode_partitioned_bloom_section();
         self.writer
             .as_mut()
             .ok_or_else(|| GoatError::internal("sstable_builder", "SSTable writer missing"))?
-            .write_all(self.bloom_builder.bitmap())
+            .write_all(&bloom_section)
             .map_err(|e| GoatError::io("sstable_write_bloom", e))?;
         let bloom_offset = self.offset;
-        self.offset += self.bloom_builder.bitmap().len() as u64;
+        self.offset += bloom_section.len() as u64;
 
         // 写入IndexBlock
         // IndexBlock包含所有数据块的位置和大小信息
@@ -475,6 +501,42 @@ impl SSTableBuilder {
         };
 
         Ok(file_metadata)
+    }
+
+    fn finalize_current_bloom_partition(&mut self) {
+        let builder = std::mem::take(&mut self.bloom_builder);
+        self.bloom_partitions
+            .push(builder.build().bitmap().to_vec());
+    }
+
+    fn encode_partitioned_bloom_section(&self) -> Vec<u8> {
+        let partition_count = self.bloom_partitions.len();
+        let index_bytes_len = PARTITIONED_BLOOM_INDEX_ENTRY_SIZE.saturating_mul(partition_count);
+        let data_start = PARTITIONED_BLOOM_HEADER_SIZE.saturating_add(index_bytes_len);
+        let bloom_data_bytes = self
+            .bloom_partitions
+            .iter()
+            .map(|partition| partition.len())
+            .sum::<usize>();
+
+        let mut section = Vec::with_capacity(data_start.saturating_add(bloom_data_bytes));
+        section.extend_from_slice(&PARTITIONED_BLOOM_MAGIC);
+        section.push(PARTITIONED_BLOOM_VERSION);
+        section.extend_from_slice(&(self.bloom_prefix_extractor_len as u16).to_le_bytes());
+        section.extend_from_slice(&(partition_count as u32).to_le_bytes());
+
+        let mut running_offset = data_start as u64;
+        for partition in &self.bloom_partitions {
+            section.extend_from_slice(&running_offset.to_le_bytes());
+            section.extend_from_slice(&(partition.len() as u64).to_le_bytes());
+            running_offset = running_offset.saturating_add(partition.len() as u64);
+        }
+
+        for partition in &self.bloom_partitions {
+            section.extend_from_slice(partition);
+        }
+
+        section
     }
 
     fn parse_seqno_from_internal_key(key: &[u8]) -> GoatResult<u64> {

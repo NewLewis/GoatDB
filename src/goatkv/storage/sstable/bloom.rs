@@ -1,6 +1,19 @@
 use std::hash::Hasher as _;
 use twox_hash::XxHash64;
 
+pub(crate) const PARTITIONED_BLOOM_MAGIC: [u8; 4] = *b"GBPF";
+pub(crate) const PARTITIONED_BLOOM_VERSION: u8 = 1;
+pub(crate) const PARTITIONED_BLOOM_HEADER_SIZE: usize = 11;
+pub(crate) const PARTITIONED_BLOOM_INDEX_ENTRY_SIZE: usize = 16;
+
+pub(crate) fn bloom_lookup_key(key: &[u8], prefix_extractor_len: usize) -> &[u8] {
+    if prefix_extractor_len == 0 || key.len() <= prefix_extractor_len {
+        key
+    } else {
+        &key[..prefix_extractor_len]
+    }
+}
+
 /// BloomFilter 构建器，用于构建 SSTable 的 BloomFilter
 pub struct BloomBuilder {
     bitmap: Vec<u8>,

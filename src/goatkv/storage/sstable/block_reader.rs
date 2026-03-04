@@ -1,7 +1,16 @@
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::format::coding;
+use crate::goatkv::format::internal_key::InternalKey;
+
+#[derive(Debug)]
+pub(crate) struct BlockSearchIndex {
+    restarts: Arc<[u32]>,
+    restart_keys: Arc<[Vec<u8>]>,
+    data_end: usize,
+}
 
 /// SSTable块读取器，用于解码BlockBuilder创建的块
 #[derive(Debug)]
@@ -9,9 +18,9 @@ pub struct BlockReader<'a> {
     /// 块的原始数据
     data: &'a [u8],
     /// 重启点数组
-    restarts: Vec<u32>,
+    restarts: Arc<[u32]>,
     /// 每个重启点对应的完整 key（解码缓存，避免查找时重复解码）
-    restart_keys: Vec<Vec<u8>>,
+    restart_keys: Arc<[Vec<u8>]>,
     /// 数据部分的结束位置（不包括重启点数组）
     data_end: usize,
 }
@@ -27,6 +36,11 @@ struct DecodedEntryView<'a> {
 impl<'a> BlockReader<'a> {
     /// 从原始字节创建BlockReader
     pub fn new(data: &'a [u8]) -> GoatResult<Self> {
+        let search_index = Arc::new(Self::parse_search_index(data)?);
+        Self::with_search_index(data, search_index)
+    }
+
+    pub(crate) fn parse_search_index(data: &'a [u8]) -> GoatResult<BlockSearchIndex> {
         if data.len() < 4 {
             return Err(GoatError::corruption(
                 "block_reader",
@@ -46,10 +60,9 @@ impl<'a> BlockReader<'a> {
         if restart_count == 0 {
             // When restart count is 0, data ends at restart count position (last 4 bytes)
             // The actual data ends just before the restart count
-            return Ok(Self {
-                data,
-                restarts: Vec::new(),
-                restart_keys: Vec::new(),
+            return Ok(BlockSearchIndex {
+                restarts: Arc::from(Vec::<u32>::new().into_boxed_slice()),
+                restart_keys: Arc::from(Vec::<Vec<u8>>::new().into_boxed_slice()),
                 data_end: data.len() - 4,
             });
         }
@@ -87,14 +100,50 @@ impl<'a> BlockReader<'a> {
         }
 
         // data_end should be restart_start to exclude restart array from iteration
-        let mut reader = Self {
+        let reader = Self {
             data,
-            restarts,
-            restart_keys: Vec::new(),
+            restarts: Arc::from(restarts.clone().into_boxed_slice()),
+            restart_keys: Arc::from(Vec::<Vec<u8>>::new().into_boxed_slice()),
             data_end: restart_start,
         };
-        reader.restart_keys = reader.collect_restart_keys();
-        Ok(reader)
+        let restart_keys = reader.collect_restart_keys();
+
+        Ok(BlockSearchIndex {
+            restarts: Arc::from(restarts.into_boxed_slice()),
+            restart_keys: Arc::from(restart_keys.into_boxed_slice()),
+            data_end: restart_start,
+        })
+    }
+
+    pub(crate) fn with_search_index(
+        data: &'a [u8],
+        search_index: Arc<BlockSearchIndex>,
+    ) -> GoatResult<Self> {
+        if data.len() < 4 {
+            return Err(GoatError::corruption(
+                "block_reader",
+                "block too small to contain restart count",
+            ));
+        }
+        if search_index.data_end > data.len() {
+            return Err(GoatError::corruption(
+                "block_reader",
+                "search index data_end out of range",
+            ));
+        }
+        if search_index.restart_keys.len() != search_index.restarts.len() {
+            return Err(GoatError::corruption(
+                "block_reader",
+                "search index restart key count mismatch",
+            ));
+        }
+
+        Ok(Self {
+            data,
+            restarts: search_index.restarts.clone(),
+            restart_keys: search_index.restart_keys.clone(),
+            data_end: search_index.data_end,
+        })
     }
 
     /// 获取块中的条目数量
@@ -152,8 +201,8 @@ impl<'a> BlockReader<'a> {
     }
 
     /// 在块中按 UserKey 查找第一个匹配条目。
-    /// 返回 (InternalKey原始字节, value)。
-    pub fn get_by_user_key(&self, user_key: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    /// 返回 (InternalKey, value)。
+    pub fn get_by_user_key(&self, user_key: &[u8]) -> Option<(InternalKey, Vec<u8>)> {
         if self.restarts.is_empty() {
             return self.linear_search_from_start_by_user_key(user_key);
         }
@@ -231,7 +280,7 @@ impl<'a> BlockReader<'a> {
 
     fn collect_restart_keys(&self) -> Vec<Vec<u8>> {
         let mut keys = Vec::with_capacity(self.restarts.len());
-        for &restart in &self.restarts {
+        for &restart in self.restarts.iter() {
             let restart_pos = restart as usize;
             if restart_pos >= self.data_end {
                 keys.push(Vec::new());
@@ -308,7 +357,7 @@ impl<'a> BlockReader<'a> {
         &self,
         restart_index: usize,
         user_key: &[u8],
-    ) -> Option<(Vec<u8>, Vec<u8>)> {
+    ) -> Option<(InternalKey, Vec<u8>)> {
         let restart_pos = self.restarts[restart_index] as usize;
         let end_pos = if restart_index + 1 < self.restarts.len() {
             self.restarts[restart_index + 1] as usize
@@ -373,7 +422,10 @@ impl<'a> BlockReader<'a> {
         None
     }
 
-    fn linear_search_from_start_by_user_key(&self, user_key: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    fn linear_search_from_start_by_user_key(
+        &self,
+        user_key: &[u8],
+    ) -> Option<(InternalKey, Vec<u8>)> {
         self.linear_search_range_by_user_key(0, self.data_end, user_key)
     }
 
@@ -410,7 +462,7 @@ impl<'a> BlockReader<'a> {
         None
     }
 
-    fn linear_search_full_by_user_key(&self, user_key: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    fn linear_search_full_by_user_key(&self, user_key: &[u8]) -> Option<(InternalKey, Vec<u8>)> {
         let iter = self.iter();
 
         for (full_key, value) in iter {
@@ -421,7 +473,10 @@ impl<'a> BlockReader<'a> {
 
             match full_user_key.cmp(user_key) {
                 Ordering::Less => {}
-                Ordering::Equal => return Some((full_key, value)),
+                Ordering::Equal => {
+                    let internal_key = Self::decode_internal_key_owned(full_key)?;
+                    return Some((internal_key, value));
+                }
                 Ordering::Greater => return None,
             }
         }
@@ -434,7 +489,7 @@ impl<'a> BlockReader<'a> {
         start_pos: usize,
         end_pos: usize,
         user_key: &[u8],
-    ) -> Option<(Vec<u8>, Vec<u8>)> {
+    ) -> Option<(InternalKey, Vec<u8>)> {
         let mut current_pos = start_pos;
         let mut prev_key = Vec::new();
 
@@ -471,7 +526,9 @@ impl<'a> BlockReader<'a> {
                     current_pos += entry.total_len;
                 }
                 Ordering::Equal => {
-                    return Some((prev_key.clone(), entry.value.to_vec()));
+                    let raw_internal_key = std::mem::take(&mut prev_key);
+                    let internal_key = Self::decode_internal_key_owned(raw_internal_key)?;
+                    return Some((internal_key, entry.value.to_vec()));
                 }
                 Ordering::Greater => {
                     return None;
@@ -571,6 +628,19 @@ impl<'a> BlockReader<'a> {
 
     fn user_key_of_internal_key(raw: &[u8]) -> Option<&[u8]> {
         raw.get(..raw.len().checked_sub(8)?)
+    }
+
+    fn decode_internal_key_owned(mut raw_key: Vec<u8>) -> Option<InternalKey> {
+        if raw_key.len() < 8 {
+            return None;
+        }
+
+        let n = raw_key.len();
+        let mut encoded_trailer = [0u8; 8];
+        encoded_trailer.copy_from_slice(&raw_key[n - 8..]);
+        raw_key.truncate(n - 8);
+        let encoded = !u64::from_be_bytes(encoded_trailer);
+        Some(InternalKey::from_encoded(raw_key, encoded))
     }
 
     /// 创建块的迭代器
@@ -817,8 +887,8 @@ mod tests {
         let (data, _) = builder.finish();
 
         let reader = BlockReader::new(data).unwrap();
-        let (raw_key, value) = reader.get_by_user_key(b"k1").unwrap();
-        assert_eq!(raw_key, k1_latest);
+        let (internal_key, value) = reader.get_by_user_key(b"k1").unwrap();
+        assert_eq!(internal_key.serialize(), k1_latest);
         assert_eq!(value, b"v30".to_vec());
         assert!(reader.get_by_user_key(b"absent").is_none());
     }
@@ -846,8 +916,8 @@ mod tests {
 
         let (data, _) = builder.finish();
         let reader = BlockReader::new(data).unwrap();
-        let (raw_key, value) = reader.get_by_user_key(b"bb").unwrap();
-        assert_eq!(raw_key, expected_latest_bb_key);
+        let (internal_key, value) = reader.get_by_user_key(b"bb").unwrap();
+        assert_eq!(internal_key.serialize(), expected_latest_bb_key);
         assert_eq!(value, b"bb_200".to_vec());
     }
 }

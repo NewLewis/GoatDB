@@ -181,11 +181,13 @@ impl FlushWorker {
         sstable_paths: Arc<SstablePaths>,
         flush_failure_streak_limit: usize,
         compaction_config: CompactionConfig,
+        bloom_prefix_extractor_len: usize,
     ) -> Self {
         let (flush_tx, flush_rx) = mpsc::channel();
         let (compaction_tx, compaction_rx) = mpsc::channel();
         let flush_failure_streak_limit = flush_failure_streak_limit.max(1);
         let compaction_config = compaction_config.normalized();
+        let bloom_prefix_extractor_len = bloom_prefix_extractor_len.min(u16::MAX as usize);
 
         let compaction_handle = {
             let lsm_state = Arc::clone(&lsm_state);
@@ -198,6 +200,7 @@ impl FlushWorker {
                     version_set,
                     sstable_paths,
                     compaction_config,
+                    bloom_prefix_extractor_len,
                 );
             })
         };
@@ -212,6 +215,7 @@ impl FlushWorker {
                     sstable_paths,
                     compaction_tx_for_flush,
                     flush_failure_streak_limit,
+                    bloom_prefix_extractor_len,
                 );
             })
         };
@@ -250,6 +254,7 @@ impl FlushWorker {
         sstable_paths: Arc<SstablePaths>,
         compaction_sender: mpsc::Sender<()>,
         flush_failure_streak_limit: usize,
+        bloom_prefix_extractor_len: usize,
     ) {
         while let Ok(task) = rx.recv() {
             // 从任务中获取要刷盘的 immutable memtable
@@ -303,7 +308,11 @@ impl FlushWorker {
             };
 
             // 单次尝试：失败直接报错，不进行重试。
-            let mut sst_builder = match SSTableBuilder::new(file_id, &sstable_paths) {
+            let mut sst_builder = match SSTableBuilder::new_with_bloom_prefix_extractor(
+                file_id,
+                &sstable_paths,
+                bloom_prefix_extractor_len,
+            ) {
                 Ok(builder) => builder,
                 Err(e) => {
                     Self::record_flush_failure(
@@ -396,9 +405,16 @@ impl FlushWorker {
         version_set: Arc<RwLock<VersionSet>>,
         sstable_paths: Arc<SstablePaths>,
         compaction_config: CompactionConfig,
+        bloom_prefix_extractor_len: usize,
     ) {
         while rx.recv().is_ok() {
-            Self::maybe_compact_levels(&lsm_state, &version_set, &sstable_paths, compaction_config);
+            Self::maybe_compact_levels(
+                &lsm_state,
+                &version_set,
+                &sstable_paths,
+                compaction_config,
+                bloom_prefix_extractor_len,
+            );
         }
     }
 
@@ -451,6 +467,7 @@ impl FlushWorker {
         version_set: &Arc<RwLock<VersionSet>>,
         sstable_paths: &Arc<SstablePaths>,
         compaction_config: CompactionConfig,
+        bloom_prefix_extractor_len: usize,
     ) {
         loop {
             let plan = {
@@ -463,7 +480,13 @@ impl FlushWorker {
                 break;
             };
 
-            if !Self::compact_one_level(lsm_state, version_set, sstable_paths, plan) {
+            if !Self::compact_one_level(
+                lsm_state,
+                version_set,
+                sstable_paths,
+                plan,
+                bloom_prefix_extractor_len,
+            ) {
                 break;
             }
         }
@@ -704,6 +727,7 @@ impl FlushWorker {
         version_set: &Arc<RwLock<VersionSet>>,
         sstable_paths: &Arc<SstablePaths>,
         plan: CompactionPlan,
+        bloom_prefix_extractor_len: usize,
     ) -> bool {
         let mut version_edit = VersionEdit::new();
         for file in &plan.source_files {
@@ -769,6 +793,7 @@ impl FlushWorker {
             &mut stream,
             &plan.grandparent_files,
             plan.grandparent_overlap_bytes_limit,
+            bloom_prefix_extractor_len,
         ) {
             Ok(result) => result,
             Err(e) => {
@@ -817,6 +842,7 @@ impl FlushWorker {
         stream: &mut CompactionStream,
         grandparent_files: &[Arc<FileMetadata>],
         grandparent_overlap_bytes_limit: u64,
+        bloom_prefix_extractor_len: usize,
     ) -> GoatResult<(Vec<(u64, TableProperties)>, u64)> {
         let mut outputs = Vec::new();
         let mut current_file_id: Option<u64> = None;
@@ -870,14 +896,20 @@ impl FlushWorker {
                     let mut vs = version_set.write().unwrap();
                     vs.allocate_file_number()
                 };
-                builder = Some(match SSTableBuilder::new(file_id, sstable_paths) {
-                    Ok(builder) => builder,
-                    Err(e) => {
-                        let output_ids = outputs.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-                        Self::cleanup_generated_sstables(sstable_paths, &output_ids);
-                        return Err(e);
-                    }
-                });
+                builder = Some(
+                    match SSTableBuilder::new_with_bloom_prefix_extractor(
+                        file_id,
+                        sstable_paths,
+                        bloom_prefix_extractor_len,
+                    ) {
+                        Ok(builder) => builder,
+                        Err(e) => {
+                            let output_ids = outputs.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+                            Self::cleanup_generated_sstables(sstable_paths, &output_ids);
+                            return Err(e);
+                        }
+                    },
+                );
                 current_file_id = Some(file_id);
                 current_smallest_user = Some(internal_key.user_key().to_vec());
             }
@@ -1174,7 +1206,7 @@ mod tests {
             grandparent_overlap_bytes_limit: u64::MAX,
         };
 
-        let ok = FlushWorker::compact_one_level(&lsm_state, &version_set, &sstable_paths, plan);
+        let ok = FlushWorker::compact_one_level(&lsm_state, &version_set, &sstable_paths, plan, 0);
         assert!(!ok, "compaction should fail when apply_edit fails");
         assert!(
             version_set.read().unwrap().next_file_number() > expected_output_file_id,

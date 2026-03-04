@@ -154,6 +154,11 @@ pub struct KvEngineOptions {
     /// slowdown 时每轮等待时长（毫秒）
     /// Default: 1ms
     pub write_slowdown_delay_ms: u64,
+
+    /// Prefix extractor length for BloomFilter key projection.
+    /// 0 means disabled (use full user key).
+    /// Default: 0
+    pub bloom_prefix_extractor_len: usize,
 }
 
 impl Default for KvEngineOptions {
@@ -194,6 +199,7 @@ impl Default for KvEngineOptions {
             soft_pending_compaction_bytes_limit: 64 * 1024 * 1024,
             hard_pending_compaction_bytes_limit: 256 * 1024 * 1024,
             write_slowdown_delay_ms: 1,
+            bloom_prefix_extractor_len: 0,
         }
     }
 }
@@ -390,6 +396,13 @@ impl KvEngineOptions {
         self
     }
 
+    /// Sets BloomFilter prefix extractor length.
+    pub fn with_bloom_prefix_extractor_len(mut self, prefix_len: usize) -> Self {
+        // Serialized as u16 in SSTable bloom section.
+        self.bloom_prefix_extractor_len = prefix_len.min(u16::MAX as usize);
+        self
+    }
+
     /// Creates options suitable for testing
     ///
     /// This creates a KvEngineOptions with a temporary data directory
@@ -443,6 +456,7 @@ impl KvEngineOptions {
             soft_pending_compaction_bytes_limit: 64 * 1024 * 1024,
             hard_pending_compaction_bytes_limit: 256 * 1024 * 1024,
             write_slowdown_delay_ms: 1,
+            bloom_prefix_extractor_len: 0,
         }
     }
 }
@@ -571,6 +585,15 @@ mod tests {
             .with_hard_pending_compaction_bytes_limit(0);
         assert_eq!(options.soft_pending_compaction_bytes_limit, 1);
         assert_eq!(options.hard_pending_compaction_bytes_limit, 1);
+    }
+
+    #[test]
+    fn test_with_bloom_prefix_extractor_len() {
+        let options = KvEngineOptions::default().with_bloom_prefix_extractor_len(16);
+        assert_eq!(options.bloom_prefix_extractor_len, 16);
+
+        let options = KvEngineOptions::default().with_bloom_prefix_extractor_len(usize::MAX);
+        assert_eq!(options.bloom_prefix_extractor_len, u16::MAX as usize);
     }
 
     #[test]

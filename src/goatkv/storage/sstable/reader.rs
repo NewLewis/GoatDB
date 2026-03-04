@@ -1,8 +1,8 @@
 use std::cmp::Ordering;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
@@ -11,7 +11,11 @@ use std::os::windows::fs::FileExt;
 
 use crc32fast::Hasher;
 
-use super::block_reader::BlockReader;
+use super::block_reader::{BlockReader, BlockSearchIndex};
+use super::bloom::{
+    bloom_lookup_key, BloomFilter, PARTITIONED_BLOOM_HEADER_SIZE,
+    PARTITIONED_BLOOM_INDEX_ENTRY_SIZE, PARTITIONED_BLOOM_MAGIC, PARTITIONED_BLOOM_VERSION,
+};
 use super::cache::{BlockCache, BlockCacheKey};
 use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::format::coding;
@@ -35,6 +39,25 @@ struct IndexEntry {
     block_size: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BloomPartitionIndexEntry {
+    offset: u64,
+    size: u64,
+}
+
+#[derive(Debug)]
+enum BloomFilterStorage {
+    Legacy(BloomFilter),
+    Partitioned(PartitionedBloomFilter),
+}
+
+#[derive(Debug)]
+struct PartitionedBloomFilter {
+    prefix_extractor_len: usize,
+    partitions: Vec<BloomPartitionIndexEntry>,
+    loaded_partitions: Mutex<HashMap<usize, Arc<BloomFilter>>>,
+}
+
 /// SSTable 读取器，用于读取和查询 SSTable 文件
 #[derive(Debug)]
 pub struct SSTableReader {
@@ -45,11 +68,13 @@ pub struct SSTableReader {
     /// 文件句柄
     file: File,
     /// BloomFilter
-    bloom_filter: super::bloom::BloomFilter,
+    bloom_filter: BloomFilterStorage,
     /// 索引条目列表，按分隔键排序
     index_entries: Vec<IndexEntry>,
     /// 可选数据块缓存
     block_cache: Option<Arc<BlockCache>>,
+    /// 数据块解析索引缓存（按 data block 索引缓存 restart 索引，避免热点 get 重复解码）
+    block_search_indexes: Vec<OnceLock<Arc<BlockSearchIndex>>>,
 }
 
 impl SSTableReader {
@@ -143,6 +168,90 @@ impl SSTableReader {
         }
 
         Ok(payload)
+    }
+
+    fn read_legacy_bloom_filter(
+        file: &File,
+        bloom_offset: u64,
+        size: u64,
+    ) -> GoatResult<BloomFilter> {
+        let mut bloom_bitmap = vec![0u8; size as usize];
+        Self::read_exact_at(file, bloom_offset, &mut bloom_bitmap, "sstable_read_bloom")?;
+        Ok(BloomFilter::new(bloom_bitmap))
+    }
+
+    fn parse_partitioned_bloom_filter(
+        file: &File,
+        bloom_offset: u64,
+        bloom_size: u64,
+    ) -> GoatResult<Option<PartitionedBloomFilter>> {
+        if bloom_size < PARTITIONED_BLOOM_HEADER_SIZE as u64 {
+            return Ok(None);
+        }
+
+        let mut header = [0u8; PARTITIONED_BLOOM_HEADER_SIZE];
+        Self::read_exact_at(file, bloom_offset, &mut header, "sstable_read_bloom_header")?;
+        if header[..4] != PARTITIONED_BLOOM_MAGIC {
+            return Ok(None);
+        }
+
+        let version = header[4];
+        if version != PARTITIONED_BLOOM_VERSION {
+            return Err(Self::corruption(format!(
+                "unsupported partitioned bloom version: {}",
+                version
+            )));
+        }
+
+        let prefix_extractor_len = u16::from_le_bytes([header[5], header[6]]) as usize;
+        let partition_count =
+            u32::from_le_bytes([header[7], header[8], header[9], header[10]]) as usize;
+        let index_size = PARTITIONED_BLOOM_INDEX_ENTRY_SIZE.saturating_mul(partition_count);
+        let data_start = PARTITIONED_BLOOM_HEADER_SIZE.saturating_add(index_size);
+        if data_start as u64 > bloom_size {
+            return Err(Self::corruption(format!(
+                "partitioned bloom index out of range: data_start={}, bloom_size={}",
+                data_start, bloom_size
+            )));
+        }
+
+        let mut index_buf = vec![0u8; index_size];
+        if !index_buf.is_empty() {
+            Self::read_exact_at(
+                file,
+                bloom_offset + PARTITIONED_BLOOM_HEADER_SIZE as u64,
+                &mut index_buf,
+                "sstable_read_bloom_index",
+            )?;
+        }
+
+        let mut partitions = Vec::with_capacity(partition_count);
+        for entry in index_buf.chunks_exact(PARTITIONED_BLOOM_INDEX_ENTRY_SIZE) {
+            let offset = u64::from_le_bytes([
+                entry[0], entry[1], entry[2], entry[3], entry[4], entry[5], entry[6], entry[7],
+            ]);
+            let size = u64::from_le_bytes([
+                entry[8], entry[9], entry[10], entry[11], entry[12], entry[13], entry[14],
+                entry[15],
+            ]);
+            let end = offset.saturating_add(size);
+            if end > bloom_size || offset < data_start as u64 {
+                return Err(Self::corruption(format!(
+                    "partitioned bloom entry out of range: offset={}, size={}, bloom_size={}",
+                    offset, size, bloom_size
+                )));
+            }
+            partitions.push(BloomPartitionIndexEntry {
+                offset: bloom_offset.saturating_add(offset),
+                size,
+            });
+        }
+
+        Ok(Some(PartitionedBloomFilter {
+            prefix_extractor_len,
+            partitions,
+            loaded_partitions: Mutex::new(HashMap::new()),
+        }))
     }
 
     /// 打开并解析 SSTable 文件
@@ -265,12 +374,19 @@ impl SSTableReader {
             )));
         }
 
-        // 5. 读取 BloomFilter
-        // BloomFilter 的大小是 index_offset - bloom_offset
+        // 5. 读取 BloomFilter（兼容 legacy bitmap 和 partitioned bloom）
         let bloom_filter_size = index_offset - bloom_offset;
-        let mut bloom_bitmap = vec![0u8; bloom_filter_size as usize];
-        Self::read_exact_at(&file, bloom_offset, &mut bloom_bitmap, "sstable_read_bloom")?;
-        let bloom_filter = super::bloom::BloomFilter::new(bloom_bitmap);
+        let bloom_filter = if let Some(partitioned) =
+            Self::parse_partitioned_bloom_filter(&file, bloom_offset, bloom_filter_size)?
+        {
+            BloomFilterStorage::Partitioned(partitioned)
+        } else {
+            BloomFilterStorage::Legacy(Self::read_legacy_bloom_filter(
+                &file,
+                bloom_offset,
+                bloom_filter_size,
+            )?)
+        };
 
         // 6. 读取和解析索引块
         // index_offset 是索引块的开始位置
@@ -360,6 +476,18 @@ impl SSTableReader {
         // 确保索引条目按分隔键排序
         index_entries.sort_by(|a, b| a.separator.cmp(&b.separator));
 
+        if let BloomFilterStorage::Partitioned(partitioned) = &bloom_filter {
+            if partitioned.partitions.len() != index_entries.len() {
+                return Err(Self::corruption(format!(
+                    "partitioned bloom partition count {} does not match data blocks {}",
+                    partitioned.partitions.len(),
+                    index_entries.len()
+                )));
+            }
+        }
+
+        let block_search_indexes = (0..index_entries.len()).map(|_| OnceLock::new()).collect();
+
         Ok(Self {
             file_path: path_ref.to_string_lossy().to_string(),
             file_id,
@@ -367,12 +495,33 @@ impl SSTableReader {
             bloom_filter,
             index_entries,
             block_cache,
+            block_search_indexes,
         })
     }
 
     /// 检查 key 是否可能存在于 SSTable 中（使用 BloomFilter 快速过滤）
     pub fn may_contain(&self, key: &[u8]) -> bool {
-        self.bloom_filter.contains(key)
+        match &self.bloom_filter {
+            BloomFilterStorage::Legacy(filter) => filter.contains(key),
+            BloomFilterStorage::Partitioned(_) => {
+                let probe_key =
+                    InternalKey::new(key.to_vec(), SEQUENCE_NUMBER_MAX, InternalKeyKind::Put);
+                let Some(block_index) = self.find_block_index_for_key(&probe_key.serialize())
+                else {
+                    return false;
+                };
+                self.may_contain_for_block(key, block_index).unwrap_or(true)
+            }
+        }
+    }
+
+    fn may_contain_for_block(&self, key: &[u8], block_index: usize) -> GoatResult<bool> {
+        match &self.bloom_filter {
+            BloomFilterStorage::Legacy(filter) => Ok(filter.contains(key)),
+            BloomFilterStorage::Partitioned(partitioned) => {
+                partitioned.may_contain(&self.file, key, block_index)
+            }
+        }
     }
 
     fn read_block_from_file(&self, block_offset: u64, block_size: u64) -> GoatResult<Vec<u8>> {
@@ -406,38 +555,68 @@ impl SSTableReader {
         Ok(Arc::new(block_payload))
     }
 
-    /// 在 SSTable 中查找指定的 key (UserKey)
-    pub fn get(&self, key: &[u8]) -> GoatResult<Option<(InternalKey, Vec<u8>)>> {
-        // 1. 使用 BloomFilter 快速过滤 (BloomFilter now indexes UserKey)
-        if !self.may_contain(key) {
-            return Ok(None);
+    fn load_block_search_index(
+        &self,
+        block_index: usize,
+        block_payload: &Arc<Vec<u8>>,
+    ) -> GoatResult<Arc<BlockSearchIndex>> {
+        let Some(slot) = self.block_search_indexes.get(block_index) else {
+            return Err(Self::corruption(format!(
+                "data block index out of range: {}",
+                block_index
+            )));
+        };
+
+        if let Some(index) = slot.get() {
+            return Ok(index.clone());
         }
 
+        let parsed = Arc::new(
+            BlockReader::parse_search_index(block_payload.as_slice()).map_err(|e| {
+                Self::corruption(format!("Failed to parse data block index: {}", e))
+            })?,
+        );
+
+        Ok(slot.get_or_init(|| parsed).clone())
+    }
+
+    /// 在 SSTable 中查找指定的 key (UserKey)
+    pub fn get(&self, key: &[u8]) -> GoatResult<Option<(InternalKey, Vec<u8>)>> {
         let probe_key = InternalKey::new(key.to_vec(), SEQUENCE_NUMBER_MAX, InternalKeyKind::Put);
 
         let block_info = self.find_block_for_key(&probe_key.serialize());
 
-        let (block_offset, block_size) = match block_info {
+        let (block_index, block_offset, block_size) = match block_info {
             Some(info) => info,
             None => return Ok(None),
         };
 
+        // 1. 使用 BloomFilter 快速过滤（partitioned bloom 只加载命中分区）
+        if !self.may_contain_for_block(key, block_index)? {
+            return Ok(None);
+        }
+
         // 3. 读取数据块（优先 block cache）
         let block_payload = self.load_data_block_payload(block_offset, block_size)?;
+        let block_search_index = self.load_block_search_index(block_index, &block_payload)?;
 
         // 4. 在数据块中查找 key
-        let block_reader = match BlockReader::new(block_payload.as_slice()) {
-            Ok(reader) => reader,
-            Err(e) => {
-                return Err(Self::corruption(format!(
-                    "Failed to parse data block: {}",
-                    e
-                )));
-            }
-        };
+        let block_reader =
+            match BlockReader::with_search_index(block_payload.as_slice(), block_search_index) {
+                Ok(reader) => reader,
+                Err(e) => {
+                    return Err(Self::corruption(format!(
+                        "Failed to parse data block: {}",
+                        e
+                    )));
+                }
+            };
 
-        if let Some((raw_internal_key, value)) = block_reader.get_by_user_key(key) {
-            return Ok(Some((Self::decode_internal_key(&raw_internal_key)?, value)));
+        if let Some((internal_key, value)) = block_reader.get_by_user_key(key) {
+            internal_key
+                .kind()
+                .map_err(|e| Self::corruption(format!("invalid internal key kind: {}", e)))?;
+            return Ok(Some((internal_key, value)));
         }
 
         Ok(None)
@@ -465,7 +644,13 @@ impl SSTableReader {
     }
 
     /// 查找包含指定 key 的数据块
-    fn find_block_for_key(&self, key: &[u8]) -> Option<(u64, u64)> {
+    fn find_block_for_key(&self, key: &[u8]) -> Option<(usize, u64, u64)> {
+        let block_index = self.find_block_index_for_key(key)?;
+        let entry = &self.index_entries[block_index];
+        Some((block_index, entry.block_offset, entry.block_size))
+    }
+
+    fn find_block_index_for_key(&self, key: &[u8]) -> Option<usize> {
         if self.index_entries.is_empty() {
             return None;
         }
@@ -484,12 +669,10 @@ impl SSTableReader {
 
         // left 是第一个分隔键 >= key 的位置
         if left < self.index_entries.len() {
-            let entry = &self.index_entries[left];
-            Some((entry.block_offset, entry.block_size))
+            Some(left)
         } else if !self.index_entries.is_empty() {
             // key 大于所有分隔键，应该位于最后一个块中
-            let entry = &self.index_entries[self.index_entries.len() - 1];
-            Some((entry.block_offset, entry.block_size))
+            Some(self.index_entries.len() - 1)
         } else {
             None
         }
@@ -508,6 +691,64 @@ impl SSTableReader {
     /// 获取索引条目数量
     pub fn index_entry_count(&self) -> usize {
         self.index_entries.len()
+    }
+
+    #[cfg(test)]
+    fn loaded_bloom_partition_count_for_test(&self) -> usize {
+        match &self.bloom_filter {
+            BloomFilterStorage::Legacy(_) => 0,
+            BloomFilterStorage::Partitioned(partitioned) => {
+                partitioned.loaded_partition_count_for_test()
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn cached_block_search_index_count_for_test(&self) -> usize {
+        self.block_search_indexes
+            .iter()
+            .filter(|slot| slot.get().is_some())
+            .count()
+    }
+}
+
+impl PartitionedBloomFilter {
+    fn may_contain(&self, file: &File, key: &[u8], block_index: usize) -> GoatResult<bool> {
+        let Some(partition) = self.partitions.get(block_index) else {
+            return Ok(true);
+        };
+
+        if let Some(filter) = self
+            .loaded_partitions
+            .lock()
+            .unwrap()
+            .get(&block_index)
+            .cloned()
+        {
+            return Ok(filter.contains(bloom_lookup_key(key, self.prefix_extractor_len)));
+        }
+
+        let mut partition_bitmap = vec![0u8; partition.size as usize];
+        SSTableReader::read_exact_at(
+            file,
+            partition.offset,
+            &mut partition_bitmap,
+            "sstable_read_bloom_partition",
+        )?;
+        let loaded = Arc::new(BloomFilter::new(partition_bitmap));
+        let filter = {
+            let mut guard = self.loaded_partitions.lock().unwrap();
+            guard
+                .entry(block_index)
+                .or_insert_with(|| loaded.clone())
+                .clone()
+        };
+        Ok(filter.contains(bloom_lookup_key(key, self.prefix_extractor_len)))
+    }
+
+    #[cfg(test)]
+    fn loaded_partition_count_for_test(&self) -> usize {
+        self.loaded_partitions.lock().unwrap().len()
     }
 }
 
@@ -573,7 +814,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let (_, sstable_paths, _) = KvEngine::init_db_paths(temp_dir.path()).unwrap();
 
-        let mut builder = SSTableBuilder::new_with_manager(1, &sstable_paths).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &sstable_paths, 0).unwrap();
 
         // 添加一些测试数据，使用 InternalKey 格式（与生产环境一致）
         // 使用递减的序列号以确保正确的排序
@@ -608,7 +849,7 @@ mod tests {
         // 创建200条数据并测试完整迭代
         let temp_dir = TempDir::new().unwrap();
         let (_, sstable_paths, _) = KvEngine::init_db_paths(temp_dir.path()).unwrap();
-        let mut builder = SSTableBuilder::new_with_manager(1, &sstable_paths).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &sstable_paths, 0).unwrap();
 
         let mut test_data = Vec::new();
         for i in 0..200 {
@@ -703,6 +944,20 @@ mod tests {
     }
 
     #[test]
+    fn test_sstable_reader_reuses_cached_block_search_index_for_hot_get() {
+        let (_temp_dir, sst_path) = create_test_sstable();
+        let reader = SSTableReader::open(&sst_path).unwrap();
+
+        assert_eq!(reader.cached_block_search_index_count_for_test(), 0);
+        assert!(reader.get(b"apple").unwrap().is_some());
+        assert_eq!(reader.cached_block_search_index_count_for_test(), 1);
+
+        // Same data block hit should reuse cached restart index instead of reparsing.
+        assert!(reader.get(b"banana").unwrap().is_some());
+        assert_eq!(reader.cached_block_search_index_count_for_test(), 1);
+    }
+
+    #[test]
     fn test_sstable_reader_may_contain() {
         let (_temp_dir, sst_path) = create_test_sstable();
         let reader = SSTableReader::open(&sst_path).unwrap();
@@ -714,6 +969,66 @@ mod tests {
         // 对不存在的key可能返回true或false（允许误报）
         // 我们只验证方法调用不会panic
         let _ = reader.may_contain(b"nonexistent");
+    }
+
+    #[test]
+    fn test_partitioned_bloom_respects_prefix_extractor() {
+        let temp_dir = TempDir::new().unwrap();
+        let (_, sstable_paths, _) = KvEngine::init_db_paths(temp_dir.path()).unwrap();
+        let mut builder = SSTableBuilder::new_with_bloom_prefix_extractor(1, &sstable_paths, 3)
+            .expect("create sstable builder");
+
+        let rows = [
+            (b"abc-001".as_slice(), b"v1".as_slice()),
+            (b"abc-002".as_slice(), b"v2".as_slice()),
+            (b"xyz-001".as_slice(), b"v3".as_slice()),
+        ];
+        for (idx, (user_key, value)) in rows.iter().enumerate() {
+            let internal_key = InternalKey::new(
+                (*user_key).to_vec(),
+                (100 - idx) as u64,
+                InternalKeyKind::Put,
+            );
+            builder
+                .write(&internal_key.serialize(), value)
+                .expect("write row");
+        }
+        builder.finish().expect("finish sstable");
+
+        let sst_path = sstable_paths.sstable_path_by_id(1);
+        let reader = SSTableReader::open(&sst_path).expect("open reader");
+
+        // Prefix bloom should return true for any key that shares an inserted prefix.
+        assert!(reader.may_contain(b"abc-999"));
+        assert_eq!(reader.get(b"abc-999").expect("get"), None);
+        assert!(!reader.may_contain(b"qqq-111"));
+    }
+
+    #[test]
+    fn test_partitioned_bloom_loads_partitions_lazily() {
+        let temp_dir = TempDir::new().unwrap();
+        let (_, sstable_paths, _) = KvEngine::init_db_paths(temp_dir.path()).unwrap();
+        let mut builder = SSTableBuilder::new_with_bloom_prefix_extractor(1, &sstable_paths, 0)
+            .expect("create sstable builder");
+
+        for i in 0..128u64 {
+            let user_key = format!("lazy_key_{:03}", i).into_bytes();
+            let internal_key = InternalKey::new(user_key, i, InternalKeyKind::Put);
+            let value = vec![b'x'; 1024];
+            builder
+                .write(&internal_key.serialize(), &value)
+                .expect("write row");
+        }
+        builder.finish().expect("finish sstable");
+
+        let sst_path = sstable_paths.sstable_path_by_id(1);
+        let reader = SSTableReader::open(&sst_path).expect("open reader");
+
+        assert_eq!(reader.loaded_bloom_partition_count_for_test(), 0);
+        assert!(reader.may_contain(b"lazy_key_003"));
+        assert_eq!(reader.loaded_bloom_partition_count_for_test(), 1);
+        assert!(reader.may_contain(b"lazy_key_120"));
+        assert!(reader.loaded_bloom_partition_count_for_test() >= 2);
     }
 
     #[test]
@@ -744,7 +1059,7 @@ mod tests {
     fn test_sstable_reader_reports_invalid_internal_key_kind() {
         let temp_dir = TempDir::new().unwrap();
         let (_, sstable_paths, _) = KvEngine::init_db_paths(temp_dir.path()).unwrap();
-        let mut builder = SSTableBuilder::new_with_manager(1, &sstable_paths).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &sstable_paths, 0).unwrap();
 
         let mut raw_key = b"bad_kind".to_vec();
         let encoded_sequence_with_invalid_kind = (42u64 << 8) | 2u64;

@@ -526,7 +526,7 @@ mod tests {
     fn build_sstable(file_id: u64) -> (tempfile::TempDir, PathBuf) {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let (_, sstable_paths, _) = KvEngine::init_db_paths(temp_dir.path()).unwrap();
-        let mut builder = SSTableBuilder::new_with_manager(file_id, &sstable_paths).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(file_id, &sstable_paths, 0).unwrap();
         for i in 0..8 {
             let key = format!("k{:02}", i).into_bytes();
             let value = format!("v{:02}", i).into_bytes();
