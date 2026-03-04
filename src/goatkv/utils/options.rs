@@ -85,6 +85,15 @@ pub struct KvEngineOptions {
     /// Default: 256MB
     pub max_mem_queue_bytes: usize,
 
+    /// Maximum immutable memtables allowed before write path enters fail-fast
+    /// backpressure to avoid unbounded memory growth.
+    /// Default: 8
+    pub max_immutable_memtables: usize,
+
+    /// Consecutive flush failures required to open flush circuit breaker.
+    /// Default: 3
+    pub flush_failure_streak_limit: usize,
+
     // ===== VersionSet Options =====
     /// 保留的历史版本数量
     /// Default: 10
@@ -123,6 +132,8 @@ impl Default for KvEngineOptions {
             max_wal_queue_bytes: 256 * 1024 * 1024,
             max_mem_queue_reqs: 65_536,
             max_mem_queue_bytes: 256 * 1024 * 1024,
+            max_immutable_memtables: 8,
+            flush_failure_streak_limit: 3,
             // VersionSet defaults
             max_versions: 10,
             manifest_max_size: 32 * 1024 * 1024, // 32MB
@@ -222,6 +233,18 @@ impl KvEngineOptions {
         self
     }
 
+    /// Sets immutable memtable backlog limit for write fail-fast backpressure.
+    pub fn with_max_immutable_memtables(mut self, max_tables: usize) -> Self {
+        self.max_immutable_memtables = max_tables;
+        self
+    }
+
+    /// Sets consecutive flush failure threshold to open flush circuit breaker.
+    pub fn with_flush_failure_streak_limit(mut self, limit: usize) -> Self {
+        self.flush_failure_streak_limit = limit;
+        self
+    }
+
     /// Sets the maximum number of versions to keep in history
     pub fn with_max_versions(mut self, max: usize) -> Self {
         self.max_versions = max;
@@ -281,6 +304,8 @@ impl KvEngineOptions {
             max_wal_queue_bytes: 256 * 1024 * 1024,
             max_mem_queue_reqs: 65_536,
             max_mem_queue_bytes: 256 * 1024 * 1024,
+            max_immutable_memtables: 128,
+            flush_failure_streak_limit: 3,
             // VersionSet defaults (use same defaults as production)
             max_versions: 10,
             manifest_max_size: 32 * 1024 * 1024, // 32MB
@@ -337,6 +362,18 @@ mod tests {
         assert_eq!(options.mem_table_size, 1024 * 1024);
         assert!(options.recover_from_wal);
         assert!(options.wal_sync);
+    }
+
+    #[test]
+    fn test_with_max_immutable_memtables() {
+        let options = KvEngineOptions::default().with_max_immutable_memtables(16);
+        assert_eq!(options.max_immutable_memtables, 16);
+    }
+
+    #[test]
+    fn test_with_flush_failure_streak_limit() {
+        let options = KvEngineOptions::default().with_flush_failure_streak_limit(5);
+        assert_eq!(options.flush_failure_streak_limit, 5);
     }
 
     #[test]

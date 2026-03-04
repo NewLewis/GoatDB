@@ -154,9 +154,11 @@ impl FlushWorker {
         lsm_state: Arc<RwLock<LSMState>>,
         version_set: Arc<RwLock<VersionSet>>,
         sstable_paths: Arc<SstablePaths>,
+        flush_failure_streak_limit: usize,
     ) -> Self {
         let (flush_tx, flush_rx) = mpsc::channel();
         let (compaction_tx, compaction_rx) = mpsc::channel();
+        let flush_failure_streak_limit = flush_failure_streak_limit.max(1);
 
         let compaction_handle = {
             let lsm_state = Arc::clone(&lsm_state);
@@ -176,6 +178,7 @@ impl FlushWorker {
                     version_set,
                     sstable_paths,
                     compaction_tx_for_flush,
+                    flush_failure_streak_limit,
                 );
             })
         };
@@ -213,6 +216,7 @@ impl FlushWorker {
         version_set: Arc<RwLock<VersionSet>>,
         sstable_paths: Arc<SstablePaths>,
         compaction_sender: mpsc::Sender<()>,
+        flush_failure_streak_limit: usize,
     ) {
         while let Ok(task) = rx.recv() {
             // 从任务中获取要刷盘的 immutable memtable
@@ -236,11 +240,18 @@ impl FlushWorker {
                 let current_version = {
                     let mut vs = version_set.write().unwrap();
                     if let Err(e) = vs.apply_edit(version_edit) {
+                        Self::record_flush_failure(
+                            &lsm_state,
+                            flush_failure_streak_limit,
+                            &e.to_string(),
+                        );
                         error!("Failed to apply VersionEdit: {}", e);
                         continue; // 跳过当前任务，继续处理后续任务
                     }
                     vs.current()
                 };
+
+                Self::reset_flush_failure_streak(&lsm_state);
 
                 Self::update_version_and_remove_task_memtable(
                     &lsm_state,
@@ -262,6 +273,11 @@ impl FlushWorker {
             let mut sst_builder = match SSTableBuilder::new(file_id, &sstable_paths) {
                 Ok(builder) => builder,
                 Err(e) => {
+                    Self::record_flush_failure(
+                        &lsm_state,
+                        flush_failure_streak_limit,
+                        &e.to_string(),
+                    );
                     error!("Failed to create SSTableBuilder: {}", e);
                     continue;
                 }
@@ -276,6 +292,11 @@ impl FlushWorker {
                 max_sequence = max_sequence.max(key.sequence_number());
                 key.serialize_into(&mut key_buf);
                 if let Err(e) = sst_builder.write(&key_buf, value.as_ref()) {
+                    Self::record_flush_failure(
+                        &lsm_state,
+                        flush_failure_streak_limit,
+                        &e.to_string(),
+                    );
                     error!("Failed to write entry to SSTable {}: {}", file_id, e);
                     write_failed = true;
                     break;
@@ -289,6 +310,11 @@ impl FlushWorker {
             let props = match sst_builder.finish() {
                 Ok(meta) => meta,
                 Err(e) => {
+                    Self::record_flush_failure(
+                        &lsm_state,
+                        flush_failure_streak_limit,
+                        &e.to_string(),
+                    );
                     error!("Failed to finish SSTable {}: {}", file_id, e);
                     continue;
                 }
@@ -311,11 +337,18 @@ impl FlushWorker {
             let current_version = {
                 let mut vs = version_set.write().unwrap();
                 if let Err(e) = vs.apply_edit(version_edit) {
+                    Self::record_flush_failure(
+                        &lsm_state,
+                        flush_failure_streak_limit,
+                        &e.to_string(),
+                    );
                     error!("Failed to apply VersionEdit: {}", e);
                     continue; // 不移除该任务 memtable，避免丢失内存中数据
                 }
                 vs.current()
             };
+
+            Self::reset_flush_failure_streak(&lsm_state);
 
             // 从 immutable_mem_tables 中精确移除当前任务对应的 memtable。
             // 不能无条件 pop_front：若前序任务失败并未出队，会导致错删队头。
@@ -350,6 +383,32 @@ impl FlushWorker {
             lsm_state_guard.immutable_mem_tables.remove(pos);
         } else {
             warn!("Flush task memtable was not found in immutable queue; skip remove");
+        }
+    }
+
+    fn record_flush_failure(
+        lsm_state: &Arc<RwLock<LSMState>>,
+        flush_failure_streak_limit: usize,
+        cause: &str,
+    ) {
+        let mut state = lsm_state.write().unwrap();
+        state.flush_failure_streak = state.flush_failure_streak.saturating_add(1);
+        if state.flush_failure_streak >= flush_failure_streak_limit {
+            if !state.flush_circuit_open {
+                warn!(
+                    "Flush circuit opened after {} consecutive failures: {}",
+                    state.flush_failure_streak, cause
+                );
+            }
+            state.flush_circuit_open = true;
+        }
+    }
+
+    fn reset_flush_failure_streak(lsm_state: &Arc<RwLock<LSMState>>) {
+        let mut state = lsm_state.write().unwrap();
+        if state.flush_failure_streak > 0 || state.flush_circuit_open {
+            state.flush_failure_streak = 0;
+            state.flush_circuit_open = false;
         }
     }
 
@@ -972,6 +1031,36 @@ mod tests {
             grandparent_overlap_bytes_limit: 1000,
         };
         assert!(FlushWorker::is_trivial_move(&loose_plan));
+    }
+
+    #[test]
+    fn flush_failure_streak_opens_and_success_resets_circuit() {
+        let version = Arc::new(make_version(vec![Vec::new(), Vec::new()]));
+        let lsm_state = Arc::new(RwLock::new(LSMState::new(
+            Arc::new(MemTable::new(1024)),
+            version,
+        )));
+
+        FlushWorker::record_flush_failure(&lsm_state, 2, "first failure");
+        {
+            let state = lsm_state.read().unwrap();
+            assert_eq!(state.flush_failure_streak, 1);
+            assert!(!state.flush_circuit_open);
+        }
+
+        FlushWorker::record_flush_failure(&lsm_state, 2, "second failure");
+        {
+            let state = lsm_state.read().unwrap();
+            assert_eq!(state.flush_failure_streak, 2);
+            assert!(state.flush_circuit_open);
+        }
+
+        FlushWorker::reset_flush_failure_streak(&lsm_state);
+        {
+            let state = lsm_state.read().unwrap();
+            assert_eq!(state.flush_failure_streak, 0);
+            assert!(!state.flush_circuit_open);
+        }
     }
 
     #[test]

@@ -408,6 +408,7 @@ impl KvEngine {
             lsm_state.clone(),
             version_set.clone(),
             sstable_paths.clone(),
+            options.flush_failure_streak_limit,
         );
         let wal_writer = Arc::new(wal_writer);
         let options = Arc::new(options);

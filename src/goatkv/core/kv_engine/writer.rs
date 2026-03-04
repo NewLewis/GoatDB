@@ -243,7 +243,14 @@ impl KvWriter {
                 && (state.flush_blocked
                     || self.wal_queue_backpressured(&state, request.approx_bytes))
             {
+                if let Some(err) = self.flush_backpressure_error() {
+                    return Err(err);
+                }
                 state = self.state_cv.wait(state).unwrap();
+            }
+
+            if let Some(err) = self.flush_backpressure_error() {
+                return Err(err);
             }
 
             // writer 已关闭则立即拒绝写入。
@@ -741,6 +748,33 @@ impl KvWriter {
                 && state.mem_queue_bytes.saturating_add(incoming_bytes) > max_bytes)
     }
 
+    fn flush_backpressure_error(&self) -> Option<GoatError> {
+        let lsm_state = self.lsm_state.read().unwrap();
+        if lsm_state.flush_circuit_open {
+            return Some(GoatError::unavailable(
+                "write_backpressure",
+                format!(
+                    "flush circuit open after {} consecutive flush failures",
+                    lsm_state.flush_failure_streak
+                ),
+            ));
+        }
+
+        let immutable_limit = self.options.max_immutable_memtables.max(1);
+        let immutable_count = lsm_state.immutable_mem_tables.len();
+        if immutable_count >= immutable_limit {
+            return Some(GoatError::unavailable(
+                "write_backpressure",
+                format!(
+                    "immutable memtable backlog {} reached limit {}",
+                    immutable_count, immutable_limit
+                ),
+            ));
+        }
+
+        None
+    }
+
     fn drain_all_queued(state: &mut WriteState) -> Vec<Arc<WriteRequest>> {
         // close/fail_fast 共用：重置状态并清空两个队列。
         state.wal_queue_reqs = 0;
@@ -766,11 +800,11 @@ impl KvWriter {
 #[cfg(test)]
 mod tests {
     use super::{KvWriter, WriteOp};
-    use crate::goatkv::core::lsm_state::LSMState;
-    use crate::goatkv::core::mem_table::MemTable;
+    use crate::goatkv::core::lsm_state::{ImmutableMemTableEntry, LSMState};
+    use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
     use crate::goatkv::core::sequence_number::SequenceNumber;
     use crate::goatkv::error::ErrorKind;
-    use crate::goatkv::format::internal_key::SEQUENCE_NUMBER_MAX;
+    use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind, SEQUENCE_NUMBER_MAX};
     use crate::goatkv::metadata::version::Version;
     use crate::goatkv::storage::wal::{WalWriter, WalWriterConfig};
     use crate::goatkv::utils::options::KvEngineOptions;
@@ -779,6 +813,14 @@ mod tests {
     use tempfile::NamedTempFile;
 
     fn build_writer_with_start(start: u64) -> KvWriter {
+        let (writer, _lsm_state) = build_writer_with_options(start, KvEngineOptions::for_test());
+        writer
+    }
+
+    fn build_writer_with_options(
+        start: u64,
+        options: KvEngineOptions,
+    ) -> (KvWriter, Arc<RwLock<LSMState>>) {
         let wal_file = NamedTempFile::new().expect("create temp wal");
         let wal_writer = WalWriter::new(
             wal_file.path().to_path_buf(),
@@ -793,14 +835,14 @@ mod tests {
         let version = Arc::new(Version::new(7, sstable_paths));
         let lsm_state = Arc::new(RwLock::new(LSMState::new(mem, version)));
         let write_gate = Arc::new(RwLock::new(()));
-        let options = Arc::new(KvEngineOptions::for_test());
-        KvWriter::new(
+        let writer = KvWriter::new(
             Arc::new(wal_writer),
             Arc::new(SequenceNumber::with_start(start)),
-            lsm_state,
+            lsm_state.clone(),
             write_gate,
-            options,
-        )
+            Arc::new(options),
+        );
+        (writer, lsm_state)
     }
 
     #[test]
@@ -820,5 +862,48 @@ mod tests {
             err.kind(),
             ErrorKind::Internal | ErrorKind::Unavailable
         ));
+    }
+
+    #[test]
+    fn submit_write_fails_fast_when_immutable_backlog_reaches_limit() {
+        let options = KvEngineOptions::for_test().with_max_immutable_memtables(1);
+        let (writer, lsm_state) = build_writer_with_options(1, options);
+
+        let source = MemTable::new(1024);
+        source.put(
+            InternalKey::new(b"k".to_vec(), 1, InternalKeyKind::Put),
+            b"v".as_ref().into(),
+        );
+        let immutable = Arc::new(ImmutableMemTable::new(source.inner()));
+        lsm_state
+            .write()
+            .unwrap()
+            .immutable_mem_tables
+            .push_back(ImmutableMemTableEntry {
+                table: immutable,
+                wal_handle: None,
+            });
+
+        let err = writer
+            .submit_write(vec![WriteOp::Put(b"k2".to_vec(), b"v2".to_vec())], || {})
+            .expect_err("write should fail when immutable backlog reached limit");
+        assert_eq!(err.kind(), ErrorKind::Unavailable);
+        assert!(err.to_string().contains("immutable memtable backlog"));
+    }
+
+    #[test]
+    fn submit_write_fails_fast_when_flush_circuit_is_open() {
+        let (writer, lsm_state) = build_writer_with_options(1, KvEngineOptions::for_test());
+        {
+            let mut state = lsm_state.write().unwrap();
+            state.flush_failure_streak = 3;
+            state.flush_circuit_open = true;
+        }
+
+        let err = writer
+            .submit_write(vec![WriteOp::Put(b"k3".to_vec(), b"v3".to_vec())], || {})
+            .expect_err("write should fail when flush circuit is open");
+        assert_eq!(err.kind(), ErrorKind::Unavailable);
+        assert!(err.to_string().contains("flush circuit open"));
     }
 }

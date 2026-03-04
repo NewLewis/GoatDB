@@ -16,6 +16,7 @@
 - 2026-03-04：完成新一轮全量静态走读（重点覆盖 compaction/manifest/recovery/读路径错误传播），新增 4 个待修复项：`P0-INTERNALKEY-KIND-PANIC-ON-CORRUPTION`、`P1-COMPACTION-ORPHAN-SSTABLE-LEAK`、`P1-COMPACTION-MEMORY-AMPLIFICATION`、`P1-FLUSH-COMPACTION-COUPLED-BACKPRESSURE`。
 - 2026-03-04：完成生产就绪差距评审（重点覆盖数据完整性/运维可观测/安全基线/接口能力），新增 9 个待修复项：`P0-SSTABLE-BLOCK-CHECKSUM-MISSING`、`P0-FLUSH-FAILURE-IMMUTABLE-BACKLOG-UNBOUNDED`、`P0-TRANSPORT-SECURITY-AUTH-MISSING`、`P1-TABLE-BLOCK-CACHE-MISSING`、`P1-OBSERVABILITY-HEALTH-GAP`、`P1-COMPACTION-POLICY-HARDCODED`、`P1-API-SCAN-SNAPSHOT-CAS-MISSING`、`P1-ONDISK-FORMAT-VERSIONING-GAP`、`P2-UNSAFE-VALIDATION-COVERAGE-GAP`。
 - 2026-03-04：完成 `P0-SSTABLE-BLOCK-CHECKSUM-MISSING` 修复与回归，`cargo test` 全量通过。
+- 2026-03-04：完成 `P0-FLUSH-FAILURE-IMMUTABLE-BACKLOG-UNBOUNDED` 修复与回归，`cargo test` 与 `cargo clippy --all-targets --all-features -- -D warnings` 通过。
 
 ## 问题清单
 
@@ -152,7 +153,7 @@
     - 2026-03-04：`SSTableReader` 在 open/get/scan 流程强制校验块 checksum，校验失败统一返回 `Corruption`。
     - 2026-03-04：新增回归 `test_sstable_reader_reports_data_block_checksum_mismatch`、`test_sstable_open_reports_index_block_checksum_mismatch`。
 
-- [ ] `P0-FLUSH-FAILURE-IMMUTABLE-BACKLOG-UNBOUNDED`
+- [x] `P0-FLUSH-FAILURE-IMMUTABLE-BACKLOG-UNBOUNDED`
   - 现象：flush 失败时 worker 记录错误后 `continue`；系统缺少“连续失败后停写/强背压”机制，immutable 队列可持续累积。
   - 影响：磁盘异常或权限异常场景下可能导致内存占用持续增长，最终触发 OOM 或整体不可用。
   - 代码定位：
@@ -164,6 +165,11 @@
     - 引入 immutable backlog 上限与连续 flush 失败熔断策略。
     - 超限后写入快速失败（`Unavailable`/`ResourceExhausted`），避免内存无界增长。
     - 增加故障注入测试：模拟磁盘写失败时 backlog 与内存占用保持有界。
+  - 关闭记录：
+    - 2026-03-04：`LSMState` 新增 `flush_failure_streak/flush_circuit_open`；`FlushWorker` 对 flush 失败累计计数，达到阈值后打开熔断，成功 flush 后自动复位。
+    - 2026-03-04：`KvWriter::submit_write` 新增 fail-fast 准入：当 immutable backlog 达上限或 flush 熔断开启时，直接返回 `Unavailable`，阻止内存继续增长。
+    - 2026-03-04：`KvEngineOptions` 新增可配置项 `max_immutable_memtables`、`flush_failure_streak_limit`（测试环境默认放宽 backlog 上限）。
+    - 2026-03-04：新增回归 `flush_failure_streak_opens_and_success_resets_circuit`、`submit_write_fails_fast_when_immutable_backlog_reaches_limit`、`submit_write_fails_fast_when_flush_circuit_is_open`。
 
 - [ ] `P0-TRANSPORT-SECURITY-AUTH-MISSING`
   - 现象：gRPC 服务当前未启用 TLS/mTLS，也没有认证鉴权拦截器。
@@ -474,14 +480,13 @@
 
 ## 建议修复顺序
 
-1. `P0-FLUSH-FAILURE-IMMUTABLE-BACKLOG-UNBOUNDED`
-2. `P0-TRANSPORT-SECURITY-AUTH-MISSING`
-3. `P1-TABLE-BLOCK-CACHE-MISSING`
-4. `P1-OBSERVABILITY-HEALTH-GAP`
-5. `P1-COMPACTION-POLICY-HARDCODED`
-6. `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
-7. `P1-ONDISK-FORMAT-VERSIONING-GAP`
-8. `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
+1. `P0-TRANSPORT-SECURITY-AUTH-MISSING`
+2. `P1-TABLE-BLOCK-CACHE-MISSING`
+3. `P1-OBSERVABILITY-HEALTH-GAP`
+4. `P1-COMPACTION-POLICY-HARDCODED`
+5. `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
+6. `P1-ONDISK-FORMAT-VERSIONING-GAP`
+7. `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
 
 ## 逐项关闭记录（执行时填写）
 

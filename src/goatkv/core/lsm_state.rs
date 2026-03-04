@@ -11,6 +11,11 @@ pub struct LSMState {
     pub mem_table: Arc<MemTable>,
     /// Immutable memtables waiting for flush
     pub immutable_mem_tables: VecDeque<ImmutableMemTableEntry>,
+    /// Consecutive flush failures observed by background flush worker.
+    pub flush_failure_streak: usize,
+    /// Circuit-breaker flag: true means write path should fail fast to avoid
+    /// unbounded immutable backlog growth.
+    pub flush_circuit_open: bool,
     /// Current version snapshot for SSTable reads
     pub version: Arc<Version>,
 }
@@ -26,6 +31,8 @@ impl LSMState {
         LSMState {
             mem_table,
             immutable_mem_tables: VecDeque::new(),
+            flush_failure_streak: 0,
+            flush_circuit_open: false,
             version,
         }
     }
