@@ -37,6 +37,14 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = EngineKind::Goatkv)]
     engine: EngineKind,
 
+    /// Table cache entries for GoatKV (0 disables table cache)
+    #[arg(long, default_value_t = 64)]
+    table_cache_capacity: usize,
+
+    /// Block cache size for GoatKV in MB (0 disables block cache)
+    #[arg(long, default_value_t = 64)]
+    block_cache_capacity_mb: usize,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -98,6 +106,18 @@ enum Commands {
         /// Value size (kept for parity, not used)
         #[arg(long, default_value_t = 1024)]
         value_size: usize,
+    },
+    /// Hotspot read benchmark (reads concentrated in hot set)
+    Hotread {
+        /// Read rounds
+        #[arg(long, default_value_t = 20)]
+        times: u64,
+        /// Total keys in DB
+        #[arg(long, default_value_t = 1024)]
+        key_nums: u64,
+        /// Hot key set size
+        #[arg(long, default_value_t = 64)]
+        hotset: u64,
     },
 }
 
@@ -389,6 +409,36 @@ fn randread_goatkv(engine: Arc<KvEngine>, times: u64, key_nums: u64, threads: us
     }
 }
 
+fn hotread_goatkv(engine: Arc<KvEngine>, times: u64, key_nums: u64, hotset: u64, threads: usize) {
+    if key_nums == 0 || times == 0 || threads == 0 {
+        return;
+    }
+    let hotset = hotset.max(1).min(key_nums);
+    for round in 0..times {
+        let mut handles = Vec::with_capacity(threads);
+        for index in 0..threads {
+            let engine = engine.clone();
+            let (start, end) = split_range(key_nums, threads, index);
+            let count = end.saturating_sub(start);
+            let seed = 0x85a3_08d3_u64
+                .wrapping_add((round + 1).wrapping_mul(0x9e37_79b9))
+                .wrapping_mul(index as u64 + 1);
+            let handle = thread::spawn(move || {
+                let mut rng = SmallRng::seed_from_u64(seed);
+                for _ in 0..count {
+                    let key_id = rng.gen_range(0..hotset);
+                    let key = make_key(key_id);
+                    let _ = engine.get(&key);
+                }
+            });
+            handles.push(handle);
+        }
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+}
+
 #[cfg(feature = "rocksdb")]
 fn randread_rocksdb(db: Arc<DB>, times: u64, key_nums: u64, threads: usize) {
     if key_nums == 0 || times == 0 || threads == 0 {
@@ -420,6 +470,37 @@ fn randread_rocksdb(db: Arc<DB>, times: u64, key_nums: u64, threads: usize) {
     }
 }
 
+#[cfg(feature = "rocksdb")]
+fn hotread_rocksdb(db: Arc<DB>, times: u64, key_nums: u64, hotset: u64, threads: usize) {
+    if key_nums == 0 || times == 0 || threads == 0 {
+        return;
+    }
+    let hotset = hotset.max(1).min(key_nums);
+    for round in 0..times {
+        let mut handles = Vec::with_capacity(threads);
+        for index in 0..threads {
+            let db = db.clone();
+            let (start, end) = split_range(key_nums, threads, index);
+            let count = end.saturating_sub(start);
+            let seed = 0x85a3_08d3_u64
+                .wrapping_add((round + 1).wrapping_mul(0x9e37_79b9))
+                .wrapping_mul(index as u64 + 1);
+            let handle = thread::spawn(move || {
+                let mut rng = SmallRng::seed_from_u64(seed);
+                for _ in 0..count {
+                    let key_id = rng.gen_range(0..hotset);
+                    let key = make_key(key_id);
+                    let _ = db.get(&key);
+                }
+            });
+            handles.push(handle);
+        }
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+}
+
 fn ms_per_iter(total_ms: u128, iters: u64) -> f64 {
     if iters == 0 {
         0.0
@@ -440,6 +521,28 @@ fn prepare_engine_dir(base: &Path, engine: EngineKind, both: bool) -> PathBuf {
         base.join(engine.label())
     } else {
         base.to_path_buf()
+    }
+}
+
+fn goatkv_options_from_cli(cli: &Cli, base_dir: &Path) -> KvEngineOptions {
+    KvEngineOptions::default()
+        .with_data_dir(base_dir)
+        .with_wal_sync(cli.wal_sync)
+        .with_table_cache_capacity(cli.table_cache_capacity)
+        .with_block_cache_capacity_bytes(cli.block_cache_capacity_mb.saturating_mul(1024 * 1024))
+}
+
+fn print_cache_metrics(engine: &KvEngine) {
+    if let Some(metrics) = engine.read_cache_metrics() {
+        println!(
+            "cache_metrics table_hit={} table_miss={} table_evict={} block_hit={} block_miss={} block_evict={}",
+            metrics.table_hits,
+            metrics.table_misses,
+            metrics.table_evictions,
+            metrics.block_hits,
+            metrics.block_misses,
+            metrics.block_evictions,
+        );
     }
 }
 
@@ -490,9 +593,7 @@ fn main() {
                 };
                 match engine_kind {
                     EngineKind::Goatkv => {
-                        let options = KvEngineOptions::default()
-                            .with_data_dir(&base_dir)
-                            .with_wal_sync(cli.wal_sync);
+                        let options = goatkv_options_from_cli(&cli, &base_dir);
                         let engine =
                             Arc::new(KvEngine::new_with_options(options).expect("open engine"));
                         let begin = Instant::now();
@@ -548,9 +649,7 @@ fn main() {
                 let iters = key_nums;
                 match engine_kind {
                     EngineKind::Goatkv => {
-                        let options = KvEngineOptions::default()
-                            .with_data_dir(&base_dir)
-                            .with_wal_sync(cli.wal_sync);
+                        let options = goatkv_options_from_cli(&cli, &base_dir);
                         let engine =
                             Arc::new(KvEngine::new_with_options(options).expect("open engine"));
                         let begin = Instant::now();
@@ -605,13 +704,11 @@ fn main() {
                 let iters = times;
                 match engine_kind {
                     EngineKind::Goatkv => {
-                        let options = KvEngineOptions::default()
-                            .with_data_dir(&base_dir)
-                            .with_wal_sync(cli.wal_sync);
+                        let options = goatkv_options_from_cli(&cli, &base_dir);
                         let engine =
                             Arc::new(KvEngine::new_with_options(options).expect("open engine"));
                         let begin = Instant::now();
-                        randread_goatkv(engine, times, key_nums, cli.threads);
+                        randread_goatkv(engine.clone(), times, key_nums, cli.threads);
                         let total_ms = begin.elapsed().as_millis();
                         let result = BenchResult {
                             engine: "goatkv",
@@ -621,6 +718,7 @@ fn main() {
                             ms_per_iter: ms_per_iter(total_ms, iters),
                         };
                         print_result(&result);
+                        print_cache_metrics(&engine);
                     }
                     EngineKind::Rocksdb => {
                         ensure_rocksdb_available();
@@ -637,6 +735,55 @@ fn main() {
                             let result = BenchResult {
                                 engine: "rocksdb",
                                 workload: "randread",
+                                total_ms,
+                                iters,
+                                ms_per_iter: ms_per_iter(total_ms, iters),
+                            };
+                            print_result(&result);
+                        }
+                    }
+                    EngineKind::Both => {}
+                }
+            }
+            Commands::Hotread {
+                times,
+                key_nums,
+                hotset,
+            } => {
+                let iters = times;
+                match engine_kind {
+                    EngineKind::Goatkv => {
+                        let options = goatkv_options_from_cli(&cli, &base_dir);
+                        let engine =
+                            Arc::new(KvEngine::new_with_options(options).expect("open engine"));
+                        let begin = Instant::now();
+                        hotread_goatkv(engine.clone(), times, key_nums, hotset, cli.threads);
+                        let total_ms = begin.elapsed().as_millis();
+                        let result = BenchResult {
+                            engine: "goatkv",
+                            workload: "hotread",
+                            total_ms,
+                            iters,
+                            ms_per_iter: ms_per_iter(total_ms, iters),
+                        };
+                        print_result(&result);
+                        print_cache_metrics(&engine);
+                    }
+                    EngineKind::Rocksdb => {
+                        ensure_rocksdb_available();
+                        #[cfg(feature = "rocksdb")]
+                        {
+                            let mut rocks_opts = Options::default();
+                            rocks_opts.create_if_missing(true);
+                            rocks_opts.set_compression_type(DBCompressionType::None);
+                            let db =
+                                Arc::new(DB::open(&rocks_opts, &base_dir).expect("open rocksdb"));
+                            let begin = Instant::now();
+                            hotread_rocksdb(db, times, key_nums, hotset, cli.threads);
+                            let total_ms = begin.elapsed().as_millis();
+                            let result = BenchResult {
+                                engine: "rocksdb",
+                                workload: "hotread",
                                 total_ms,
                                 iters,
                                 ms_per_iter: ms_per_iter(total_ms, iters),

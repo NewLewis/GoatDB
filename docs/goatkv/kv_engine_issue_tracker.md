@@ -18,6 +18,7 @@
 - 2026-03-04：完成 `P0-SSTABLE-BLOCK-CHECKSUM-MISSING` 修复与回归，`cargo test` 全量通过。
 - 2026-03-04：完成 `P0-FLUSH-FAILURE-IMMUTABLE-BACKLOG-UNBOUNDED` 修复与回归，`cargo test` 与 `cargo clippy --all-targets --all-features -- -D warnings` 通过。
 - 2026-03-04：完成 `P0-TRANSPORT-SECURITY-AUTH-MISSING` 修复与回归，新增 server TLS/mTLS 选项、token 鉴权拦截器与 README 安全部署说明；`cargo test` 与 `cargo clippy --all-targets --all-features -- -D warnings` 通过。
+- 2026-03-04：完成 `P1-TABLE-BLOCK-CACHE-MISSING` 修复与回归，新增可配置 table/block cache、缓存指标快照与热点读基准命令；`cargo test` 与 `cargo clippy --all-targets --all-features -- -D warnings` 通过。
 
 ## 问题清单
 
@@ -377,17 +378,26 @@
     - 2026-03-04：`FlushWorker` 拆分为独立 flush 线程与 compaction 线程；flush 成功后仅发送 compaction 触发信号，不在 flush 线程内执行 compaction。
     - 2026-03-04：新增/更新回归 `test_l0_compacts_to_base_level_when_l0_exceeds_threshold`、`test_compaction_cascades_to_l2_when_l1_exceeds_threshold`，验证持续 flush 下 compaction 可后台推进并保持读正确性。
 
-- [ ] `P1-TABLE-BLOCK-CACHE-MISSING`
+- [x] `P1-TABLE-BLOCK-CACHE-MISSING`
   - 现象：读路径未引入 table cache/block cache，SSTable 读取仍频繁打开文件与重复解码。
   - 影响：高并发读场景下延迟与 IOPS 放大，FD 压力上升，吞吐受限。
   - 代码定位：
-    - `src/goatkv/metadata/version.rs:103`
-    - `src/goatkv/metadata/version.rs:112`
-    - `src/goatkv/storage/sstable/reader.rs:70`
+    - `src/goatkv/storage/sstable/cache.rs:1`
+    - `src/goatkv/metadata/version.rs:109`
+    - `src/goatkv/metadata/version_set.rs:164`
+    - `src/goatkv/storage/sstable/reader.rs:38`
+    - `src/goatkv/utils/options.rs:93`
+    - `benches/goatkv_bench.rs:97`
   - 验收标准：
     - 引入可配置 table cache 与 block cache（容量/淘汰策略可调）。
     - 暴露缓存命中率与驱逐指标。
     - 增加基准测试：热点读场景下延迟与吞吐显著改善。
+  - 关闭记录：
+    - 2026-03-04：新增 `TableCache + BlockCache`（LRU 驱逐）并接入 `Version::get` 与 `SSTableReader` 数据块读取；table/block cache 分别支持按条目数/字节数配置。
+    - 2026-03-04：`KvEngineOptions` 新增 `table_cache_capacity`、`block_cache_capacity_bytes`，`VersionSetOptions` 同步透传并在版本快照间共享缓存实例。
+    - 2026-03-04：新增缓存指标快照 `ReadCacheMetrics`，并在 `KvEngine::read_cache_metrics()` 暴露命中/未命中/驱逐计数。
+    - 2026-03-04：`benches/goatkv_bench.rs` 新增 `hotread` 工作负载与缓存容量参数，支持热点读对比（可通过 `--table-cache-capacity/--block-cache-capacity-mb` 调优或置 0 关闭）。
+    - 2026-03-04：新增回归 `table_cache_reports_hits_and_evictions`、`block_cache_reports_hit_after_warmup`、`table_cache_can_be_disabled`。
 
 - [ ] `P1-OBSERVABILITY-HEALTH-GAP`
   - 现象：当前仅有日志输出，缺少标准化 metrics 与健康检查接口。
@@ -489,12 +499,11 @@
 
 ## 建议修复顺序
 
-1. `P1-TABLE-BLOCK-CACHE-MISSING`
-2. `P1-OBSERVABILITY-HEALTH-GAP`
-3. `P1-COMPACTION-POLICY-HARDCODED`
-4. `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
-5. `P1-ONDISK-FORMAT-VERSIONING-GAP`
-6. `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
+1. `P1-OBSERVABILITY-HEALTH-GAP`
+2. `P1-COMPACTION-POLICY-HARDCODED`
+3. `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
+4. `P1-ONDISK-FORMAT-VERSIONING-GAP`
+5. `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
 
 ## 逐项关闭记录（执行时填写）
 

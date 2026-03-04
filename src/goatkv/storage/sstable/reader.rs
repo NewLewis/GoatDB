@@ -3,10 +3,12 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use crc32fast::Hasher;
 
 use super::block_reader::BlockReader;
+use super::cache::{BlockCache, BlockCacheKey};
 use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::format::coding;
 use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind, SEQUENCE_NUMBER_MAX};
@@ -34,12 +36,16 @@ struct IndexEntry {
 pub struct SSTableReader {
     /// SSTable 文件的路径
     file_path: String,
+    /// SSTable 文件 id（可选，用于 block cache key）
+    file_id: Option<u64>,
     /// 文件句柄
-    file: File,
+    file: Mutex<File>,
     /// BloomFilter
     bloom_filter: super::bloom::BloomFilter,
     /// 索引条目列表，按分隔键排序
     index_entries: Vec<IndexEntry>,
+    /// 可选数据块缓存
+    block_cache: Option<Arc<BlockCache>>,
 }
 
 impl SSTableReader {
@@ -106,6 +112,22 @@ impl SSTableReader {
 
     /// 打开并解析 SSTable 文件
     pub fn open<P: AsRef<Path>>(path: P) -> GoatResult<Self> {
+        Self::open_internal(path, None, None)
+    }
+
+    pub(crate) fn open_with_block_cache<P: AsRef<Path>>(
+        path: P,
+        file_id: u64,
+        block_cache: Option<Arc<BlockCache>>,
+    ) -> GoatResult<Self> {
+        Self::open_internal(path, Some(file_id), block_cache)
+    }
+
+    fn open_internal<P: AsRef<Path>>(
+        path: P,
+        file_id: Option<u64>,
+        block_cache: Option<Arc<BlockCache>>,
+    ) -> GoatResult<Self> {
         let path_ref = path.as_ref();
         let mut file = File::open(path_ref).map_err(|e| GoatError::io("sstable_open", e))?;
 
@@ -308,9 +330,11 @@ impl SSTableReader {
 
         Ok(Self {
             file_path: path_ref.to_string_lossy().to_string(),
-            file,
+            file_id,
+            file: Mutex::new(file),
             bloom_filter,
             index_entries,
+            block_cache,
         })
     }
 
@@ -319,8 +343,38 @@ impl SSTableReader {
         self.bloom_filter.contains(key)
     }
 
+    fn read_block_from_file(&self, block_offset: u64, block_size: u64) -> GoatResult<Vec<u8>> {
+        let mut file = self.file.lock().unwrap();
+        file.seek(SeekFrom::Start(block_offset))
+            .map_err(|e| GoatError::io("sstable_seek_data_block", e))?;
+        let mut block_data = vec![0u8; block_size as usize];
+        file.read_exact(&mut block_data)
+            .map_err(|e| GoatError::io("sstable_read_data_block", e))?;
+        Ok(block_data)
+    }
+
+    fn load_data_block_payload(
+        &self,
+        block_offset: u64,
+        block_size: u64,
+    ) -> GoatResult<Arc<Vec<u8>>> {
+        if let (Some(file_id), Some(block_cache)) = (self.file_id, self.block_cache.as_ref()) {
+            let cache_key = BlockCacheKey::new(file_id, block_offset, block_size);
+            if let Some(payload) = block_cache.get(&cache_key) {
+                return Ok(payload);
+            }
+            let block_data = self.read_block_from_file(block_offset, block_size)?;
+            let block_payload = Self::verify_block_checksum(&block_data, "data block")?.to_vec();
+            return Ok(block_cache.insert(cache_key, block_payload));
+        }
+
+        let block_data = self.read_block_from_file(block_offset, block_size)?;
+        let block_payload = Self::verify_block_checksum(&block_data, "data block")?.to_vec();
+        Ok(Arc::new(block_payload))
+    }
+
     /// 在 SSTable 中查找指定的 key (UserKey)
-    pub fn get(&mut self, key: &[u8]) -> GoatResult<Option<(InternalKey, Vec<u8>)>> {
+    pub fn get(&self, key: &[u8]) -> GoatResult<Option<(InternalKey, Vec<u8>)>> {
         // 1. 使用 BloomFilter 快速过滤 (BloomFilter now indexes UserKey)
         if !self.may_contain(key) {
             return Ok(None);
@@ -335,18 +389,11 @@ impl SSTableReader {
             None => return Ok(None),
         };
 
-        // 3. 读取数据块
-        self.file
-            .seek(SeekFrom::Start(block_offset))
-            .map_err(|e| GoatError::io("sstable_seek_data_block", e))?;
-        let mut block_data = vec![0u8; block_size as usize];
-        self.file
-            .read_exact(&mut block_data)
-            .map_err(|e| GoatError::io("sstable_read_data_block", e))?;
-        let block_payload = Self::verify_block_checksum(&block_data, "data block")?;
+        // 3. 读取数据块（优先 block cache）
+        let block_payload = self.load_data_block_payload(block_offset, block_size)?;
 
         // 4. 在数据块中查找 key
-        let block_reader = match BlockReader::new(block_payload) {
+        let block_reader = match BlockReader::new(block_payload.as_slice()) {
             Ok(reader) => reader,
             Err(e) => {
                 return Err(Self::corruption(format!(
@@ -382,18 +429,12 @@ impl SSTableReader {
     }
 
     /// Full scan of all entries in this SSTable.
-    pub fn scan_all(&mut self) -> GoatResult<Vec<(InternalKey, Vec<u8>)>> {
+    pub fn scan_all(&self) -> GoatResult<Vec<(InternalKey, Vec<u8>)>> {
         let mut entries = Vec::new();
         for entry in &self.index_entries {
-            self.file
-                .seek(SeekFrom::Start(entry.block_offset))
-                .map_err(|e| GoatError::io("sstable_seek_scan_block", e))?;
-            let mut block_data = vec![0u8; entry.block_size as usize];
-            self.file
-                .read_exact(&mut block_data)
-                .map_err(|e| GoatError::io("sstable_read_scan_block", e))?;
-            let block_payload = Self::verify_block_checksum(&block_data, "data block")?;
-            let block_reader = BlockReader::new(block_payload).map_err(|e| {
+            let block_payload =
+                self.load_data_block_payload(entry.block_offset, entry.block_size)?;
+            let block_reader = BlockReader::new(block_payload.as_slice()).map_err(|e| {
                 Self::corruption(format!("Failed to parse data block during scan: {}", e))
             })?;
             for (k, v) in block_reader.iter() {
@@ -481,17 +522,10 @@ impl SSTableScanIterator {
             }
 
             let entry = &self.reader.index_entries[self.block_index];
-            self.reader
-                .file
-                .seek(SeekFrom::Start(entry.block_offset))
-                .map_err(|e| GoatError::io("sstable_seek_scan_block", e))?;
-            let mut block_data = vec![0u8; entry.block_size as usize];
-            self.reader
-                .file
-                .read_exact(&mut block_data)
-                .map_err(|e| GoatError::io("sstable_read_scan_block", e))?;
-            let block_payload = SSTableReader::verify_block_checksum(&block_data, "data block")?;
-            let block_reader = BlockReader::new(block_payload).map_err(|e| {
+            let block_payload = self
+                .reader
+                .load_data_block_payload(entry.block_offset, entry.block_size)?;
+            let block_reader = BlockReader::new(block_payload.as_slice()).map_err(|e| {
                 SSTableReader::corruption(format!("Failed to parse data block during scan: {}", e))
             })?;
 
@@ -579,7 +613,7 @@ mod tests {
         builder.finish().unwrap();
 
         let sst_path = sstable_paths.sstable_path_by_id(1);
-        let mut reader = SSTableReader::open(&sst_path).unwrap();
+        let reader = SSTableReader::open(&sst_path).unwrap();
 
         // 检查测试数据本身是否有重复
         let mut seen_keys = std::collections::HashSet::new();
@@ -632,7 +666,7 @@ mod tests {
     #[test]
     fn test_sstable_reader_get() {
         let (_temp_dir, sst_path) = create_test_sstable();
-        let mut reader = SSTableReader::open(&sst_path).unwrap();
+        let reader = SSTableReader::open(&sst_path).unwrap();
 
         // 测试存在的key
         let result = reader.get(b"apple");
@@ -704,7 +738,7 @@ mod tests {
         builder.finish().unwrap();
 
         let sst_path = sstable_paths.sstable_path_by_id(1);
-        let mut reader = SSTableReader::open(&sst_path).unwrap();
+        let reader = SSTableReader::open(&sst_path).unwrap();
         let err = reader
             .get(b"bad_kind")
             .expect_err("invalid kind should be reported as corruption");
@@ -719,7 +753,7 @@ mod tests {
         file_content[0] ^= 0x01;
         fs::write(&sst_path, &file_content).unwrap();
 
-        let mut reader = SSTableReader::open(&sst_path).unwrap();
+        let reader = SSTableReader::open(&sst_path).unwrap();
         let err = reader
             .get(b"apple")
             .expect_err("corrupted data block must return corruption");

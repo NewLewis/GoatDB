@@ -8,6 +8,7 @@ use crate::goatkv::metadata::file_metadata::FileMetadata;
 use crate::goatkv::metadata::manifest::{ManifestReader, ManifestWriter, INIT_MANIFEST_FILE_NAME};
 use crate::goatkv::metadata::version::Version;
 use crate::goatkv::metadata::version_edit::{NewFile, VersionEdit};
+use crate::goatkv::storage::sstable::TableCache;
 use crate::goatkv::utils::cleanup_task::CleanupTask;
 use crate::goatkv::utils::options::KvEngineOptions;
 use crate::goatkv::utils::paths::{ManifestPaths, SstablePaths};
@@ -92,6 +93,7 @@ pub struct VersionSet {
     // ---------------- 环境配置 ----------------
     manifest_paths: Arc<ManifestPaths>,
     sstable_paths: Arc<SstablePaths>,
+    table_cache: Option<Arc<TableCache>>,
     options: Arc<VersionSetOptions>, // Options 通常只读，用 Arc 共享
 }
 
@@ -109,6 +111,12 @@ pub struct VersionSetOptions {
 
     /// 层级数量
     pub num_levels: usize,
+
+    /// Table cache 最大条目数（0 表示禁用 table cache）
+    pub table_cache_capacity: usize,
+
+    /// Block cache 容量（字节，0 表示禁用 block cache）
+    pub block_cache_capacity_bytes: usize,
 }
 
 impl Default for VersionSetOptions {
@@ -118,6 +126,8 @@ impl Default for VersionSetOptions {
             manifest_max_size: 32 * 1024 * 1024, // 32MB
             manifest_rewrite_edit_count: 10000,
             num_levels: 7,
+            table_cache_capacity: 64,
+            block_cache_capacity_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -129,6 +139,8 @@ impl From<&KvEngineOptions> for VersionSetOptions {
             manifest_max_size: options.manifest_max_size,
             manifest_rewrite_edit_count: options.manifest_rewrite_edit_count,
             num_levels: options.num_levels,
+            table_cache_capacity: options.table_cache_capacity,
+            block_cache_capacity_bytes: options.block_cache_capacity_bytes,
         }
     }
 }
@@ -151,8 +163,22 @@ impl VersionSet {
         options: VersionSetOptions,
         obsolete_sender: UnboundedSender<CleanupTask>,
     ) -> GoatResult<Self> {
+        let table_cache =
+            if options.table_cache_capacity == 0 && options.block_cache_capacity_bytes == 0 {
+                None
+            } else {
+                Some(Arc::new(TableCache::new(
+                    options.table_cache_capacity,
+                    options.block_cache_capacity_bytes,
+                )))
+            };
+
         // 创建空的当前版本：没有任何 SSTable
-        let current = Arc::new(Version::new(options.num_levels, sstable_paths.clone()));
+        let current = Arc::new(Version::new_with_cache(
+            options.num_levels,
+            sstable_paths.clone(),
+            table_cache.clone(),
+        ));
 
         Ok(Self {
             current,
@@ -167,6 +193,7 @@ impl VersionSet {
             obsolete_sender,
             manifest_paths,
             sstable_paths,
+            table_cache,
             options: Arc::new(options),
         })
     }
@@ -432,10 +459,11 @@ impl VersionSet {
         }
 
         Self::sort_level_files(&mut files);
-        self.current = Arc::new(Version::from_files(
+        self.current = Arc::new(Version::from_files_with_cache(
             files,
             self.last_sequence,
             self.sstable_paths.clone(),
+            self.table_cache.clone(),
         ));
 
         Ok(())
@@ -720,10 +748,11 @@ impl VersionSet {
         //
         // 设计理由：
         // - 将 last_sequence 绑定到版本，便于恢复时做一致性校验。
-        Ok(Arc::new(Version::from_files(
+        Ok(Arc::new(Version::from_files_with_cache(
             new_files,
             self.last_sequence,
             self.sstable_paths.clone(),
+            self.table_cache.clone(),
         )))
     }
 

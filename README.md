@@ -92,6 +92,9 @@ cargo test --release --test 'e2e_load' -- --ignored
 
 # Run benchmarks
 cargo bench --bench goatkv_bench --features rocksdb -- --directory ./bench_data --threads 1 --engine both populate --key-nums 100000 --batch-size 1000 --value-size 1024 --seq
+
+# Hotspot read benchmark (GoatKV table/block cache)
+cargo bench --bench goatkv_bench -- --directory ./bench_data --engine goatkv --threads 8 --table-cache-capacity 128 --block-cache-capacity-mb 64 hotread --key-nums 100000 --hotset 256 --times 20
 ```
 
 ### E2E Behavior In Restricted Environments

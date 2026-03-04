@@ -20,6 +20,7 @@ use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::format::internal_key::SEQUENCE_NUMBER_MAX;
 use crate::goatkv::metadata::version::Version;
 use crate::goatkv::metadata::version_set::{VersionSet, VersionSetOptions};
+use crate::goatkv::storage::sstable::ReadCacheMetrics;
 use crate::goatkv::storage::wal::{
     replay_wal_file, WalHandle, WalPaths, WalReplayStats, WalWriter, WalWriterConfig,
 };
@@ -196,6 +197,11 @@ impl KvEngine {
 
     pub fn get(&self, key: &[u8]) -> GoatResult<Option<Vec<u8>>> {
         self.reader.get(key)
+    }
+
+    pub fn read_cache_metrics(&self) -> Option<ReadCacheMetrics> {
+        let lsm_state = self.lsm_state.read().unwrap();
+        lsm_state.version.read_cache_metrics()
     }
 
     pub fn put(&self, key: Vec<u8>, value: Vec<u8>) -> GoatResult<()> {

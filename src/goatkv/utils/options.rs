@@ -94,6 +94,14 @@ pub struct KvEngineOptions {
     /// Default: 3
     pub flush_failure_streak_limit: usize,
 
+    /// Maximum number of opened SSTable readers in table cache.
+    /// Default: 64
+    pub table_cache_capacity: usize,
+
+    /// Maximum bytes for block cache (shared across SSTables).
+    /// Default: 64MB
+    pub block_cache_capacity_bytes: usize,
+
     // ===== VersionSet Options =====
     /// 保留的历史版本数量
     /// Default: 10
@@ -134,6 +142,8 @@ impl Default for KvEngineOptions {
             max_mem_queue_bytes: 256 * 1024 * 1024,
             max_immutable_memtables: 8,
             flush_failure_streak_limit: 3,
+            table_cache_capacity: 64,
+            block_cache_capacity_bytes: 64 * 1024 * 1024,
             // VersionSet defaults
             max_versions: 10,
             manifest_max_size: 32 * 1024 * 1024, // 32MB
@@ -245,6 +255,18 @@ impl KvEngineOptions {
         self
     }
 
+    /// Sets table cache capacity (entry count).
+    pub fn with_table_cache_capacity(mut self, capacity: usize) -> Self {
+        self.table_cache_capacity = capacity;
+        self
+    }
+
+    /// Sets block cache capacity in bytes.
+    pub fn with_block_cache_capacity_bytes(mut self, capacity_bytes: usize) -> Self {
+        self.block_cache_capacity_bytes = capacity_bytes;
+        self
+    }
+
     /// Sets the maximum number of versions to keep in history
     pub fn with_max_versions(mut self, max: usize) -> Self {
         self.max_versions = max;
@@ -306,6 +328,8 @@ impl KvEngineOptions {
             max_mem_queue_bytes: 256 * 1024 * 1024,
             max_immutable_memtables: 128,
             flush_failure_streak_limit: 3,
+            table_cache_capacity: 64,
+            block_cache_capacity_bytes: 64 * 1024 * 1024,
             // VersionSet defaults (use same defaults as production)
             max_versions: 10,
             manifest_max_size: 32 * 1024 * 1024, // 32MB
@@ -374,6 +398,18 @@ mod tests {
     fn test_with_flush_failure_streak_limit() {
         let options = KvEngineOptions::default().with_flush_failure_streak_limit(5);
         assert_eq!(options.flush_failure_streak_limit, 5);
+    }
+
+    #[test]
+    fn test_with_table_cache_capacity() {
+        let options = KvEngineOptions::default().with_table_cache_capacity(128);
+        assert_eq!(options.table_cache_capacity, 128);
+    }
+
+    #[test]
+    fn test_with_block_cache_capacity_bytes() {
+        let options = KvEngineOptions::default().with_block_cache_capacity_bytes(8 * 1024 * 1024);
+        assert_eq!(options.block_cache_capacity_bytes, 8 * 1024 * 1024);
     }
 
     #[test]

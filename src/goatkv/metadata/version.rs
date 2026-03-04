@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::goatkv::error::{Error as GoatError, ErrorKind as GoatErrorKind, Result as GoatResult};
 use crate::goatkv::format::internal_key::InternalKey;
 use crate::goatkv::metadata::file_metadata::FileMetadata;
-use crate::goatkv::storage::sstable::SSTableReader;
+use crate::goatkv::storage::sstable::{ReadCacheMetrics, SSTableReader, TableCache};
 use crate::goatkv::utils::paths::SstablePaths;
 
 /// Version 代表某一时刻数据库的完整状态
@@ -23,6 +23,8 @@ pub struct Version {
     creation_seqno: u64,
     /// 路径管理器（用于定位 SSTable）
     sstable_paths: Arc<SstablePaths>,
+    /// 可选 table/block cache（跨版本共享）
+    table_cache: Option<Arc<TableCache>>,
 }
 
 impl Version {
@@ -70,11 +72,21 @@ impl Version {
 
     /// 创建一个新的空 Version
     pub fn new(num_levels: usize, sstable_paths: Arc<SstablePaths>) -> Self {
+        Self::new_with_cache(num_levels, sstable_paths, None)
+    }
+
+    /// 创建一个新的空 Version（可选读缓存）
+    pub fn new_with_cache(
+        num_levels: usize,
+        sstable_paths: Arc<SstablePaths>,
+        table_cache: Option<Arc<TableCache>>,
+    ) -> Self {
         Self {
             files: vec![Vec::new(); num_levels],
             level_size_bytes: vec![0; num_levels],
             creation_seqno: 0,
             sstable_paths,
+            table_cache,
         }
     }
 
@@ -83,6 +95,16 @@ impl Version {
         files: Vec<Vec<Arc<FileMetadata>>>,
         creation_seqno: u64,
         sstable_paths: Arc<SstablePaths>,
+    ) -> Self {
+        Self::from_files_with_cache(files, creation_seqno, sstable_paths, None)
+    }
+
+    /// 从文件列表构建 Version（可选读缓存）
+    pub fn from_files_with_cache(
+        files: Vec<Vec<Arc<FileMetadata>>>,
+        creation_seqno: u64,
+        sstable_paths: Arc<SstablePaths>,
+        table_cache: Option<Arc<TableCache>>,
     ) -> Self {
         // 计算层级大小
         let level_size_bytes: Vec<u64> = files
@@ -95,6 +117,15 @@ impl Version {
             level_size_bytes,
             creation_seqno,
             sstable_paths,
+            table_cache,
+        }
+    }
+
+    fn open_sstable_reader(&self, file_id: u64, path: &Path) -> GoatResult<Arc<SSTableReader>> {
+        if let Some(cache) = self.table_cache.as_ref() {
+            cache.get_or_open(file_id, path)
+        } else {
+            Ok(Arc::new(SSTableReader::open(path)?))
         }
     }
 
@@ -110,7 +141,8 @@ impl Version {
             if key >= file.smallest_user_key() && key <= file.largest_user_key() {
                 // key在文件范围中，说明该文件中可能包含key
                 let sstable_path = self.sstable_paths.sstable_path_by_id(file.file_id);
-                let mut reader = SSTableReader::open(&sstable_path)
+                let reader = self
+                    .open_sstable_reader(file.file_id, &sstable_path)
                     .map_err(|e| Self::map_sstable_open_err(&sstable_path, e))?;
                 match reader
                     .get(key)
@@ -126,7 +158,8 @@ impl Version {
         for level in 1..self.files.len() {
             if let Some(file) = self.search_level(level, key) {
                 let sstable_path = self.sstable_paths.sstable_path_by_id(file.file_id);
-                let mut reader = SSTableReader::open(&sstable_path)
+                let reader = self
+                    .open_sstable_reader(file.file_id, &sstable_path)
                     .map_err(|e| Self::map_sstable_open_err(&sstable_path, e))?;
                 return reader
                     .get(key)
@@ -213,6 +246,10 @@ impl Version {
             .iter()
             .flat_map(|files| files.iter().map(|f| f.file_id))
             .collect()
+    }
+
+    pub fn read_cache_metrics(&self) -> Option<ReadCacheMetrics> {
+        self.table_cache.as_ref().map(|cache| cache.metrics())
     }
 
     /// 检查是否需要压缩
