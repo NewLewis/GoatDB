@@ -633,6 +633,9 @@
     - 支持按 key range 切片并行执行 subcompaction。
     - 保证输出文件范围不重叠且 VersionEdit 提交一致。
     - 在高写入压测下 compaction backlog 能持续下降。
+  - 进展：
+    - 2026-03-05：`SM5-01` 第一阶段已落地：新增 `storage/compaction` 模块，包含 `SubcompactionRange` 与 key-range 切分器（`split_user_key_ranges`、`build_subcompaction_ranges`），并接入 compaction 计划阶段做范围预切分（当前仍串行执行）。
+    - 2026-03-05：新增切分器回归（有序/不重叠/上限约束）与边界提取回归（丢弃全局最大 cut point，避免尾段空范围）。
 
 - [ ] `P1-PER-LEVEL-COMPRESSION`
   - 现象：SSTable 数据块当前未支持按层压缩策略（如 LZ4/ZSTD/Snappy）。
@@ -1091,16 +1094,22 @@
 
 #### Milestone 5（compaction 吞吐与空间效率）
 
-- [ ] `TASK-SM5-01` subcompaction 范围切分器（status: planned）
+- [ ] `TASK-SM5-01` subcompaction 范围切分器（status: in-progress, 2026-03-05）
   - 目标：将大 compaction task 拆为可并行子任务。
   - 关键改动文件：
+    - `src/goatkv/storage/compaction/mod.rs`
     - `src/goatkv/storage/compaction/picker.rs`
     - `src/goatkv/storage/compaction/plan.rs`
+    - `src/goatkv/core/flush_worker.rs`
   - 回归命令：
-    - `cargo test --lib --tests`
+    - `cargo test --lib goatkv::storage::compaction::plan::tests`
+    - `cargo test --lib goatkv::storage::compaction::picker::tests`
+    - `cargo test --lib goatkv::core::flush_worker::tests::trivial_move_respects_grandparent_overlap_limit`
   - DoD：
     - 切分逻辑遵守 key-range 不重叠与顺序约束。
     - 单线程与并行结果一致。
+  - 进展记录：
+    - 2026-03-05：范围切分器与边界提取已实现并接入 compaction 计划流程，下一步在 `SM5-02` 引入并行执行后补“单线程 vs 并行结果一致性”对照验证。
 
 - [ ] `TASK-SM5-02` 并行 subcompaction 执行与资源控制（status: planned）
   - 目标：提高后台追赶速度且不击穿前台延迟。

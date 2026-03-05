@@ -12,6 +12,7 @@ use crate::goatkv::metadata::file_metadata::{FileMetadata, TableProperties};
 use crate::goatkv::metadata::version::Version;
 use crate::goatkv::metadata::version_edit::{NewFile, VersionEdit};
 use crate::goatkv::metadata::version_set::VersionSet;
+use crate::goatkv::storage::compaction::picker::build_subcompaction_ranges;
 use crate::goatkv::storage::sstable::{SSTableBuilder, SSTableReader, SSTableScanIterator};
 use crate::goatkv::utils::paths::SstablePaths;
 use tracing::{error, warn};
@@ -34,6 +35,8 @@ impl Default for CompactionConfig {
         }
     }
 }
+
+const SUBCOMPACTION_RANGE_SPLIT_TARGET: usize = 4;
 
 impl CompactionConfig {
     fn normalized(mut self) -> Self {
@@ -739,6 +742,11 @@ impl FlushWorker {
         plan: CompactionPlan,
         bloom_prefix_extractor_len: usize,
     ) -> bool {
+        let _planned_sub_ranges = build_subcompaction_ranges(
+            &plan.source_files,
+            &plan.target_files,
+            SUBCOMPACTION_RANGE_SPLIT_TARGET,
+        );
         let mut version_edit = VersionEdit::new();
         for file in &plan.source_files {
             version_edit.delete_file(plan.source_level, file.file_id);
