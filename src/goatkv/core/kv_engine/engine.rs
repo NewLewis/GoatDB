@@ -214,6 +214,10 @@ impl KvEngine {
         self.reader.get(key)
     }
 
+    pub fn multi_get(&self, keys: &[Vec<u8>]) -> GoatResult<Vec<Option<Vec<u8>>>> {
+        self.reader.multi_get(keys)
+    }
+
     pub fn create_snapshot(&self) -> GoatResult<SnapshotHandle> {
         let seq = self.writer.last_published_sequence();
         let mut manager = self.snapshot_manager.write().unwrap();
@@ -919,6 +923,45 @@ mod tests {
         assert_eq!(engine.get(b"key2").unwrap(), Some(b"value2".to_vec()));
 
         assert_eq!(engine.get(b"nonexistent").unwrap(), None);
+    }
+
+    #[test]
+    fn test_multi_get_mixed_hits_misses_and_delete() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"k1".to_vec(), b"v1".to_vec()).unwrap();
+        engine.put(b"k2".to_vec(), b"v2".to_vec()).unwrap();
+        engine.put(b"k3".to_vec(), b"v3".to_vec()).unwrap();
+        engine.delete(b"k2".to_vec()).unwrap();
+        engine.flush();
+        engine
+            .wait_for_immutable_memtables(Duration::from_secs(3))
+            .unwrap();
+
+        let keys = vec![
+            b"k1".to_vec(),
+            b"k2".to_vec(),
+            b"missing".to_vec(),
+            b"k3".to_vec(),
+        ];
+        let results = engine.multi_get(&keys).unwrap();
+        assert_eq!(
+            results,
+            vec![Some(b"v1".to_vec()), None, None, Some(b"v3".to_vec())]
+        );
+    }
+
+    #[test]
+    fn test_multi_get_empty_keys() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        let keys: Vec<Vec<u8>> = Vec::new();
+        let results = engine.multi_get(&keys).unwrap();
+        assert!(results.is_empty());
     }
 
     #[test]

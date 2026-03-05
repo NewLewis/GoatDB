@@ -596,6 +596,9 @@
     - 增加 MultiGet API 与引擎批量读入口。
     - 批量路径复用 table/block cache probe 与文件打开结果。
     - 增加 batch size 梯度基准，验证吞吐提升。
+  - 进展：
+    - 2026-03-05：新增 `KvEngine::multi_get`/`KvReader::multi_get` 批量读入口，单次请求内复用同一份读快照（mem/immutable/version）避免逐 key 重复抓取引擎读状态。
+    - 2026-03-05：`goatkv_bench` 新增 `multiget` workload（支持 `batch_size`、`miss_ratio`，可跑 GoatKV/RocksDB 对照），后续补 batch-size 梯度与 miss-heavy/workset-fit 对照结果。
 
 - [x] `P1-ROW-CACHE-MISSING`
   - 现象：当前读缓存仅覆盖 table cache 与 data block cache，缺少按 user key/value 结果缓存层。
@@ -1060,17 +1063,20 @@
   - 进展记录：
     - 2026-03-05：已完成共享 filter cache 与指标导出，下一步补 filter miss-heavy/hotread 对照基准并确定默认容量阈值。
 
-- [ ] `TASK-SM4-03` MultiGet 批量 probe 复用与对照基准（status: planned）
+- [ ] `TASK-SM4-03` MultiGet 批量 probe 复用与对照基准（status: in-progress, 2026-03-05）
   - 目标：减少重复 table/block 定位，提升批量读效率。
   - 关键改动文件：
-    - `src/goatkv/engine.rs`
-    - `src/goatkv/storage/sstable/`
+    - `src/goatkv/core/kv_engine/engine.rs`
+    - `src/goatkv/core/kv_engine/reader.rs`
     - `benches/goatkv_bench.rs`
   - 回归命令：
+    - `cargo test --lib goatkv::core::kv_engine::engine::tests::test_multi_get_mixed_hits_misses_and_delete`
     - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine goatkv --wal-sync multiget`
   - DoD：
     - `MultiGet` 吞吐达到阶段目标（相对基线可量化提升）。
     - miss-heavy/workset-fit 两类负载均有结果记录。
+  - 进展记录：
+    - 2026-03-05：完成批量读 API 与 benchmark 命令骨架，下一步实现跨 key 的 table/block probe 复用与基准对照。
 
 #### Milestone 5（compaction 吞吐与空间效率）
 

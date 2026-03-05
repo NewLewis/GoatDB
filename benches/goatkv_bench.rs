@@ -135,6 +135,21 @@ enum Commands {
         #[arg(long, default_value_t = 64)]
         hotset: u64,
     },
+    /// Batch MultiGet benchmark
+    Multiget {
+        /// Batch rounds
+        #[arg(long, default_value_t = 20)]
+        times: u64,
+        /// Total keys in DB
+        #[arg(long, default_value_t = 1024)]
+        key_nums: u64,
+        /// Keys per batch request
+        #[arg(long, default_value_t = 32)]
+        batch_size: u64,
+        /// Miss ratio percent [0,100]
+        #[arg(long, default_value_t = 0)]
+        miss_ratio: u64,
+    },
 }
 
 struct BenchResult {
@@ -455,6 +470,58 @@ fn hotread_goatkv(engine: Arc<KvEngine>, times: u64, key_nums: u64, hotset: u64,
     }
 }
 
+fn sample_multiget_key_id(rng: &mut SmallRng, key_nums: u64, miss_ratio: u64) -> u64 {
+    let miss_ratio = miss_ratio.min(100);
+    let roll = rng.gen_range(0..100);
+    if roll < miss_ratio {
+        // Keep miss key space separated from populated range.
+        key_nums + rng.gen_range(0..key_nums.max(1))
+    } else {
+        rng.gen_range(0..key_nums)
+    }
+}
+
+fn multiget_goatkv(
+    engine: Arc<KvEngine>,
+    times: u64,
+    key_nums: u64,
+    batch_size: u64,
+    miss_ratio: u64,
+    threads: usize,
+) {
+    if key_nums == 0 || times == 0 || threads == 0 || batch_size == 0 {
+        return;
+    }
+    let batch_size = batch_size.max(1);
+
+    for round in 0..times {
+        let mut handles = Vec::with_capacity(threads);
+        for index in 0..threads {
+            let engine = engine.clone();
+            let (start, end) = split_range(key_nums, threads, index);
+            let batches = (end.saturating_sub(start)).div_ceil(batch_size).max(1);
+            let seed = 0x0d15_ea5e_u64
+                .wrapping_add((round + 1).wrapping_mul(0x9e37_79b9))
+                .wrapping_mul(index as u64 + 1);
+            let handle = thread::spawn(move || {
+                let mut rng = SmallRng::seed_from_u64(seed);
+                for _ in 0..batches {
+                    let mut keys = Vec::with_capacity(batch_size as usize);
+                    for _ in 0..batch_size {
+                        let key_id = sample_multiget_key_id(&mut rng, key_nums, miss_ratio);
+                        keys.push(make_key(key_id));
+                    }
+                    let _ = engine.multi_get(&keys);
+                }
+            });
+            handles.push(handle);
+        }
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+}
+
 #[cfg(feature = "rocksdb")]
 fn randread_rocksdb(db: Arc<DB>, times: u64, key_nums: u64, threads: usize) {
     if key_nums == 0 || times == 0 || threads == 0 {
@@ -507,6 +574,48 @@ fn hotread_rocksdb(db: Arc<DB>, times: u64, key_nums: u64, hotset: u64, threads:
                     let key_id = rng.gen_range(0..hotset);
                     let key = make_key(key_id);
                     let _ = db.get(&key);
+                }
+            });
+            handles.push(handle);
+        }
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(feature = "rocksdb")]
+fn multiget_rocksdb(
+    db: Arc<DB>,
+    times: u64,
+    key_nums: u64,
+    batch_size: u64,
+    miss_ratio: u64,
+    threads: usize,
+) {
+    if key_nums == 0 || times == 0 || threads == 0 || batch_size == 0 {
+        return;
+    }
+    let batch_size = batch_size.max(1);
+
+    for round in 0..times {
+        let mut handles = Vec::with_capacity(threads);
+        for index in 0..threads {
+            let db = db.clone();
+            let (start, end) = split_range(key_nums, threads, index);
+            let batches = (end.saturating_sub(start)).div_ceil(batch_size).max(1);
+            let seed = 0x0d15_ea5e_u64
+                .wrapping_add((round + 1).wrapping_mul(0x9e37_79b9))
+                .wrapping_mul(index as u64 + 1);
+            let handle = thread::spawn(move || {
+                let mut rng = SmallRng::seed_from_u64(seed);
+                for _ in 0..batches {
+                    let mut keys = Vec::with_capacity(batch_size as usize);
+                    for _ in 0..batch_size {
+                        let key_id = sample_multiget_key_id(&mut rng, key_nums, miss_ratio);
+                        keys.push(make_key(key_id));
+                    }
+                    let _ = db.multi_get(keys);
                 }
             });
             handles.push(handle);
@@ -810,6 +919,70 @@ fn main() {
                             let result = BenchResult {
                                 engine: "rocksdb",
                                 workload: "hotread",
+                                total_ms,
+                                iters,
+                                ms_per_iter: ms_per_iter(total_ms, iters),
+                            };
+                            print_result(&result);
+                        }
+                    }
+                    EngineKind::Both => {}
+                }
+            }
+            Commands::Multiget {
+                times,
+                key_nums,
+                batch_size,
+                miss_ratio,
+            } => {
+                let iters = times;
+                match engine_kind {
+                    EngineKind::Goatkv => {
+                        let options = goatkv_options_from_cli(&cli, &base_dir);
+                        let engine =
+                            Arc::new(KvEngine::new_with_options(options).expect("open engine"));
+                        let begin = Instant::now();
+                        multiget_goatkv(
+                            engine.clone(),
+                            times,
+                            key_nums,
+                            batch_size,
+                            miss_ratio,
+                            cli.threads,
+                        );
+                        let total_ms = begin.elapsed().as_millis();
+                        let result = BenchResult {
+                            engine: "goatkv",
+                            workload: "multiget",
+                            total_ms,
+                            iters,
+                            ms_per_iter: ms_per_iter(total_ms, iters),
+                        };
+                        print_result(&result);
+                        print_cache_metrics(&engine);
+                    }
+                    EngineKind::Rocksdb => {
+                        ensure_rocksdb_available();
+                        #[cfg(feature = "rocksdb")]
+                        {
+                            let mut rocks_opts = Options::default();
+                            rocks_opts.create_if_missing(true);
+                            rocks_opts.set_compression_type(DBCompressionType::None);
+                            let db =
+                                Arc::new(DB::open(&rocks_opts, &base_dir).expect("open rocksdb"));
+                            let begin = Instant::now();
+                            multiget_rocksdb(
+                                db,
+                                times,
+                                key_nums,
+                                batch_size,
+                                miss_ratio,
+                                cli.threads,
+                            );
+                            let total_ms = begin.elapsed().as_millis();
+                            let result = BenchResult {
+                                engine: "rocksdb",
+                                workload: "multiget",
                                 total_ms,
                                 iters,
                                 ms_per_iter: ms_per_iter(total_ms, iters),

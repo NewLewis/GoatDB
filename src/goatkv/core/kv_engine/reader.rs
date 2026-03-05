@@ -47,6 +47,34 @@ impl KvReader {
             .map(|result| result.map(|value| value.to_vec()))
     }
 
+    pub fn multi_get(&self, keys: &[Vec<u8>]) -> GoatResult<Vec<Option<Vec<u8>>>> {
+        let (mem_table, immutable_mem_tables, version) = self.snapshot_read_state();
+        let mut results = Vec::with_capacity(keys.len());
+
+        for key in keys {
+            if let Some(result) = Self::get_from_memtable(&mem_table, key)? {
+                results.push(result.map(|value| value.to_vec()));
+                continue;
+            }
+
+            let mut found = None;
+            for entry in immutable_mem_tables.iter().rev() {
+                if let Some(result) = Self::get_from_immutable(entry, key)? {
+                    found = Some(result.map(|value| value.to_vec()));
+                    break;
+                }
+            }
+            if let Some(result) = found {
+                results.push(result);
+                continue;
+            }
+
+            results.push(Self::get_from_version(&version, key)?.map(|value| value.to_vec()));
+        }
+
+        Ok(results)
+    }
+
     fn snapshot_read_state(
         &self,
     ) -> (
