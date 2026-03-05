@@ -56,6 +56,53 @@ mod tests {
     }
 
     #[test]
+    fn test_wal_writer_preallocate_and_truncate_on_drop() {
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let path = temp_file.path().to_path_buf();
+        let config = WalWriterConfig {
+            wal_sync: false,
+            wal_preallocate_bytes: 4096,
+            ..WalWriterConfig::default()
+        };
+
+        let key = InternalKey::new(b"prealloc".to_vec(), 1, InternalKeyKind::Put);
+        let value = b"value".to_vec();
+
+        let logical_size = {
+            let wal = WalWriter::new(path.clone(), config).expect("open wal");
+            wal.append(&key, &value).expect("append wal");
+            let metadata = fs::metadata(&path).expect("metadata after append");
+            assert!(
+                metadata.len() >= 4096,
+                "file should be preallocated while writer is alive"
+            );
+            wal.logical_size_for_test()
+        };
+
+        let final_size = fs::metadata(&path).expect("metadata after drop").len();
+        assert_eq!(final_size, logical_size);
+    }
+
+    #[test]
+    fn test_wal_writer_periodic_sync_when_wal_sync_disabled() {
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let path = temp_file.path().to_path_buf();
+        let config = WalWriterConfig {
+            wal_sync: false,
+            wal_bytes_per_sync: 1,
+            ..WalWriterConfig::default()
+        };
+
+        let wal = WalWriter::new(path, config).expect("open wal");
+        let key = InternalKey::new(b"sync".to_vec(), 1, InternalKeyKind::Put);
+        wal.append(&key, b"v1").expect("append first record");
+        assert!(
+            wal.sync_calls_for_test() >= 1,
+            "periodic sync should trigger once bytes_per_sync is reached"
+        );
+    }
+
+    #[test]
     fn test_wal_reader_empty() {
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
         let reader = WalReader::new(&temp_file.path().to_path_buf());
@@ -198,5 +245,42 @@ mod tests {
             .expect_err("invalid kind should fail WAL replay");
         assert_eq!(err.kind(), ErrorKind::Corruption);
         assert!(err.to_string().contains("invalid internal key kind"));
+    }
+
+    #[test]
+    fn test_wal_replay_truncates_preallocated_zero_tail() {
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let path = temp_file.path().to_path_buf();
+
+        {
+            let config = WalWriterConfig {
+                wal_sync: false,
+                ..WalWriterConfig::default()
+            };
+            let wal = WalWriter::new(path.clone(), config).expect("open wal");
+            let key = InternalKey::new(b"ok".to_vec(), 7, InternalKeyKind::Put);
+            wal.append(&key, b"value").expect("append wal");
+        }
+
+        let good_len = fs::metadata(&path).expect("metadata after close").len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open file")
+            .set_len(good_len + 4096)
+            .expect("extend file with zero tail");
+
+        let mut replayed = 0usize;
+        let stats = replay_wal_file(&path, |_key, _value| replayed += 1).expect("replay wal");
+        assert_eq!(replayed, 1);
+        assert_eq!(stats.entries, 1);
+        assert!(
+            stats.truncated,
+            "zero tail should be truncated during replay"
+        );
+        assert_eq!(
+            fs::metadata(&path).expect("metadata after replay").len(),
+            good_len
+        );
     }
 }

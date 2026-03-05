@@ -482,6 +482,11 @@
     - 定义并实现 on-disk format version 字段与兼容读取策略。
     - 给出升级/回滚策略文档（forward/backward compatibility）。
     - 增加跨版本读写兼容测试。
+  - 进展记录：
+    - 2026-03-05：完成第一阶段格式版本落地：
+      - MANIFEST：`VersionEdit` 新增 `format_version` 字段（默认兼容 legacy=0，当前写入=1），恢复阶段对高于支持上限的版本直接报 `Corruption` 拒绝启动。
+      - SSTable：footer padding 区新增格式标记与 `format_version`（当前=1），读取路径兼容无标记旧文件（按 legacy=0 处理）。
+      - 新增/通过回归：`encode_decode_preserves_manifest_format_version`、`decode_legacy_edit_without_format_version_is_compatible`、`apply_edit_writes_current_manifest_format_version`、`recovery_rejects_unsupported_manifest_format_version`、`test_sstable_reader_compat_legacy_footer_without_format_marker`、`test_sstable_reader_rejects_unsupported_format_version`。
 
 - [x] `P1-WRITE-STALL-BY-COMPACTION-PRESSURE`
   - 现象：当前写入背压主要基于 WAL/Mem 队列与 immutable backlog，缺少基于 `L0` 文件数和 compaction debt 的分级限速/停写策略。
@@ -685,6 +690,430 @@
     - 增加 WAL 预分配与 `bytes_per_sync` 参数配置。
     - 增加周期性 sync 策略并验证崩溃恢复正确性不回退。
     - 压测下写入尾延迟波动收敛。
+  - 进展记录：
+    - 2026-03-05：`WalWriterConfig` 新增 `wal_preallocate_bytes` 与 `wal_bytes_per_sync`。
+      - 预分配：写入前按步长扩容（`set_len`），关闭/轮转时回收到 `logical_size`。
+      - 周期 sync：`wal_sync=false` 时按累计写入字节触发 `sync_data`，`wal_sync=true` 仍保持每次 append 同步语义。
+    - 2026-03-05：`KvEngineOptions` 增加 `with_wal_preallocate_bytes`、`with_wal_bytes_per_sync`，并透传到 `KvEngine::open_wal_writer`。
+    - 2026-03-05：`goatkv_server` 与 `goatkv_bench` 新增对应 CLI 参数，支持运行期/基准参数化。
+    - 2026-03-05：新增 WAL 回归：
+      - `test_wal_writer_preallocate_and_truncate_on_drop`
+      - `test_wal_writer_periodic_sync_when_wal_sync_disabled`
+      - `test_wal_replay_truncates_preallocated_zero_tail`
+      恢复回归 `integration_recovery` 全量通过。
+    - 2026-03-05：新增参数扫描恢复回归 `recovery_replays_wal_across_prealloc_and_bytes_per_sync_profiles`，覆盖
+      - default：`wal_preallocate_bytes=0`，`wal_bytes_per_sync=0`
+      - 高频 sync：`wal_preallocate_bytes=4096`，`wal_bytes_per_sync=1`
+      - 低频 sync：`wal_preallocate_bytes=4096`，`wal_bytes_per_sync=4MB`
+      三档配置均验证“零尾截断 + 数据可见性恢复”。
+
+## 单机 KV 补全计划（2026-03-05）
+
+目标：在不引入分布式复制/事务协调前，完成“可作为关系型上层存储引擎的单机 KV 能力闭环”。
+
+### 里程碑 0：基线冻结（0.5 周）
+
+- 目标：
+  - 冻结单机验收门槛与基准配置，作为后续阶段统一回归标准。
+- 任务：
+  - 固化回归门槛：`cargo test --lib --tests`、`cargo clippy --all-targets --all-features -- -D warnings`。
+  - 固化性能基线：`goatkv_bench` `populate/randread/hotread`（包含 `row_cache=0` 对照）。
+  - 在 issue 里维护阶段状态（`planned/in-progress/done`）与实际完成日期。
+- 验收：
+  - 在文档中记录“基线命令 + 当前基线结果 + 目标回归阈值（允许波动范围）”。
+
+### 里程碑 1：KV 语义补全（1.5~2 周）
+
+- 目标：
+  - 补齐单机上层最常用的 KV 访问语义：`Scan`、`MultiGet`、`CAS`。
+- 对应 issue：
+  - `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
+  - `P1-MULTIGET-BATCH-READ-PATH`
+- 任务：
+  - proto/server/client 增加 `Scan`、`MultiGet`、`CompareAndSet`。
+  - engine 层提供原子 `CAS`、快照一致 `Scan(snapshot_id)`、批量读短路径。
+  - 增加 e2e：扫描一致性、CAS 并发冲突、批量读命中复用。
+- 验收：
+  - API 文档明确错误语义（`NotFound/Conflict/Unavailable`）。
+  - e2e 覆盖“点读写 + 扫描 + CAS + 快照”基本矩阵。
+
+### 里程碑 2：持久化与格式演进（1.5 周）
+
+- 目标：
+  - 提升可升级性与长期运行稳定性，避免格式升级/写入尾延迟成为瓶颈。
+- 对应 issue：
+  - `P1-ONDISK-FORMAT-VERSIONING-GAP`
+  - `P2-WAL-PREALLOC-BYTES-PER-SYNC`
+- 任务：
+  - SSTable/MANIFEST 增加显式 format version 与兼容读取策略。
+  - WAL 增加预分配与 `bytes_per_sync` 配置。
+  - 增加跨版本读写兼容测试与恢复回归测试。
+- 验收：
+  - 输出格式兼容矩阵（forward/backward）。
+  - 崩溃恢复测试不回退，写入尾延迟抖动收敛。
+
+### 里程碑 3：可观测与健康检查（1 周）
+
+- 目标：
+  - 建立单机运维闭环，支持自动探活、容量与性能告警。
+- 对应 issue：
+  - `P1-OBSERVABILITY-HEALTH-GAP`
+- 任务：
+  - 增加 liveness/readiness 接口。
+  - 暴露核心指标：QPS、错误率、p95/p99、flush/compaction backlog、cache hit/miss、队列水位。
+  - 补充看板字段与告警建议阈值。
+- 验收：
+  - 本地可通过接口和指标快速定位“写阻塞/compaction 积压/缓存退化”。
+
+### 里程碑 4：读路径剩余优化（1.5 周）
+
+- 目标：
+  - 补齐 scan/multiget 场景下的吞吐短板，稳定点查优势。
+- 对应 issue：
+  - `P1-PREFIX-BLOOM-PARTITIONED-FILTER`
+  - `P1-READAHEAD-ITERATOR-OPT`
+  - `P1-MULTIGET-BATCH-READ-PATH`（性能部分）
+- 任务：
+  - 迭代器 readahead/prefetch。
+  - partitioned filter 分区缓存纳入统一容量治理与指标。
+  - MultiGet 路径复用 table/block probe，减少重复开销。
+- 验收：
+  - scan/multiget benchmark 吞吐提升且点查不回退。
+
+### 里程碑 5：compaction 吞吐与空间效率（1.5 周）
+
+- 目标：
+  - 提升持续写入场景下后台追赶能力与空间利用率。
+- 对应 issue：
+  - `P1-PARALLEL-COMPACTION-SUBCOMPACTION`
+  - `P1-PER-LEVEL-COMPRESSION`
+- 任务：
+  - 引入 subcompaction 并行切片。
+  - 支持 per-level compression 策略与读取解压兼容。
+  - 增加 backlog 收敛与空间占用基准。
+- 验收：
+  - 高写入压测下 compaction debt 可持续下降，空间占用可预测。
+
+### 里程碑 6：unsafe 稳定性封口（1 周）
+
+- 目标：
+  - 降低 skiplist/arena `unsafe` 路径的长期维护风险。
+- 对应 issue：
+  - `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
+- 任务：
+  - 增加 Miri/Loom/Fuzz 覆盖关键并发路径。
+  - 为 unsafe 代码块补充不变量注释与审计清单。
+  - 增加长稳压测（soak）并纳入周期性任务。
+- 验收：
+  - 形成可重复执行的“并发正确性 + 内存安全”验证流水线。
+
+### PR 级拆分清单（单机 KV）
+
+说明：以下任务按“单个 PR 可评审、可回滚、可独立验收”拆分，默认状态 `planned`，执行时在任务后标记 `in-progress/done` 并补充完成日期。
+
+#### Milestone 0（基线冻结）
+
+- [x] `TASK-SM0-01` 基线回归脚本与门槛固化（status: done, 2026-03-05）
+  - 目标：统一功能/静态检查入口，避免阶段回归口径漂移。
+  - 关键改动文件：
+    - `scripts/baseline-gate.sh`
+    - `docs/goatkv/kv_engine_issue_tracker.md`
+  - 回归命令：
+    - `./scripts/baseline-gate.sh`
+  - DoD：
+    - 单命令可执行全量基线回归。
+    - 文档记录失败处理规范（失败即阻断后续阶段合并）。
+  - 执行规范（已固化）：
+    - 脚本顺序执行：`cargo test --lib --tests`、`cargo clippy --all-targets --all-features -- -D warnings`。
+    - 任一子命令返回非零即立即退出，并阻断后续里程碑任务合并。
+
+- [ ] `TASK-SM0-02` 基线 benchmark 模板与阈值登记（status: planned）
+  - 目标：固定 `populate/randread/hotread` 的运行参数、结果格式、阈值。
+  - 关键改动文件：
+    - `benches/goatkv_bench.rs`
+    - `docs/goatkv/kv_engine_issue_tracker.md`
+  - 回归命令：
+    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine goatkv --wal-sync populate`
+    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine goatkv --wal-sync randread`
+    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine goatkv --wal-sync hotread`
+  - DoD：
+    - 结果包含吞吐、p95/p99、样本规模、执行日期。
+    - 设定回退阈值（建议默认 5%~10%，按场景落盘）。
+
+#### Milestone 1（KV 语义补全）
+
+- [ ] `TASK-SM1-01` Proto/Server/Client 增加 `Scan`、`MultiGet`、`CompareAndSet`（status: planned）
+  - 目标：打通 API 面与调用链，定义清晰错误语义。
+  - 关键改动文件：
+    - `proto/goatkv.proto`
+    - `src/bin/goatkv_server.rs`
+    - `src/bin/goatkv_client.rs`
+  - 回归命令：
+    - `cargo test --lib --tests`
+  - DoD：
+    - gRPC 接口可端到端调用。
+    - `NotFound/Conflict/Unavailable` 返回语义文档化。
+
+- [ ] `TASK-SM1-02` 引擎层快照一致 `Scan(snapshot_id)`（status: planned）
+  - 目标：扫描在快照下获得稳定视图，不受并发写入影响。
+  - 关键改动文件：
+    - `src/goatkv/engine.rs`
+    - `src/goatkv/storage/mvcc/`
+    - `src/goatkv/storage/memtable/`
+  - 回归命令：
+    - `cargo test --test e2e_scan`
+  - DoD：
+    - 并发写入 + 扫描用例结果一致可复现。
+    - 快照生命周期无资源泄露。
+
+- [ ] `TASK-SM1-03` 原子 CAS 语义与冲突检测（status: planned）
+  - 目标：保证 CAS 比较与写入原子执行，冲突可观测。
+  - 关键改动文件：
+    - `src/goatkv/engine.rs`
+    - `src/goatkv/storage/sequence/`
+    - `tests/e2e/`
+  - 回归命令：
+    - `cargo test --test e2e_cas_conflict`
+  - DoD：
+    - 并发 CAS 冲突率与返回码符合预期。
+    - 不引入写路径明显退化（以基线阈值判定）。
+
+- [ ] `TASK-SM1-04` `MultiGet` 批量读接口与基础复用（status: planned）
+  - 目标：减少 RPC 往返和重复 probe，建立后续读优化基础。
+  - 关键改动文件：
+    - `src/goatkv/engine.rs`
+    - `src/goatkv/storage/sstable/`
+    - `tests/e2e/`
+  - 回归命令：
+    - `cargo test --test e2e_multiget`
+  - DoD：
+    - `MultiGet` 正确返回部分命中/全部 miss。
+    - 比逐 key get 具备可测吞吐收益（同参数下对照）。
+
+#### Milestone 2（持久化与格式演进）
+
+- [x] `TASK-SM2-01` SST/MANIFEST format version 字段落地（status: done, 2026-03-05）
+  - 目标：显式格式版本，支持后续演进与兼容策略。
+  - 关键改动文件：
+    - `src/goatkv/storage/sstable/`
+    - `src/goatkv/storage/manifest/`
+    - `src/goatkv/metadata/version_edit.rs`
+    - `src/goatkv/metadata/version_set.rs`
+  - 回归命令：
+    - `cargo test --lib format_version`
+    - `cargo test --lib goatkv::storage::sstable::reader::tests`
+    - `cargo test --lib goatkv::metadata::version_set::tests`
+    - `./scripts/baseline-gate.sh`
+  - DoD：
+    - 新文件写入包含版本信息。
+    - 旧版本读取路径明确（接受/拒绝）并可测试。
+
+- [x] `TASK-SM2-02` 兼容矩阵测试（forward/backward）（status: done, 2026-03-05）
+  - 目标：验证跨版本读写、恢复路径行为稳定。
+  - 关键改动文件：
+    - `tests/integration/compat_test.rs`
+    - `Cargo.toml`
+    - `docs/goatkv/kv_engine_issue_tracker.md`
+  - 回归命令：
+    - `cargo test --test integration_compat`
+  - DoD：
+    - 兼容矩阵按版本维度可执行并记录结果。
+    - 不兼容场景返回明确错误而非 panic。
+  - 关闭记录：
+    - 2026-03-05：新增 `integration_compat`，覆盖 5 组版本场景（baseline、manifest backward、sstable backward、manifest forward reject、sstable forward reject）。
+
+- [x] `TASK-SM2-03` WAL 预分配与 `bytes_per_sync` 参数化（status: done, 2026-03-05）
+  - 目标：降低尾延迟抖动，提升持续写入平滑性。
+  - 关键改动文件：
+    - `src/goatkv/storage/wal/writer.rs`
+    - `src/goatkv/utils/options.rs`
+    - `src/goatkv/core/kv_engine/engine.rs`
+    - `src/bin/goatkv_server.rs`
+    - `benches/goatkv_bench.rs`
+  - 回归命令：
+    - `cargo test --lib goatkv::storage::wal::tests`
+    - `cargo test --test integration_recovery`
+    - `cargo test --bin goatkv_server`
+    - `cargo test --lib goatkv::utils::options::tests`
+    - `./scripts/baseline-gate.sh`
+  - DoD：
+    - 支持配置 WAL 预分配大小与周期性 sync。
+    - 崩溃恢复语义不回退。
+
+- [x] `TASK-SM2-04` 崩溃恢复回归与参数扫描（status: done, 2026-03-05）
+  - 目标：覆盖预分配/sync 配置组合下的恢复正确性。
+  - 关键改动文件：
+    - `tests/integration/`
+    - `tests/e2e/`
+  - 回归命令：
+    - `cargo test --test integration_recovery`
+    - `./scripts/baseline-gate.sh`
+  - DoD：
+    - 至少覆盖“默认/高频 sync/低频 sync”三档配置。
+    - 恢复后可见数据满足 WAL durability 约束。
+
+#### Milestone 3（可观测与健康检查）
+
+- [ ] `TASK-SM3-01` liveness/readiness 接口接入（status: planned）
+  - 目标：提供标准探活与就绪检查入口。
+  - 关键改动文件：
+    - `src/bin/goatkv_server.rs`
+    - `src/goatkv/server/`
+  - 回归命令：
+    - `cargo test --test e2e_health`
+  - DoD：
+    - 进程可存活但未就绪场景返回不同状态。
+    - 支持被部署系统直接探测。
+
+- [ ] `TASK-SM3-02` 核心指标导出（QPS/延迟/错误率/backlog/cache）（status: planned）
+  - 目标：覆盖定位写阻塞和读退化所需最小指标集。
+  - 关键改动文件：
+    - `src/goatkv/metrics/`
+    - `src/goatkv/engine.rs`
+    - `src/goatkv/storage/`
+  - 回归命令：
+    - `cargo test --lib --tests`
+  - DoD：
+    - 指标命名、标签、单位有文档定义。
+    - 关键路径埋点不引入显著性能回退。
+
+- [ ] `TASK-SM3-03` 告警阈值建议与运维手册（status: planned）
+  - 目标：给出可执行的排障基线，缩短故障定位时间。
+  - 关键改动文件：
+    - `docs/goatkv/`
+  - 回归命令：
+    - 文档评审（Checklist）
+  - DoD：
+    - 覆盖“写阻塞/compaction 积压/cache 退化”三类场景。
+    - 每类场景给出触发阈值与处理顺序。
+
+#### Milestone 4（读路径剩余优化）
+
+- [ ] `TASK-SM4-01` Iterator readahead/prefetch（status: planned）
+  - 目标：提升长扫描吞吐，降低块读取抖动。
+  - 关键改动文件：
+    - `src/goatkv/storage/sstable/iterator.rs`
+    - `src/goatkv/storage/block_cache/`
+  - 回归命令：
+    - `cargo test --lib --tests`
+    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine goatkv --wal-sync randread`
+  - DoD：
+    - scan 吞吐提升且点查（single get）不回退超阈值。
+
+- [ ] `TASK-SM4-02` partitioned filter 缓存治理与指标（status: planned）
+  - 目标：将 partitioned filter 纳入统一容量与命中率管理。
+  - 关键改动文件：
+    - `src/goatkv/storage/sstable/filter_block.rs`
+    - `src/goatkv/storage/block_cache/`
+    - `src/goatkv/metrics/`
+  - 回归命令：
+    - `cargo test --lib --tests`
+  - DoD：
+    - filter 分区缓存命中率可观测。
+    - 缓存上限受统一配额控制。
+
+- [ ] `TASK-SM4-03` MultiGet 批量 probe 复用与对照基准（status: planned）
+  - 目标：减少重复 table/block 定位，提升批量读效率。
+  - 关键改动文件：
+    - `src/goatkv/engine.rs`
+    - `src/goatkv/storage/sstable/`
+    - `benches/goatkv_bench.rs`
+  - 回归命令：
+    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine goatkv --wal-sync multiget`
+  - DoD：
+    - `MultiGet` 吞吐达到阶段目标（相对基线可量化提升）。
+    - miss-heavy/workset-fit 两类负载均有结果记录。
+
+#### Milestone 5（compaction 吞吐与空间效率）
+
+- [ ] `TASK-SM5-01` subcompaction 范围切分器（status: planned）
+  - 目标：将大 compaction task 拆为可并行子任务。
+  - 关键改动文件：
+    - `src/goatkv/storage/compaction/picker.rs`
+    - `src/goatkv/storage/compaction/plan.rs`
+  - 回归命令：
+    - `cargo test --lib --tests`
+  - DoD：
+    - 切分逻辑遵守 key-range 不重叠与顺序约束。
+    - 单线程与并行结果一致。
+
+- [ ] `TASK-SM5-02` 并行 subcompaction 执行与资源控制（status: planned）
+  - 目标：提高后台追赶速度且不击穿前台延迟。
+  - 关键改动文件：
+    - `src/goatkv/storage/compaction/mod.rs`
+    - `src/goatkv/storage/compaction/worker.rs`
+    - `src/goatkv/options.rs`
+  - 回归命令：
+    - `cargo test --lib --tests`
+    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine goatkv --wal-sync populate --threads 16`
+  - DoD：
+    - compaction debt 在高写入下可持续下降。
+    - 写路径延迟退化在阈值内。
+
+- [ ] `TASK-SM5-03` per-level compression 配置与读兼容（status: planned）
+  - 目标：按层配置压缩策略，平衡 CPU 与空间放大。
+  - 关键改动文件：
+    - `src/goatkv/storage/sstable/`
+    - `src/goatkv/storage/compaction/`
+    - `src/goatkv/options.rs`
+  - 回归命令：
+    - `cargo test --lib --tests`
+  - DoD：
+    - 各层压缩策略可配置且默认值安全。
+    - 读取路径对混合压缩文件兼容。
+
+- [ ] `TASK-SM5-04` 空间占用与 compaction backlog 基准（status: planned）
+  - 目标：量化空间效率和后台追赶效果，形成回归阈值。
+  - 关键改动文件：
+    - `benches/goatkv_bench.rs`
+    - `docs/goatkv/kv_engine_issue_tracker.md`
+  - 回归命令：
+    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine goatkv --wal-sync populate --threads 16 --key-nums 10000`
+  - DoD：
+    - 输出空间放大、debt 曲线、吞吐/延迟对照。
+    - 写入稳定期内 backlog 斜率可解释并可复现。
+
+#### Milestone 6（unsafe 稳定性封口）
+
+- [ ] `TASK-SM6-01` unsafe 不变量注释与审计清单（status: planned）
+  - 目标：显式化 unsafe 前提，降低维护误用风险。
+  - 关键改动文件：
+    - `src/goatkv/storage/skiplist/`
+    - `src/goatkv/storage/arena/`
+    - `docs/goatkv/`
+  - 回归命令：
+    - `cargo test --lib --tests`
+  - DoD：
+    - 关键 unsafe 块均有不变量说明。
+    - 审计清单可用于 code review 对照。
+
+- [ ] `TASK-SM6-02` Miri/Loom/Fuzz harness 建设（status: planned）
+  - 目标：覆盖并发交错与内存安全高风险路径。
+  - 关键改动文件：
+    - `tests/`
+    - `scripts/`
+    - `Cargo.toml`
+  - 回归命令：
+    - `cargo test -- --ignored`
+    - `cargo test --features loom`
+  - DoD：
+    - 至少 1 条 Loom 场景、1 组 fuzz 输入集可重复执行。
+    - 在 CI 或周期任务中可自动触发。
+
+- [ ] `TASK-SM6-03` 长稳压测（soak）作业与失败归档（status: planned）
+  - 目标：验证长时间运行下内存/句柄/延迟稳定性。
+  - 关键改动文件：
+    - `scripts/`
+    - `docs/goatkv/kv_engine_issue_tracker.md`
+  - 回归命令：
+    - `cargo test --test e2e_soak -- --ignored`
+  - DoD：
+    - 输出标准化报告（持续时长、错误、资源曲线）。
+    - 明确失败样本归档路径和复盘模板。
+
+### 预计总工期
+
+- 约 8~9 周（按单人连续推进估算，不含分布式能力开发）。
 
 ## 建议修复顺序
 

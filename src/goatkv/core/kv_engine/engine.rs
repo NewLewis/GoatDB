@@ -402,6 +402,8 @@ impl KvEngine {
             wal_path,
             WalWriterConfig {
                 wal_sync: options.wal_sync,
+                wal_preallocate_bytes: options.wal_preallocate_bytes,
+                wal_bytes_per_sync: options.wal_bytes_per_sync,
             },
         )
         .map_err(|e| {

@@ -33,6 +33,14 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     wal_sync: bool,
 
+    /// WAL preallocation bytes for GoatKV (0 disables)
+    #[arg(long, default_value_t = 0)]
+    wal_preallocate_bytes: u64,
+
+    /// WAL periodic sync bytes for GoatKV (0 disables)
+    #[arg(long, default_value_t = 0)]
+    wal_bytes_per_sync: u64,
+
     /// Engine to run
     #[arg(long, value_enum, default_value_t = EngineKind::Goatkv)]
     engine: EngineKind,
@@ -532,6 +540,8 @@ fn goatkv_options_from_cli(cli: &Cli, base_dir: &Path) -> KvEngineOptions {
     KvEngineOptions::default()
         .with_data_dir(base_dir)
         .with_wal_sync(cli.wal_sync)
+        .with_wal_preallocate_bytes(cli.wal_preallocate_bytes)
+        .with_wal_bytes_per_sync(cli.wal_bytes_per_sync)
         .with_table_cache_capacity(cli.table_cache_capacity)
         .with_block_cache_capacity_bytes(cli.block_cache_capacity_mb.saturating_mul(1024 * 1024))
         .with_row_cache_capacity_bytes(cli.row_cache_capacity_mb.saturating_mul(1024 * 1024))

@@ -236,6 +236,18 @@ struct Args {
     address: String,
     #[arg(short, long, help = "Data directory (default: ./goatdb_data)")]
     data_dir: Option<String>,
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "WAL preallocation bytes (0 disables)"
+    )]
+    wal_preallocate_bytes: u64,
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "WAL periodic sync bytes when wal_sync is disabled (0 disables)"
+    )]
+    wal_bytes_per_sync: u64,
     #[arg(long, help = "TLS certificate PEM path")]
     tls_cert_path: Option<String>,
     #[arg(long, help = "TLS private key PEM path")]
@@ -376,6 +388,9 @@ async fn main() -> GoatResult<()> {
     if let Some(ref dir) = args.data_dir {
         options = options.with_data_dir(dir);
     }
+    options = options
+        .with_wal_preallocate_bytes(args.wal_preallocate_bytes)
+        .with_wal_bytes_per_sync(args.wal_bytes_per_sync);
     // 初始化日志
     let _log_guards = init_logging("goatkv_server", &options.data_dir, "info");
     if let Some(dir) = args.data_dir.as_ref() {
@@ -467,6 +482,8 @@ mod tests {
         Args {
             address: "127.0.0.1:50051".to_string(),
             data_dir: None,
+            wal_preallocate_bytes: 0,
+            wal_bytes_per_sync: 0,
             tls_cert_path: cert.map(str::to_string),
             tls_key_path: key.map(str::to_string),
             tls_client_ca_path: client_ca.map(str::to_string),

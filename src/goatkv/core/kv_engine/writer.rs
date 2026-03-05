@@ -1032,7 +1032,10 @@ mod tests {
         let wal_file = NamedTempFile::new().expect("create temp wal");
         let wal_writer = WalWriter::new(
             wal_file.path().to_path_buf(),
-            WalWriterConfig { wal_sync: false },
+            WalWriterConfig {
+                wal_sync: false,
+                ..WalWriterConfig::default()
+            },
         )
         .expect("open wal writer");
         let mem = Arc::new(MemTable::new(1024 * 1024));

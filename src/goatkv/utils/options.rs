@@ -45,6 +45,17 @@ pub struct KvEngineOptions {
     /// Default: true (safer but slower)
     pub wal_sync: bool,
 
+    /// WAL preallocation bytes.
+    /// 0 disables preallocation.
+    /// Default: 0
+    pub wal_preallocate_bytes: u64,
+
+    /// WAL periodic sync bytes.
+    /// Accumulated appended bytes trigger one sync when wal_sync=false.
+    /// 0 disables periodic sync.
+    /// Default: 0
+    pub wal_bytes_per_sync: u64,
+
     /// Maximum operation count per WAL group commit
     /// Default: 4096
     pub wal_max_group_ops: usize,
@@ -175,6 +186,8 @@ impl Default for KvEngineOptions {
             mem_table_size: 1024 * 1024, // 1MB
             recover_from_wal: true,
             wal_sync: true,
+            wal_preallocate_bytes: 0,
+            wal_bytes_per_sync: 0,
             wal_max_group_ops: 4096,
             wal_max_group_bytes: 2 * 1024 * 1024,
             wal_group_wait_us: 20,
@@ -236,6 +249,18 @@ impl KvEngineOptions {
     /// Sets whether to synchronize WAL writes to disk
     pub fn with_wal_sync(mut self, sync: bool) -> Self {
         self.wal_sync = sync;
+        self
+    }
+
+    /// Sets WAL preallocation bytes (0 disables).
+    pub fn with_wal_preallocate_bytes(mut self, bytes: u64) -> Self {
+        self.wal_preallocate_bytes = bytes;
+        self
+    }
+
+    /// Sets WAL periodic sync bytes (0 disables).
+    pub fn with_wal_bytes_per_sync(mut self, bytes: u64) -> Self {
+        self.wal_bytes_per_sync = bytes;
         self
     }
 
@@ -439,6 +464,8 @@ impl KvEngineOptions {
             mem_table_size: 1024 * 1024, // 1MB
             recover_from_wal: false,     // Don't recover in tests
             wal_sync: false,             // Don't sync in tests for speed
+            wal_preallocate_bytes: 0,
+            wal_bytes_per_sync: 0,
             wal_max_group_ops: 4096,
             wal_max_group_bytes: 2 * 1024 * 1024,
             wal_group_wait_us: 0,
@@ -511,6 +538,18 @@ mod tests {
     fn test_with_wal_sync() {
         let options = KvEngineOptions::default().with_wal_sync(false);
         assert!(!options.wal_sync);
+    }
+
+    #[test]
+    fn test_with_wal_preallocate_bytes() {
+        let options = KvEngineOptions::default().with_wal_preallocate_bytes(4 * 1024 * 1024);
+        assert_eq!(options.wal_preallocate_bytes, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_with_wal_bytes_per_sync() {
+        let options = KvEngineOptions::default().with_wal_bytes_per_sync(512 * 1024);
+        assert_eq!(options.wal_bytes_per_sync, 512 * 1024);
     }
 
     #[test]
@@ -626,5 +665,7 @@ mod tests {
         assert_eq!(options.mem_table_size, 1024 * 1024);
         assert!(!options.recover_from_wal);
         assert!(!options.wal_sync);
+        assert_eq!(options.wal_preallocate_bytes, 0);
+        assert_eq!(options.wal_bytes_per_sync, 0);
     }
 }

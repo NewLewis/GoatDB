@@ -7,7 +7,9 @@ use crate::goatkv::metadata::current;
 use crate::goatkv::metadata::file_metadata::FileMetadata;
 use crate::goatkv::metadata::manifest::{ManifestReader, ManifestWriter, INIT_MANIFEST_FILE_NAME};
 use crate::goatkv::metadata::version::Version;
-use crate::goatkv::metadata::version_edit::{NewFile, VersionEdit};
+use crate::goatkv::metadata::version_edit::{
+    NewFile, VersionEdit, MANIFEST_FORMAT_VERSION_CURRENT, MANIFEST_FORMAT_VERSION_LEGACY,
+};
 use crate::goatkv::storage::sstable::TableCache;
 use crate::goatkv::utils::cleanup_task::CleanupTask;
 use crate::goatkv::utils::options::KvEngineOptions;
@@ -57,6 +59,8 @@ pub struct VersionSet {
     /// - MANIFEST 是元数据的唯一持久化来源，追加写更高效；
     /// - 通过 append + fsync 保证崩溃恢复的可重放性。
     manifest_writer: Option<ManifestWriter>,
+    /// 当前 MANIFEST 格式版本。
+    manifest_format_version: u32,
     /// 当前 MANIFEST 文件编号。
     manifest_file_number: u64,
     /// 当前 MANIFEST 自上次重写以来累计的 edit 数量。
@@ -192,6 +196,7 @@ impl VersionSet {
             current,
             versions: VecDeque::new(),
             manifest_writer: None,
+            manifest_format_version: MANIFEST_FORMAT_VERSION_LEGACY,
             manifest_file_number: 0,
             manifest_edit_count: 0,
             log_number: 0,
@@ -482,7 +487,16 @@ impl VersionSet {
         self.apply_edit_internal(edit, true)
     }
 
-    fn apply_edit_internal(&mut self, edit: VersionEdit, write_manifest: bool) -> GoatResult<()> {
+    fn apply_edit_internal(
+        &mut self,
+        mut edit: VersionEdit,
+        write_manifest: bool,
+    ) -> GoatResult<()> {
+        if write_manifest && edit.format_version.is_none() {
+            edit.set_format_version(MANIFEST_FORMAT_VERSION_CURRENT);
+        }
+        self.validate_manifest_format_version(&edit)?;
+
         // 1. 验证 VersionEdit 的合法性，避免非法删除或重复新增
         //
         // 设计理由：
@@ -519,6 +533,9 @@ impl VersionSet {
         }
         if let Some(last_seq) = edit.last_sequence {
             self.last_sequence = last_seq;
+        }
+        if let Some(format_version) = edit.format_version {
+            self.manifest_format_version = format_version;
         }
         self.apply_compact_pointers(&edit)?;
 
@@ -609,6 +626,22 @@ impl VersionSet {
             }
         }
 
+        Ok(())
+    }
+
+    fn validate_manifest_format_version(&self, edit: &VersionEdit) -> GoatResult<()> {
+        let format_version = edit
+            .format_version
+            .unwrap_or(MANIFEST_FORMAT_VERSION_LEGACY);
+        if format_version > MANIFEST_FORMAT_VERSION_CURRENT {
+            return Err(GoatError::corruption(
+                "manifest_format",
+                format!(
+                    "unsupported manifest format version {}, max supported {}",
+                    format_version, MANIFEST_FORMAT_VERSION_CURRENT
+                ),
+            ));
+        }
         Ok(())
     }
 
@@ -813,6 +846,7 @@ impl VersionSet {
 
     fn build_snapshot_edit(&self) -> VersionEdit {
         let mut edit = VersionEdit::new();
+        edit.set_format_version(MANIFEST_FORMAT_VERSION_CURRENT);
         edit.set_log_number(self.log_number);
         edit.set_next_file_number(self.next_file_number);
         edit.set_last_sequence(self.last_sequence);
@@ -858,6 +892,7 @@ impl VersionSet {
         edit: VersionEdit,
         files: &mut Vec<Vec<Arc<FileMetadata>>>,
     ) -> GoatResult<()> {
+        self.validate_manifest_format_version(&edit)?;
         self.validate_edit_for_files(&edit, files)?;
 
         if let Some(log_num) = edit.log_number {
@@ -869,6 +904,9 @@ impl VersionSet {
         }
         if let Some(last_seq) = edit.last_sequence {
             self.last_sequence = last_seq;
+        }
+        if let Some(format_version) = edit.format_version {
+            self.manifest_format_version = format_version;
         }
         self.apply_compact_pointers(&edit)?;
 
@@ -946,6 +984,10 @@ impl VersionSet {
         self.last_sequence
     }
 
+    pub fn manifest_format_version(&self) -> u32 {
+        self.manifest_format_version
+    }
+
     /// 获取某层 compaction pointer（user key）
     pub fn compact_pointer(&self, level: usize) -> Option<Vec<u8>> {
         self.compact_pointers.get(level).and_then(|k| k.clone())
@@ -976,15 +1018,18 @@ impl VersionSet {
 
 #[cfg(test)]
 mod tests {
-    use super::{VersionEdit, VersionSet, VersionSetOptions};
+    use super::{VersionEdit, VersionSet, VersionSetOptions, MANIFEST_FORMAT_VERSION_CURRENT};
     use crate::goatkv::core::kv_engine::KvEngine;
+    use crate::goatkv::metadata::manifest::ManifestWriter;
     use crate::goatkv::utils::cleanup_task::CleanupTask;
+    use crate::goatkv::utils::paths::{ManifestPaths, SstablePaths};
+    use crate::goatkv::ErrorKind;
+    use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::mpsc::unbounded_channel;
 
     fn open_version_set(base: &std::path::Path) -> VersionSet {
-        let (_wal_paths, sstable_paths, manifest_paths) =
-            KvEngine::init_db_paths(base).expect("init db paths");
+        let (sstable_paths, manifest_paths) = open_paths(base);
         let (obsolete_tx, _obsolete_rx) = unbounded_channel::<CleanupTask>();
         VersionSet::open(
             manifest_paths,
@@ -993,6 +1038,12 @@ mod tests {
             obsolete_tx,
         )
         .expect("open version set")
+    }
+
+    fn open_paths(base: &std::path::Path) -> (Arc<SstablePaths>, Arc<ManifestPaths>) {
+        let (_wal_paths, sstable_paths, manifest_paths) =
+            KvEngine::init_db_paths(base).expect("init db paths");
+        (sstable_paths, manifest_paths)
     }
 
     #[test]
@@ -1031,5 +1082,71 @@ mod tests {
 
         let reopened = open_version_set(temp_dir.path());
         assert_eq!(reopened.next_file_number(), 64);
+    }
+
+    #[test]
+    fn apply_edit_writes_current_manifest_format_version() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let mut version_set = open_version_set(temp_dir.path());
+        assert_eq!(version_set.manifest_format_version(), 0);
+
+        let mut edit = VersionEdit::new();
+        edit.set_next_file_number(12);
+        version_set
+            .apply_edit(edit)
+            .expect("apply edit should set format version");
+        assert_eq!(
+            version_set.manifest_format_version(),
+            MANIFEST_FORMAT_VERSION_CURRENT
+        );
+
+        drop(version_set);
+
+        let reopened = open_version_set(temp_dir.path());
+        assert_eq!(
+            reopened.manifest_format_version(),
+            MANIFEST_FORMAT_VERSION_CURRENT
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_unsupported_manifest_format_version() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let (sstable_paths, manifest_paths) = open_paths(temp_dir.path());
+        {
+            let (obsolete_tx, _obsolete_rx) = unbounded_channel::<CleanupTask>();
+            let _ = VersionSet::open(
+                manifest_paths.clone(),
+                sstable_paths.clone(),
+                VersionSetOptions::default(),
+                obsolete_tx,
+            )
+            .expect("bootstrap version set");
+        }
+
+        let manifest_path = manifest_paths.data_dir().join("MANIFEST-0");
+        let mut writer =
+            ManifestWriter::open_for_append(&manifest_path, 0).expect("open manifest for append");
+        let mut edit = VersionEdit::new();
+        edit.set_format_version(MANIFEST_FORMAT_VERSION_CURRENT + 1);
+        edit.set_next_file_number(99);
+        writer
+            .append_edit(&edit)
+            .expect("append unsupported format version edit");
+        writer.sync().expect("sync manifest");
+        drop(writer);
+
+        let (obsolete_tx, _obsolete_rx) = unbounded_channel::<CleanupTask>();
+        let reopen = VersionSet::open(
+            manifest_paths,
+            sstable_paths,
+            VersionSetOptions::default(),
+            obsolete_tx,
+        );
+        let err = reopen.expect_err("unsupported manifest format should fail recovery");
+        assert_eq!(err.kind(), ErrorKind::Corruption);
+        assert!(err
+            .to_string()
+            .contains("unsupported manifest format version"));
     }
 }

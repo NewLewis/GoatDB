@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use goat_db::goatkv::core::kv_engine::KvEngine;
 use goat_db::goatkv::error::ErrorKind;
+use goat_db::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
 use goat_db::goatkv::metadata::current;
 use goat_db::goatkv::metadata::manifest::{ManifestWriter, INIT_MANIFEST_FILE_NAME};
 use goat_db::goatkv::metadata::version_edit::VersionEdit;
@@ -51,8 +52,14 @@ fn recovery_handles_truncated_wal_tail() {
 
     // 写入一个完整记录
     {
-        let wal =
-            WalWriter::new(wal_path(0, &wal_paths), WalWriterConfig { wal_sync: false }).unwrap();
+        let wal = WalWriter::new(
+            wal_path(0, &wal_paths),
+            WalWriterConfig {
+                wal_sync: false,
+                ..WalWriterConfig::default()
+            },
+        )
+        .unwrap();
         let key = goat_db::goatkv::format::internal_key::InternalKey::new(
             b"ok".to_vec(),
             1,
@@ -81,10 +88,85 @@ fn recovery_handles_truncated_wal_tail() {
     assert_eq!(engine.get(b"ok").unwrap(), Some(b"v1".to_vec()));
 
     // 截断应已发生：文件现在能被重新打开且尾部无多余无效记录（无法精确比对长度）
-    WalWriter::new(wal_path(0, &wal_paths), WalWriterConfig { wal_sync: false })
-        .expect("truncated WAL should be openable");
+    WalWriter::new(
+        wal_path(0, &wal_paths),
+        WalWriterConfig {
+            wal_sync: false,
+            ..WalWriterConfig::default()
+        },
+    )
+    .expect("truncated WAL should be openable");
 
     drop(engine);
+}
+
+#[test]
+fn recovery_replays_wal_across_prealloc_and_bytes_per_sync_profiles() {
+    let rt = test_runtime();
+    let _guard = rt.enter();
+
+    let scenarios = [
+        ("default", 0_u64, 0_u64),
+        ("high_sync_freq", 4096_u64, 1_u64),
+        ("low_sync_freq", 4096_u64, 4 * 1024 * 1024_u64),
+    ];
+
+    for (name, preallocate_bytes, bytes_per_sync) in scenarios {
+        let tmp = temp_dir();
+        let (wal_paths, _sstable_paths, _manifest_paths) =
+            KvEngine::init_db_paths(tmp.path()).unwrap();
+        let wal_file = wal_path(1, &wal_paths);
+        let key = format!("key_{}", name).into_bytes();
+        let value = format!("value_{}", name).into_bytes();
+
+        {
+            let wal = WalWriter::new(
+                wal_file.clone(),
+                WalWriterConfig {
+                    wal_sync: false,
+                    wal_preallocate_bytes: preallocate_bytes,
+                    wal_bytes_per_sync: bytes_per_sync,
+                },
+            )
+            .unwrap_or_else(|e| panic!("create wal writer for scenario {}: {}", name, e));
+            let internal_key = InternalKey::new(key.clone(), 1, InternalKeyKind::Put);
+            wal.append(&internal_key, &value)
+                .unwrap_or_else(|e| panic!("append wal for scenario {}: {}", name, e));
+        }
+
+        // 模拟“预分配后异常退出”留下的零尾巴。
+        let stable_len = fs::metadata(&wal_file).unwrap().len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&wal_file)
+            .unwrap()
+            .set_len(stable_len + 512)
+            .unwrap();
+
+        let options = KvEngineOptions::default()
+            .with_data_dir(tmp.path())
+            .with_mem_table_size(64 * 1024)
+            .with_wal_sync(false)
+            .with_wal_preallocate_bytes(preallocate_bytes)
+            .with_wal_bytes_per_sync(bytes_per_sync)
+            .with_recover_from_wal(true);
+
+        let engine = KvEngine::new_with_options(options)
+            .unwrap_or_else(|e| panic!("open engine for scenario {}: {}", name, e));
+        assert_eq!(
+            engine.get(&key).unwrap(),
+            Some(value.clone()),
+            "scenario {} should recover appended key",
+            name
+        );
+        assert_eq!(
+            fs::metadata(&wal_file).unwrap().len(),
+            stable_len,
+            "scenario {} should truncate zero tail during replay",
+            name
+        );
+        drop(engine);
+    }
 }
 
 #[test]
@@ -97,8 +179,14 @@ fn recovery_replays_multiple_wals_in_order() {
 
     // WAL 0
     {
-        let wal =
-            WalWriter::new(wal_path(0, &wal_paths), WalWriterConfig { wal_sync: false }).unwrap();
+        let wal = WalWriter::new(
+            wal_path(0, &wal_paths),
+            WalWriterConfig {
+                wal_sync: false,
+                ..WalWriterConfig::default()
+            },
+        )
+        .unwrap();
         let key = goat_db::goatkv::format::internal_key::InternalKey::new(
             b"a".to_vec(),
             1,
@@ -109,8 +197,14 @@ fn recovery_replays_multiple_wals_in_order() {
 
     // WAL 1
     {
-        let wal =
-            WalWriter::new(wal_path(1, &wal_paths), WalWriterConfig { wal_sync: false }).unwrap();
+        let wal = WalWriter::new(
+            wal_path(1, &wal_paths),
+            WalWriterConfig {
+                wal_sync: false,
+                ..WalWriterConfig::default()
+            },
+        )
+        .unwrap();
         let key = goat_db::goatkv::format::internal_key::InternalKey::new(
             b"b".to_vec(),
             2,
@@ -343,8 +437,14 @@ fn recovery_replays_wal_if_flush_never_completed() {
 
     // WAL 1 写入一条记录
     {
-        let wal =
-            WalWriter::new(wal_path(1, &wal_paths), WalWriterConfig { wal_sync: false }).unwrap();
+        let wal = WalWriter::new(
+            wal_path(1, &wal_paths),
+            WalWriterConfig {
+                wal_sync: false,
+                ..WalWriterConfig::default()
+            },
+        )
+        .unwrap();
         let key = goat_db::goatkv::format::internal_key::InternalKey::new(
             b"k".to_vec(),
             1,

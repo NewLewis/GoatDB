@@ -16,6 +16,10 @@ const TAG_COMPACT_POINTER: u32 = 5;
 const TAG_DELETED_FILE: u32 = 6;
 const TAG_NEW_FILE: u32 = 7;
 const TAG_NEW_FILE_V2: u32 = 8;
+const TAG_FORMAT_VERSION: u32 = 9;
+
+pub const MANIFEST_FORMAT_VERSION_LEGACY: u32 = 0;
+pub const MANIFEST_FORMAT_VERSION_CURRENT: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct NewFile {
@@ -69,6 +73,7 @@ impl NewFile {
 /// 它可以被序列化后追加写到 MANIFEST 文件中
 #[derive(Debug, Default)]
 pub struct VersionEdit {
+    pub format_version: Option<u32>, // MANIFEST 记录格式版本
     // 1. 全局状态字段 (Option 表示该次 Edit 是否修改了这个值)
     pub comparator_name: Option<String>, // 用于检查打开 DB 时比较器是否匹配
     pub log_number: Option<u64>,         // 当前有效的 WAL 日志编号
@@ -97,6 +102,10 @@ impl VersionEdit {
     // 设置 Log Number
     pub fn set_log_number(&mut self, num: u64) {
         self.log_number = Some(num);
+    }
+
+    pub fn set_format_version(&mut self, version: u32) {
+        self.format_version = Some(version);
     }
 
     // 设置 Next File Number
@@ -134,6 +143,12 @@ impl VersionEdit {
     // 这里以 JSON 为例，实际高性能场景建议用 bincode
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
+
+        // 0. Format Version
+        if let Some(version) = self.format_version {
+            coding::put_varint64(&mut buf, TAG_FORMAT_VERSION as u64);
+            coding::put_varint64(&mut buf, version as u64);
+        }
 
         // 1. Comparator
         if let Some(ref name) = self.comparator_name {
@@ -202,6 +217,18 @@ impl VersionEdit {
             cursor += bytes_read;
 
             match tag as u32 {
+                TAG_FORMAT_VERSION => {
+                    let (version, bytes_read) =
+                        coding::decode_varint64_with_length(&data[cursor..])?;
+                    cursor += bytes_read;
+                    if version > u32::MAX as u64 {
+                        return Err(GoatError::corruption(
+                            "version_edit_decode",
+                            format!("manifest format version overflow: {}", version),
+                        ));
+                    }
+                    edit.format_version = Some(version as u32);
+                }
                 TAG_COMPARATOR => {
                     let (name_data, bytes_read) =
                         coding::get_length_prefixed_slice(&data[cursor..])?;
@@ -309,5 +336,39 @@ impl VersionEdit {
         }
 
         Ok(edit)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VersionEdit, MANIFEST_FORMAT_VERSION_CURRENT, MANIFEST_FORMAT_VERSION_LEGACY};
+
+    #[test]
+    fn encode_decode_preserves_manifest_format_version() {
+        let mut edit = VersionEdit::new();
+        edit.set_format_version(MANIFEST_FORMAT_VERSION_CURRENT);
+        edit.set_log_number(7);
+
+        let decoded = VersionEdit::decode(&edit.encode()).expect("decode version edit");
+        assert_eq!(
+            decoded.format_version,
+            Some(MANIFEST_FORMAT_VERSION_CURRENT),
+            "manifest format version should be preserved"
+        );
+        assert_eq!(decoded.log_number, Some(7));
+    }
+
+    #[test]
+    fn decode_legacy_edit_without_format_version_is_compatible() {
+        let mut edit = VersionEdit::new();
+        edit.set_log_number(11);
+        let decoded = VersionEdit::decode(&edit.encode()).expect("decode legacy version edit");
+        assert_eq!(
+            decoded
+                .format_version
+                .unwrap_or(MANIFEST_FORMAT_VERSION_LEGACY),
+            MANIFEST_FORMAT_VERSION_LEGACY
+        );
+        assert_eq!(decoded.log_number, Some(11));
     }
 }

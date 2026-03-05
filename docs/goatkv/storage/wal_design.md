@@ -4,8 +4,8 @@
 
 当前版本关键点：
 
-- `WalManager` 不再使用后台写线程。
-- WAL 由业务调用线程直接写入（在 `WalManager` 内部互斥串行）。
+- WAL 不再使用后台写线程。
+- WAL 由业务调用线程直接写入（在 `WalWriter` 内部互斥串行）。
 - 旧参数 `sync_interval_ms / sync_bytes / max_buffer_bytes` 已移除。
 
 ## 1. 设计目标
@@ -23,7 +23,6 @@ src/goatkv/storage/wal/
 ├── format.rs     # 记录格式、校验和、底层 read_record
 ├── writer.rs     # 低层文件写入器（write_bytes/flush/sync_data）
 ├── reader.rs     # 迭代读取 WAL 记录
-├── manager.rs    # WAL 管理器（调用线程内联写入）
 ├── recovery.rs   # WAL 回放与坏尾截断
 ├── handle.rs     # WAL 生命周期句柄（清理协同）
 └── error.rs
@@ -51,12 +50,9 @@ checksum(u32) | key_len(u32) | user_key(bytes) | encoded_seq_num(u64) | value_le
 
 说明：`sequence_number` 是 LSM 逻辑版本顺序，不是文件字节偏移。
 
-## 4. WalManager 并发模型
+## 4. 并发模型
 
-`WalManager` 使用：
-
-- `Mutex<WalState>`：串行化 WAL 文件操作。
-- `WalWriter`：底层 `write_bytes / flush / sync_data`。
+`WalWriter` 使用 `Mutex<WalWriterState>` 串行化 WAL 文件操作。
 
 没有后台线程、没有条件变量、没有内部缓冲队列。
 
@@ -74,12 +70,18 @@ checksum(u32) | key_len(u32) | user_key(bytes) | encoded_seq_num(u64) | value_le
 
 ### 5.2 `wal_sync=false`
 
-`wal_sync=false` 时仍会 `flush`，但不调用 `sync_data`。
+`wal_sync=false` 时仍会 `flush`，并可选按 `wal_bytes_per_sync` 周期执行 `sync_data`。
 
 即：
 
 - 保证数据从用户态缓冲写入内核页缓存。
-- 不保证落盘（进程崩溃恢复通常可见，系统掉电不保证）。
+- 不保证每次都落盘（进程崩溃恢复通常可见，系统掉电不保证）。
+
+### 5.3 预分配（`wal_preallocate_bytes`）
+
+- 当 `wal_preallocate_bytes > 0` 时，写入前会按步长执行 `set_len` 扩容。
+- 文件关闭/轮转时会回收到 `logical_size`，避免长期尾部空洞。
+- 若进程异常退出导致尾部空洞残留，恢复阶段会在回放时截断到最后有效记录。
 
 ## 6. 轮转与关闭
 
@@ -87,9 +89,10 @@ checksum(u32) | key_len(u32) | user_key(bytes) | encoded_seq_num(u64) | value_le
 
 `rotate(new_path)` 在同一把锁下执行：
 
-1. 先对当前 writer 做 `flush`。
-2. 若 `wal_sync=true`，执行 `sync_data`。
-3. 打开新 WAL 文件，替换 writer。
+1. 对当前 writer 做 `flush`。
+2. 如启用预分配，回收文件到 `logical_size`。
+3. 若 `wal_sync=true`，执行 `sync_data`。
+4. 打开新 WAL 文件，替换 writer。
 
 ### 6.2 关闭（Drop）
 
@@ -97,7 +100,8 @@ checksum(u32) | key_len(u32) | user_key(bytes) | encoded_seq_num(u64) | value_le
 
 1. 标记 `closed=true`。
 2. 尝试 `flush`。
-3. 若 `wal_sync=true`，再尝试 `sync_data`。
+3. 如启用预分配，回收文件到 `logical_size`。
+4. 若 `wal_sync=true`，再尝试 `sync_data`。
 
 ## 7. 恢复流程
 
@@ -113,11 +117,17 @@ checksum(u32) | key_len(u32) | user_key(bytes) | encoded_seq_num(u64) | value_le
 
 ## 8. 配置项
 
-`WalManagerConfig` 当前只保留：
+`WalWriterConfig` 当前配置项：
 
 - `wal_sync: bool`
+- `wal_preallocate_bytes: u64`
+- `wal_bytes_per_sync: u64`
 
-引擎侧映射来自 `KvEngineOptions::wal_sync`。
+引擎侧映射来自：
+
+- `KvEngineOptions::wal_sync`
+- `KvEngineOptions::wal_preallocate_bytes`
+- `KvEngineOptions::wal_bytes_per_sync`
 
 ## 9. 已移除项
 

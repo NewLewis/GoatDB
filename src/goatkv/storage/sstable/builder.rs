@@ -20,6 +20,11 @@ use crate::goatkv::utils::paths::SstablePaths;
 /// 对应的ASCII字符串为 "pjr_goat"（反向）
 const MAGIC_NUMBER: u64 = 0x706A725F676F6174;
 const BLOCK_CHECKSUM_SIZE: usize = 4;
+const FOOTER_SIZE: usize = 48;
+const FOOTER_PADDING_BYTES: usize = 40;
+const FOOTER_FORMAT_MARKER: [u8; 4] = *b"GKFV";
+const FOOTER_FORMAT_METADATA_SIZE: usize = 8;
+const SSTABLE_FORMAT_VERSION_CURRENT: u8 = 1;
 
 /// SSTableBuilder用于构建SSTable文件
 ///
@@ -448,7 +453,19 @@ impl SSTableBuilder {
         // 填充0字节，使Footer总大小为48字节
         // Padding = 48 - (bloom_offset_len + index_offset_len + magic_len)
         // magic_len固定为8字节
-        let padding = vec![0; 40 - (bloom_offset_len + index_offset_len)];
+        let padding_len = FOOTER_PADDING_BYTES
+            .checked_sub(bloom_offset_len + index_offset_len)
+            .ok_or_else(|| {
+                GoatError::corruption(
+                    "sstable_write_footer_padding",
+                    "footer varint offsets exceed fixed footer size",
+                )
+            })?;
+        let mut padding = vec![0; padding_len];
+        if padding.len() >= FOOTER_FORMAT_METADATA_SIZE {
+            padding[..4].copy_from_slice(&FOOTER_FORMAT_MARKER);
+            padding[4] = SSTABLE_FORMAT_VERSION_CURRENT;
+        }
         self.writer
             .as_mut()
             .ok_or_else(|| GoatError::internal("sstable_builder", "SSTable writer missing"))?
@@ -464,7 +481,7 @@ impl SSTableBuilder {
 
         // 更新 offset 以反映 Footer 的大小
         // Footer 总大小为 48 字节
-        self.offset += 48;
+        self.offset += FOOTER_SIZE as u64;
 
         // 刷新缓冲区，确保所有数据写入磁盘
         let mut writer = self

@@ -28,6 +28,10 @@ const MAGIC_NUMBER: u64 = 0x706A725F676F6174;
 /// 两个varint(最多20字节) + padding + magic(8字节)
 const FOOTER_SIZE: usize = 48;
 const BLOCK_CHECKSUM_SIZE: usize = 4;
+const FOOTER_FORMAT_MARKER: [u8; 4] = *b"GKFV";
+const FOOTER_FORMAT_METADATA_SIZE: usize = 8;
+const SSTABLE_FORMAT_VERSION_LEGACY: u8 = 0;
+const SSTABLE_FORMAT_VERSION_CURRENT: u8 = 1;
 
 /// SSTable 文件的索引条目
 #[derive(Debug, Clone)]
@@ -136,6 +140,8 @@ pub struct SSTableReader {
     block_cache: Option<Arc<BlockCache>>,
     /// 数据块解析索引缓存（按 data block 索引缓存 restart 索引，避免热点 get 重复解码）
     block_search_indexes: Vec<OnceLock<Arc<BlockSearchIndex>>>,
+    /// footer 中记录的 SSTable 格式版本（legacy 文件默认 0）
+    format_version: u8,
 }
 
 impl SSTableReader {
@@ -319,6 +325,13 @@ impl SSTableReader {
         }))
     }
 
+    fn parse_footer_format_version(padding: &[u8]) -> u8 {
+        if padding.len() >= FOOTER_FORMAT_METADATA_SIZE && padding[..4] == FOOTER_FORMAT_MARKER {
+            return padding[4];
+        }
+        SSTABLE_FORMAT_VERSION_LEGACY
+    }
+
     /// 打开并解析 SSTable 文件
     pub fn open<P: AsRef<Path>>(path: P) -> GoatResult<Self> {
         Self::open_internal(path, None, None)
@@ -411,7 +424,15 @@ impl SSTableReader {
         // 跳过 padding (应该是0字节)
         // padding 大小 = FOOTER_SIZE - 8(magic) - bloom_bytes_len - index_bytes_len
         // 验证 padding 都是0
-        for &byte in footer.iter().take(footer.len() - 8).skip(cursor) {
+        let footer_padding = &footer[cursor..footer.len() - 8];
+        let format_version = Self::parse_footer_format_version(footer_padding);
+        if format_version > SSTABLE_FORMAT_VERSION_CURRENT {
+            return Err(Self::corruption(format!(
+                "unsupported sstable format version {}, max supported {}",
+                format_version, SSTABLE_FORMAT_VERSION_CURRENT
+            )));
+        }
+        for &byte in footer_padding {
             if byte != 0 {
                 // 不返回错误，只是记录警告，因为可能有其他数据
             }
@@ -561,7 +582,12 @@ impl SSTableReader {
             index_entries,
             block_cache,
             block_search_indexes,
+            format_version,
         })
+    }
+
+    pub fn format_version(&self) -> u8 {
+        self.format_version
     }
 
     /// 检查 key 是否可能存在于 SSTable 中（使用 BloomFilter 快速过滤）
@@ -946,6 +972,7 @@ impl SSTableScanIterator {
 mod tests {
     use super::*;
     use crate::goatkv::core::kv_engine::KvEngine;
+    use crate::goatkv::format::coding;
     use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
     use crate::goatkv::storage::sstable::SSTableBuilder;
     use crate::goatkv::ErrorKind;
@@ -989,6 +1016,18 @@ mod tests {
 
         let sst_path = sstable_paths.sstable_path_by_id(1);
         (temp_dir, sst_path)
+    }
+
+    fn footer_padding_range(file_content: &[u8]) -> (usize, usize) {
+        let footer_start = file_content.len() - FOOTER_SIZE;
+        let footer = &file_content[footer_start..];
+        let (_, bloom_bytes_len) =
+            coding::decode_varint64_with_length(footer).expect("decode bloom offset");
+        let (_, index_bytes_len) = coding::decode_varint64_with_length(&footer[bloom_bytes_len..])
+            .expect("decode index offset");
+        let padding_start = footer_start + bloom_bytes_len + index_bytes_len;
+        let padding_end = file_content.len() - 8;
+        (padding_start, padding_end)
     }
 
     #[test]
@@ -1064,6 +1103,38 @@ mod tests {
             "Reader created successfully with {} index entries",
             reader.index_entry_count()
         );
+        assert_eq!(reader.format_version(), SSTABLE_FORMAT_VERSION_CURRENT);
+    }
+
+    #[test]
+    fn test_sstable_reader_compat_legacy_footer_without_format_marker() {
+        let (_temp_dir, sst_path) = create_test_sstable();
+        let mut file_content = fs::read(&sst_path).expect("read sstable");
+        let (padding_start, padding_end) = footer_padding_range(&file_content);
+        file_content[padding_start..padding_end].fill(0);
+        fs::write(&sst_path, &file_content).expect("rewrite footer as legacy");
+
+        let reader = SSTableReader::open(&sst_path).expect("open legacy-compatible sstable");
+        assert_eq!(reader.format_version(), SSTABLE_FORMAT_VERSION_LEGACY);
+        assert!(reader.get(b"apple").expect("read").is_some());
+    }
+
+    #[test]
+    fn test_sstable_reader_rejects_unsupported_format_version() {
+        let (_temp_dir, sst_path) = create_test_sstable();
+        let mut file_content = fs::read(&sst_path).expect("read sstable");
+        let (padding_start, padding_end) = footer_padding_range(&file_content);
+        let padding = &mut file_content[padding_start..padding_end];
+        assert!(padding.len() >= FOOTER_FORMAT_METADATA_SIZE);
+        padding[..4].copy_from_slice(&FOOTER_FORMAT_MARKER);
+        padding[4] = SSTABLE_FORMAT_VERSION_CURRENT + 1;
+        fs::write(&sst_path, &file_content).expect("write unsupported format footer");
+
+        let err = SSTableReader::open(&sst_path).expect_err("unsupported format should fail open");
+        assert_eq!(err.kind(), ErrorKind::Corruption);
+        assert!(err
+            .to_string()
+            .contains("unsupported sstable format version"));
     }
 
     #[test]
@@ -1134,7 +1205,7 @@ mod tests {
 
         let (internal_key, value) = reader.get_pinned_at_seq(b"k1", 123).unwrap().unwrap();
         assert_eq!(internal_key.sequence_number(), 123);
-        assert_eq!(value.as_slice(), vec![(123 % 251) as u8; 256].as_slice());
+        assert_eq!(value.as_slice(), vec![123u8; 256].as_slice());
     }
 
     #[test]

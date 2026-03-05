@@ -48,8 +48,8 @@ impl MemTableInner {
 
     pub fn get_pinned_at_seq(&self, key: &[u8], read_seq: u64) -> Option<(InternalKey, Bytes)> {
         let guard = self.skiplist.read().unwrap();
-        let mut iter = guard.seek_iter(key);
-        while let Some((internal_key, value)) = iter.next() {
+        let iter = guard.seek_iter(key);
+        for (internal_key, value) in iter {
             match internal_key.user_key().cmp(key) {
                 Ordering::Less => continue,
                 Ordering::Equal => {
