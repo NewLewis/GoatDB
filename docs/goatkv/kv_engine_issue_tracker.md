@@ -418,7 +418,7 @@
     - 2026-03-04：`benches/goatkv_bench.rs` 新增 `hotread` 工作负载与缓存容量参数，支持热点读对比（可通过 `--table-cache-capacity/--block-cache-capacity-mb` 调优或置 0 关闭）。
     - 2026-03-04：新增回归 `table_cache_reports_hits_and_evictions`、`block_cache_reports_hit_after_warmup`、`table_cache_can_be_disabled`。
 
-- [ ] `P1-OBSERVABILITY-HEALTH-GAP`
+- [x] `P1-OBSERVABILITY-HEALTH-GAP`
   - 现象：当前仅有日志输出，缺少标准化 metrics 与健康检查接口。
   - 影响：故障发现与容量规划依赖人工日志，缺少可观测闭环与自动告警基础。
   - 代码定位：
@@ -429,6 +429,10 @@
     - 增加健康检查（liveness/readiness）接口。
     - 增加核心指标：QPS、延迟分位数、flush/compaction backlog、错误率、队列水位。
     - 补充运维看板与告警建议阈值。
+  - 关闭记录：
+    - 2026-03-05：完成 `SM3-01`，新增 `--health-address` 与 `/livez`、`/readyz`，补充 `e2e_health` 探针状态分离回归。
+    - 2026-03-05：完成 `SM3-02`，新增 `/metrics` 与核心运行指标（QPS/错误率/延迟、backlog、queue、cache 命中/未命中/驱逐）。
+    - 2026-03-05：完成 `SM3-03`，新增 `ops_alert_runbook.md` 与 `metrics_reference.md`，给出告警阈值与处置顺序。
 
 - [x] `P1-COMPACTION-POLICY-HARDCODED`
   - 现象：compaction 触发阈值和层级大小目标仍以内嵌常量形式存在，运行时不可调。
@@ -998,15 +1002,20 @@
     - 2026-03-05：新增 `e2e_health::test_metrics_endpoint_exposes_core_metrics` 验证指标端点可用与关键指标存在。
     - 2026-03-05：补充 `metrics_reference.md`，定义指标命名、标签和单位；新增 `e2e_health::test_metrics_endpoint_tracks_success_and_error_requests` 验证请求/错误计数随流量增长。
 
-- [ ] `TASK-SM3-03` 告警阈值建议与运维手册（status: planned）
+- [x] `TASK-SM3-03` 告警阈值建议与运维手册（status: done, 2026-03-05）
   - 目标：给出可执行的排障基线，缩短故障定位时间。
   - 关键改动文件：
-    - `docs/goatkv/`
+    - `docs/goatkv/ops_alert_runbook.md`
+    - `docs/goatkv/metrics_reference.md`
+    - `docs/goatkv/kv_engine_issue_tracker.md`
   - 回归命令：
     - 文档评审（Checklist）
   - DoD：
     - 覆盖“写阻塞/compaction 积压/cache 退化”三类场景。
     - 每类场景给出触发阈值与处理顺序。
+  - 关闭记录：
+    - 2026-03-05：新增 runbook，落地三类故障的告警阈值、看板字段、处置顺序和值班 checklist。
+    - 2026-03-05：阈值与默认配置显式对齐（`max_immutable_memtables`、`l0_*_writes_trigger`、`soft/hard_pending_compaction_bytes_limit` 等）。
 
 #### Milestone 4（读路径剩余优化）
 
@@ -1138,16 +1147,15 @@
 
 ## 建议修复顺序
 
-1. `P1-OBSERVABILITY-HEALTH-GAP`
-2. `P1-ONDISK-FORMAT-VERSIONING-GAP`
-3. `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
-4. `P1-PREFIX-BLOOM-PARTITIONED-FILTER`
-5. `P1-READAHEAD-ITERATOR-OPT`
-6. `P1-MULTIGET-BATCH-READ-PATH`
-7. `P1-PARALLEL-COMPACTION-SUBCOMPACTION`
-8. `P1-PER-LEVEL-COMPRESSION`
-9. `P2-WAL-PREALLOC-BYTES-PER-SYNC`
-10. `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
+1. `P1-ONDISK-FORMAT-VERSIONING-GAP`
+2. `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
+3. `P1-PREFIX-BLOOM-PARTITIONED-FILTER`
+4. `P1-READAHEAD-ITERATOR-OPT`
+5. `P1-MULTIGET-BATCH-READ-PATH`
+6. `P1-PARALLEL-COMPACTION-SUBCOMPACTION`
+7. `P1-PER-LEVEL-COMPRESSION`
+8. `P2-WAL-PREALLOC-BYTES-PER-SYNC`
+9. `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
 
 ## 逐项关闭记录（执行时填写）
 
