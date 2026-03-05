@@ -17,7 +17,7 @@ use super::bloom::{
     bloom_lookup_key, BloomFilter, PARTITIONED_BLOOM_HEADER_SIZE,
     PARTITIONED_BLOOM_INDEX_ENTRY_SIZE, PARTITIONED_BLOOM_MAGIC, PARTITIONED_BLOOM_VERSION,
 };
-use super::cache::{BlockCache, BlockCacheKey};
+use super::cache::{BlockCache, BlockCacheKey, FilterPartitionCache, FilterPartitionCacheKey};
 use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::format::coding;
 use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind, SEQUENCE_NUMBER_MAX};
@@ -60,7 +60,9 @@ enum BloomFilterStorage {
 #[derive(Debug)]
 struct PartitionedBloomFilter {
     prefix_extractor_len: usize,
+    file_id: Option<u64>,
     partitions: Vec<BloomPartitionIndexEntry>,
+    partition_cache: Option<Arc<FilterPartitionCache>>,
     loaded_partitions: Mutex<HashMap<usize, Arc<BloomFilter>>>,
 }
 
@@ -256,6 +258,8 @@ impl SSTableReader {
         file: &File,
         bloom_offset: u64,
         bloom_size: u64,
+        file_id: Option<u64>,
+        partition_cache: Option<Arc<FilterPartitionCache>>,
     ) -> GoatResult<Option<PartitionedBloomFilter>> {
         if bloom_size < PARTITIONED_BLOOM_HEADER_SIZE as u64 {
             return Ok(None);
@@ -321,7 +325,9 @@ impl SSTableReader {
 
         Ok(Some(PartitionedBloomFilter {
             prefix_extractor_len,
+            file_id,
             partitions,
+            partition_cache,
             loaded_partitions: Mutex::new(HashMap::new()),
         }))
     }
@@ -335,21 +341,23 @@ impl SSTableReader {
 
     /// 打开并解析 SSTable 文件
     pub fn open<P: AsRef<Path>>(path: P) -> GoatResult<Self> {
-        Self::open_internal(path, None, None)
+        Self::open_internal(path, None, None, None)
     }
 
     pub(crate) fn open_with_block_cache<P: AsRef<Path>>(
         path: P,
         file_id: u64,
         block_cache: Option<Arc<BlockCache>>,
+        partition_cache: Option<Arc<FilterPartitionCache>>,
     ) -> GoatResult<Self> {
-        Self::open_internal(path, Some(file_id), block_cache)
+        Self::open_internal(path, Some(file_id), block_cache, partition_cache)
     }
 
     fn open_internal<P: AsRef<Path>>(
         path: P,
         file_id: Option<u64>,
         block_cache: Option<Arc<BlockCache>>,
+        partition_cache: Option<Arc<FilterPartitionCache>>,
     ) -> GoatResult<Self> {
         let path_ref = path.as_ref();
         let file = File::open(path_ref).map_err(|e| GoatError::io("sstable_open", e))?;
@@ -463,9 +471,13 @@ impl SSTableReader {
 
         // 5. 读取 BloomFilter（兼容 legacy bitmap 和 partitioned bloom）
         let bloom_filter_size = index_offset - bloom_offset;
-        let bloom_filter = if let Some(partitioned) =
-            Self::parse_partitioned_bloom_filter(&file, bloom_offset, bloom_filter_size)?
-        {
+        let bloom_filter = if let Some(partitioned) = Self::parse_partitioned_bloom_filter(
+            &file,
+            bloom_offset,
+            bloom_filter_size,
+            file_id,
+            partition_cache,
+        )? {
             BloomFilterStorage::Partitioned(partitioned)
         } else {
             BloomFilterStorage::Legacy(Self::read_legacy_bloom_filter(
@@ -891,6 +903,24 @@ impl PartitionedBloomFilter {
         let Some(partition) = self.partitions.get(block_index) else {
             return Ok(true);
         };
+        let lookup_key = bloom_lookup_key(key, self.prefix_extractor_len);
+
+        if let (Some(cache), Some(file_id)) = (self.partition_cache.as_ref(), self.file_id) {
+            let cache_key = FilterPartitionCacheKey::new(file_id, block_index);
+            if let Some(filter) = cache.get(&cache_key) {
+                return Ok(filter.contains(lookup_key));
+            }
+
+            let mut partition_bitmap = vec![0u8; partition.size as usize];
+            SSTableReader::read_exact_at(
+                file,
+                partition.offset,
+                &mut partition_bitmap,
+                "sstable_read_bloom_partition",
+            )?;
+            let filter = cache.insert(cache_key, BloomFilter::new(partition_bitmap));
+            return Ok(filter.contains(lookup_key));
+        }
 
         if let Some(filter) = self
             .loaded_partitions
@@ -899,7 +929,7 @@ impl PartitionedBloomFilter {
             .get(&block_index)
             .cloned()
         {
-            return Ok(filter.contains(bloom_lookup_key(key, self.prefix_extractor_len)));
+            return Ok(filter.contains(lookup_key));
         }
 
         let mut partition_bitmap = vec![0u8; partition.size as usize];
@@ -917,7 +947,7 @@ impl PartitionedBloomFilter {
                 .or_insert_with(|| loaded.clone())
                 .clone()
         };
-        Ok(filter.contains(bloom_lookup_key(key, self.prefix_extractor_len)))
+        Ok(filter.contains(lookup_key))
     }
 
     #[cfg(test)]

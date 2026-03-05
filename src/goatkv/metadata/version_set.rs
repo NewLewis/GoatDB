@@ -124,6 +124,9 @@ pub struct VersionSetOptions {
 
     /// Row cache 容量（字节，0 表示禁用 row cache）
     pub row_cache_capacity_bytes: usize,
+
+    /// Partitioned filter cache 容量（字节，0 表示禁用 filter cache）
+    pub filter_cache_capacity_bytes: usize,
 }
 
 impl Default for VersionSetOptions {
@@ -136,6 +139,7 @@ impl Default for VersionSetOptions {
             table_cache_capacity: 64,
             block_cache_capacity_bytes: 64 * 1024 * 1024,
             row_cache_capacity_bytes: 32 * 1024 * 1024,
+            filter_cache_capacity_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -150,6 +154,7 @@ impl From<&KvEngineOptions> for VersionSetOptions {
             table_cache_capacity: options.table_cache_capacity,
             block_cache_capacity_bytes: options.block_cache_capacity_bytes,
             row_cache_capacity_bytes: options.row_cache_capacity_bytes,
+            filter_cache_capacity_bytes: options.filter_cache_capacity_bytes,
         }
     }
 }
@@ -175,6 +180,7 @@ impl VersionSet {
         let table_cache = if options.table_cache_capacity == 0
             && options.block_cache_capacity_bytes == 0
             && options.row_cache_capacity_bytes == 0
+            && options.filter_cache_capacity_bytes == 0
         {
             None
         } else {
@@ -182,6 +188,7 @@ impl VersionSet {
                 options.table_cache_capacity,
                 options.block_cache_capacity_bytes,
                 options.row_cache_capacity_bytes,
+                options.filter_cache_capacity_bytes,
             )))
         };
 

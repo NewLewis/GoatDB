@@ -525,6 +525,8 @@
     - 2026-03-04：`SSTableBuilder` 已改为写入 partitioned bloom 段（按 data-block 分区），并通过 `KvEngineOptions::bloom_prefix_extractor_len` 支持 prefix bloom。
     - 2026-03-04：`SSTableReader` 已支持 partitioned bloom 解析与按分区懒加载，`may_contain/get` 复用 data-block 索引定位 filter 分区，避免 open 时一次性读取整段 bloom。
     - 2026-03-04：新增回归 `test_partitioned_bloom_respects_prefix_extractor`、`test_partitioned_bloom_loads_partitions_lazily`。
+    - 2026-03-05：`SM4-02` 第一阶段落地：新增有上限 `FilterPartitionCache`（HyperClock 风格淘汰）并接入 `TableCache` 共享缓存层；`PartitionedBloomFilter::may_contain` 优先命中共享 cache，回退路径仅用于无共享 cache 场景。
+    - 2026-03-05：新增 filter cache 指标 `filter_hits/misses/evictions`（bench 输出与 `/metrics`），并补充回归 `test_filter_cache_reports_hit_after_warmup`。
 
 - [x] `P1-POINT-GET-HOTPATH-DECODE-COPY-AMPLIFICATION`
   - 现象：点查命中路径会重复构建 `BlockReader`、重复解码 restart/entry，且 `decode_entry_at`/返回路径存在多次 `Vec` 拷贝。
@@ -1037,17 +1039,26 @@
     - 2026-03-05：完成 5 轮 GoatKV vs RocksDB 对照（`/tmp/goatkv_sm401_cmp_multi_*`，`threads=16,key_nums=20000`）：`randread(times=80)` GoatKV 均值 `481.8ms` vs RocksDB `575.0ms`（GoatKV 约快 `16.2%`）；`populate(batch_size=1000,value_size=1024,seq)` GoatKV 均值 `66.8ms` vs RocksDB `49.2ms`（GoatKV 约慢 `1.36x`）。
     - 2026-03-05：当前点查无回退，仍需补 scan 专项 benchmark 才能闭环 `SM4-01` DoD（scan 吞吐提升量化）。
 
-- [ ] `TASK-SM4-02` partitioned filter 缓存治理与指标（status: planned）
+- [ ] `TASK-SM4-02` partitioned filter 缓存治理与指标（status: in-progress, 2026-03-05）
   - 目标：将 partitioned filter 纳入统一容量与命中率管理。
   - 关键改动文件：
-    - `src/goatkv/storage/sstable/filter_block.rs`
-    - `src/goatkv/storage/block_cache/`
-    - `src/goatkv/metrics/`
+    - `src/goatkv/storage/sstable/cache.rs`
+    - `src/goatkv/storage/sstable/reader.rs`
+    - `src/goatkv/utils/options.rs`
+    - `src/goatkv/metadata/version_set.rs`
+    - `src/bin/goatkv_server.rs`
+    - `benches/goatkv_bench.rs`
+    - `docs/goatkv/metrics_reference.md`
   - 回归命令：
-    - `cargo test --lib --tests`
+    - `cargo test --lib goatkv::storage::sstable::cache::tests`
+    - `cargo test --lib goatkv::storage::sstable::reader::tests`
+    - `cargo test --bin goatkv_server`
+    - `cargo test --test e2e_health test_metrics_endpoint_exposes_core_metrics`
   - DoD：
     - filter 分区缓存命中率可观测。
     - 缓存上限受统一配额控制。
+  - 进展记录：
+    - 2026-03-05：已完成共享 filter cache 与指标导出，下一步补 filter miss-heavy/hotread 对照基准并确定默认容量阈值。
 
 - [ ] `TASK-SM4-03` MultiGet 批量 probe 复用与对照基准（status: planned）
   - 目标：减少重复 table/block 定位，提升批量读效率。

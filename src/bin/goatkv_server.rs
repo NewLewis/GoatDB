@@ -612,6 +612,29 @@ fn append_engine_metrics(text: &mut String, engine: &KvEngine) {
             "goatkv_cache_block_evictions_total {}\n",
             cache.block_evictions
         ));
+
+        text.push_str("# HELP goatkv_cache_filter_hits_total Partitioned filter cache hits\n");
+        text.push_str("# TYPE goatkv_cache_filter_hits_total counter\n");
+        text.push_str(&format!(
+            "goatkv_cache_filter_hits_total {}\n",
+            cache.filter_hits
+        ));
+
+        text.push_str("# HELP goatkv_cache_filter_misses_total Partitioned filter cache misses\n");
+        text.push_str("# TYPE goatkv_cache_filter_misses_total counter\n");
+        text.push_str(&format!(
+            "goatkv_cache_filter_misses_total {}\n",
+            cache.filter_misses
+        ));
+
+        text.push_str(
+            "# HELP goatkv_cache_filter_evictions_total Partitioned filter cache evictions\n",
+        );
+        text.push_str("# TYPE goatkv_cache_filter_evictions_total counter\n");
+        text.push_str(&format!(
+            "goatkv_cache_filter_evictions_total {}\n",
+            cache.filter_evictions
+        ));
     }
 }
 

@@ -117,6 +117,10 @@ pub struct KvEngineOptions {
     /// Default: 32MB
     pub row_cache_capacity_bytes: usize,
 
+    /// Maximum bytes for partitioned bloom filter cache.
+    /// Default: 16MB
+    pub filter_cache_capacity_bytes: usize,
+
     // ===== VersionSet Options =====
     /// 保留的历史版本数量
     /// Default: 10
@@ -203,6 +207,7 @@ impl Default for KvEngineOptions {
             table_cache_capacity: 64,
             block_cache_capacity_bytes: 64 * 1024 * 1024,
             row_cache_capacity_bytes: 32 * 1024 * 1024,
+            filter_cache_capacity_bytes: 16 * 1024 * 1024,
             // VersionSet defaults
             max_versions: 10,
             manifest_max_size: 32 * 1024 * 1024, // 32MB
@@ -354,6 +359,12 @@ impl KvEngineOptions {
         self
     }
 
+    /// Sets partitioned filter cache capacity in bytes.
+    pub fn with_filter_cache_capacity_bytes(mut self, capacity_bytes: usize) -> Self {
+        self.filter_cache_capacity_bytes = capacity_bytes;
+        self
+    }
+
     /// Sets the maximum number of versions to keep in history
     pub fn with_max_versions(mut self, max: usize) -> Self {
         self.max_versions = max;
@@ -481,6 +492,7 @@ impl KvEngineOptions {
             table_cache_capacity: 64,
             block_cache_capacity_bytes: 64 * 1024 * 1024,
             row_cache_capacity_bytes: 32 * 1024 * 1024,
+            filter_cache_capacity_bytes: 16 * 1024 * 1024,
             // VersionSet defaults (use same defaults as production)
             max_versions: 10,
             manifest_max_size: 32 * 1024 * 1024, // 32MB
@@ -589,6 +601,12 @@ mod tests {
     fn test_with_row_cache_capacity_bytes() {
         let options = KvEngineOptions::default().with_row_cache_capacity_bytes(4 * 1024 * 1024);
         assert_eq!(options.row_cache_capacity_bytes, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_with_filter_cache_capacity_bytes() {
+        let options = KvEngineOptions::default().with_filter_cache_capacity_bytes(2 * 1024 * 1024);
+        assert_eq!(options.filter_cache_capacity_bytes, 2 * 1024 * 1024);
     }
 
     #[test]

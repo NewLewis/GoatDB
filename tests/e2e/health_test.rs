@@ -139,6 +139,7 @@ async fn test_metrics_endpoint_exposes_core_metrics() {
     assert!(body.contains("goatkv_engine_immutable_memtable_backlog"));
     assert!(body.contains("goatkv_engine_pending_compaction_bytes"));
     assert!(body.contains("goatkv_cache_table_hits_total"));
+    assert!(body.contains("goatkv_cache_filter_hits_total"));
 }
 
 #[tokio::test]

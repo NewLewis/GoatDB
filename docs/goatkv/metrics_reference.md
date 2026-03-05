@@ -68,6 +68,9 @@ This document defines the exported `/metrics` names, label keys, units, and sema
 | `goatkv_cache_block_hits_total` | counter | none | hits | Block cache hit count. |
 | `goatkv_cache_block_misses_total` | counter | none | misses | Block cache miss count. |
 | `goatkv_cache_block_evictions_total` | counter | none | evictions | Block cache eviction count. |
+| `goatkv_cache_filter_hits_total` | counter | none | hits | Partitioned filter cache hit count. |
+| `goatkv_cache_filter_misses_total` | counter | none | misses | Partitioned filter cache miss count. |
+| `goatkv_cache_filter_evictions_total` | counter | none | evictions | Partitioned filter cache eviction count. |
 
 ## Process Metric
 
