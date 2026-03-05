@@ -38,6 +38,19 @@ fn http_get_status(health_base_url: &str, path: &str) -> std::io::Result<u16> {
     http_get(health_base_url, path).map(|(status, _)| status)
 }
 
+fn metric_value(metrics_text: &str, metric_key: &str) -> f64 {
+    metrics_text
+        .lines()
+        .find_map(|line| {
+            if !line.starts_with(metric_key) {
+                return None;
+            }
+            let value = line.split_whitespace().nth(1)?;
+            value.parse::<f64>().ok()
+        })
+        .unwrap_or_else(|| panic!("metric `{}` not found in output", metric_key))
+}
+
 #[tokio::test]
 async fn test_health_liveness_and_readiness_transition_on_shutdown() {
     if should_skip_network_e2e() {
@@ -126,4 +139,81 @@ async fn test_metrics_endpoint_exposes_core_metrics() {
     assert!(body.contains("goatkv_engine_immutable_memtable_backlog"));
     assert!(body.contains("goatkv_engine_pending_compaction_bytes"));
     assert!(body.contains("goatkv_cache_table_hits_total"));
+}
+
+#[tokio::test]
+async fn test_metrics_endpoint_tracks_success_and_error_requests() {
+    if should_skip_network_e2e() {
+        return;
+    }
+
+    let health_port = find_free_port();
+    let server = TestServer::start_with_options(TestServerOptions {
+        port: None,
+        health_port: Some(health_port),
+        data_dir: None,
+        show_logs: false,
+        capture_stderr: true,
+    })
+    .await;
+    let health_url = server
+        .health_address()
+        .expect("health endpoint should be configured");
+
+    let (_, before) = http_get(health_url, "/metrics").expect("fetch baseline metrics");
+    let requests_before = metric_value(&before, "goatkv_rpc_requests_total");
+    let errors_before = metric_value(&before, "goatkv_rpc_requests_error_total");
+    let write_before = metric_value(
+        &before,
+        "goatkv_rpc_method_requests_total{method=\"write\"}",
+    );
+    let get_errors_before = metric_value(&before, "goatkv_rpc_method_errors_total{method=\"get\"}");
+
+    let mut client = server.client().await;
+    client
+        .write(common::test_server::goatkv::WriteRequest {
+            key: b"metrics_counter_key".to_vec(),
+            value: b"metrics_counter_val".to_vec(),
+        })
+        .await
+        .expect("write should succeed");
+    let get_err = client
+        .get(common::test_server::goatkv::GetRequest {
+            key: Vec::new(),
+            snapshot_id: 0,
+        })
+        .await
+        .expect_err("empty key get should fail");
+    assert_eq!(get_err.code(), tonic::Code::InvalidArgument);
+
+    let (_, after) = http_get(health_url, "/metrics").expect("fetch post metrics");
+    let requests_after = metric_value(&after, "goatkv_rpc_requests_total");
+    let errors_after = metric_value(&after, "goatkv_rpc_requests_error_total");
+    let write_after = metric_value(&after, "goatkv_rpc_method_requests_total{method=\"write\"}");
+    let get_errors_after = metric_value(&after, "goatkv_rpc_method_errors_total{method=\"get\"}");
+
+    assert!(
+        requests_after >= requests_before + 2.0,
+        "total requests should increase by at least 2, before={}, after={}",
+        requests_before,
+        requests_after
+    );
+    assert!(
+        errors_after >= errors_before + 1.0,
+        "error requests should increase, before={}, after={}",
+        errors_before,
+        errors_after
+    );
+    assert!(
+        write_after >= write_before + 1.0,
+        "write method counter should increase, before={}, after={}",
+        write_before,
+        write_after
+    );
+    assert!(
+        get_errors_after >= get_errors_before + 1.0,
+        "get method error counter should increase, before={}, after={}",
+        get_errors_before,
+        get_errors_after
+    );
 }

@@ -982,6 +982,7 @@
     - `src/bin/goatkv_server.rs`
     - `src/goatkv/server/health.rs`
     - `tests/e2e/health_test.rs`
+    - `docs/goatkv/metrics_reference.md`
   - 回归命令：
     - `cargo test --bin goatkv_server`
     - `cargo test --lib goatkv::metrics::tests`
@@ -995,6 +996,7 @@
     - 2026-03-05：`goatkv_server` 读写路径接入观测埋点，按 RPC method 输出请求与错误计数。
     - 2026-03-05：`/metrics` 接入健康探针 HTTP 服务，导出引擎 backlog 与队列水位（immutable backlog、pending compaction bytes、wal/mem queue、write pressure）及 cache hit/miss/evictions。
     - 2026-03-05：新增 `e2e_health::test_metrics_endpoint_exposes_core_metrics` 验证指标端点可用与关键指标存在。
+    - 2026-03-05：补充 `metrics_reference.md`，定义指标命名、标签和单位；新增 `e2e_health::test_metrics_endpoint_tracks_success_and_error_requests` 验证请求/错误计数随流量增长。
 
 - [ ] `TASK-SM3-03` 告警阈值建议与运维手册（status: planned）
   - 目标：给出可执行的排障基线，缩短故障定位时间。
