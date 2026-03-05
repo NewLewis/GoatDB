@@ -135,12 +135,28 @@ impl Version {
     }
 
     pub(crate) fn get_pinned(&self, key: &[u8]) -> GoatResult<Option<(InternalKey, PinnedValue)>> {
-        if let Some(cached) = self.get_cached_row(key) {
+        let read_seq = self.creation_seqno;
+        if let Some(cached) = self.get_cached_row(key, read_seq) {
             return Ok(cached);
         }
 
         let result = self.load_from_sstables_pinned(key)?;
-        self.cache_row_result(key, &result);
+        self.cache_row_result(key, read_seq, &result);
+        Ok(result)
+    }
+
+    pub(crate) fn get_pinned_at_seq(
+        &self,
+        key: &[u8],
+        read_seq: u64,
+    ) -> GoatResult<Option<(InternalKey, PinnedValue)>> {
+        let effective_read_seq = read_seq.min(self.creation_seqno);
+        if let Some(cached) = self.get_cached_row(key, effective_read_seq) {
+            return Ok(cached);
+        }
+
+        let result = self.load_from_sstables_pinned_at_seq(key, effective_read_seq)?;
+        self.cache_row_result(key, effective_read_seq, &result);
         Ok(result)
     }
 
@@ -185,9 +201,71 @@ impl Version {
         Ok(None)
     }
 
-    fn get_cached_row(&self, key: &[u8]) -> Option<Option<(InternalKey, PinnedValue)>> {
+    fn load_from_sstables_pinned_at_seq(
+        &self,
+        key: &[u8],
+        read_seq: u64,
+    ) -> GoatResult<Option<(InternalKey, PinnedValue)>> {
+        for file in self.files[0].iter().rev() {
+            if read_seq < file.props.smallest_seqno {
+                continue;
+            }
+            if key >= file.smallest_user_key() && key <= file.largest_user_key() {
+                let sstable_path = file.sstable_path();
+                let reader = self
+                    .open_sstable_reader(file.file_id, sstable_path)
+                    .map_err(|e| Self::map_sstable_open_err(sstable_path, e))?;
+                let result = if read_seq >= file.props.largest_seqno {
+                    reader
+                        .get_pinned(key)
+                        .map_err(|e| Self::map_sstable_read_err(sstable_path, e))?
+                } else {
+                    reader
+                        .get_pinned_at_seq(key, read_seq)
+                        .map_err(|e| Self::map_sstable_read_err(sstable_path, e))?
+                };
+                match result {
+                    Some(result) => return Ok(Some(result)),
+                    None => continue,
+                }
+            }
+        }
+
+        for level in 1..self.files.len() {
+            if let Some(file) = self.search_level(level, key) {
+                if read_seq < file.props.smallest_seqno {
+                    continue;
+                }
+                let sstable_path = file.sstable_path();
+                let reader = self
+                    .open_sstable_reader(file.file_id, sstable_path)
+                    .map_err(|e| Self::map_sstable_open_err(sstable_path, e))?;
+                let result = if read_seq >= file.props.largest_seqno {
+                    reader
+                        .get_pinned(key)
+                        .map_err(|e| Self::map_sstable_read_err(sstable_path, e))?
+                } else {
+                    reader
+                        .get_pinned_at_seq(key, read_seq)
+                        .map_err(|e| Self::map_sstable_read_err(sstable_path, e))?
+                };
+                match result {
+                    Some(result) => return Ok(Some(result)),
+                    None => continue,
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn get_cached_row(
+        &self,
+        key: &[u8],
+        read_seq: u64,
+    ) -> Option<Option<(InternalKey, PinnedValue)>> {
         let cache = self.table_cache.as_ref()?;
-        let cached = cache.row_cache_get(self.creation_seqno, key)?;
+        let cached = cache.row_cache_get(self.creation_seqno, read_seq, key)?;
         match cached {
             RowCacheValue::Hit {
                 internal_key,
@@ -197,7 +275,12 @@ impl Version {
         }
     }
 
-    fn cache_row_result(&self, key: &[u8], result: &Option<(InternalKey, PinnedValue)>) {
+    fn cache_row_result(
+        &self,
+        key: &[u8],
+        read_seq: u64,
+        result: &Option<(InternalKey, PinnedValue)>,
+    ) {
         let Some(cache) = self.table_cache.as_ref() else {
             return;
         };
@@ -208,7 +291,7 @@ impl Version {
             },
             None => RowCacheValue::Miss,
         };
-        cache.row_cache_insert(self.creation_seqno, key, cached);
+        cache.row_cache_insert(self.creation_seqno, read_seq, key, cached);
     }
 
     /// 在指定层级（非 Level 0）中查找包含 key 的文件

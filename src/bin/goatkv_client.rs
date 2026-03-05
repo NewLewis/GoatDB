@@ -91,6 +91,9 @@ enum Commands {
     Get {
         /// 键
         key: String,
+        /// 快照 ID（0 表示最新读）
+        #[arg(long, default_value_t = 0)]
+        snapshot_id: u64,
     },
     /// 更新键的值
     Update {
@@ -106,13 +109,22 @@ enum Commands {
     },
     /// 手动触发 flush
     Flush,
+    /// 创建快照
+    SnapshotCreate,
+    /// 释放快照
+    SnapshotRelease {
+        /// 快照 ID
+        snapshot_id: u64,
+    },
 }
 
 /// 交互式 REPL 客户端
 async fn run_interactive(mut client: GoatKvServiceClient<Channel>) -> GoatResult<()> {
     println!("GoatDB Interactive Client");
     println!("Connected to server successfully!");
-    println!("Commands: put <key> <value>, get <key>, update <key> <value>, delete <key>, exit");
+    println!(
+        "Commands: put <key> <value>, get <key> [snapshot_id], update <key> <value>, delete <key>, flush, snapshot-create, snapshot-release <id>, exit"
+    );
     println!("Use Tab for auto-completion, ↑↓ for history, Ctrl+C to exit");
 
     let mut rl = DefaultEditor::new().map_err(|e| {
@@ -167,6 +179,12 @@ async fn run_interactive(mut client: GoatKvServiceClient<Channel>) -> GoatResult
                             "update" => handle_update(&mut client, &args_refs[1..]).await,
                             "delete" => handle_delete(&mut client, &args_refs[1..]).await,
                             "flush" => handle_flush(&mut client).await,
+                            "snapshot-create" | "snapshot_create" => {
+                                handle_create_snapshot(&mut client).await
+                            }
+                            "snapshot-release" | "snapshot_release" => {
+                                handle_release_snapshot(&mut client, &args_refs[1..]).await
+                            }
                             _ => {
                                 println!(
                                     "Unknown command: {}. Type 'help' for available commands.",
@@ -208,16 +226,21 @@ async fn run_interactive(mut client: GoatKvServiceClient<Channel>) -> GoatResult
 fn print_help() {
     println!("Available commands:");
     println!("  put <key> <value>   - Insert or update a key-value pair");
-    println!("  get <key>           - Get the value of a key");
+    println!("  get <key> [snapshot_id] - Get the value of a key");
     println!("  update <key> <value> - Update an existing key's value");
     println!("  delete <key>        - Delete a key-value pair");
     println!("  flush               - Manually trigger flush");
+    println!("  snapshot-create     - Create a read snapshot");
+    println!("  snapshot-release <id> - Release a snapshot");
     println!("  exit, quit, :q      - Exit the client");
     println!("  help, :help         - Show this help message");
     println!("\nExamples:");
     println!("  put my_key \"my value\"");
     println!("  put \"key with spaces\" \"value with spaces\"");
     println!("  get my_key");
+    println!("  get my_key 42");
+    println!("  snapshot-create");
+    println!("  snapshot-release 42");
     println!("  delete \"key with spaces\"");
     println!("  flush");
 }
@@ -253,12 +276,32 @@ async fn handle_put(client: &mut GoatKvServiceClient<Channel>, args: &[&str]) ->
 /// 处理 get 命令
 async fn handle_get(client: &mut GoatKvServiceClient<Channel>, args: &[&str]) -> GoatResult<()> {
     if args.is_empty() {
-        return Err(GoatError::invalid_argument("get", "Usage: get <key>"));
+        return Err(GoatError::invalid_argument(
+            "get",
+            "Usage: get <key> [snapshot_id]",
+        ));
     }
+    if args.len() > 2 {
+        return Err(GoatError::invalid_argument(
+            "get",
+            "Usage: get <key> [snapshot_id]",
+        ));
+    }
+
+    let snapshot_id = if args.len() == 2 {
+        args[1].parse::<u64>().map_err(|e| {
+            GoatError::invalid_argument(
+                "snapshot_id",
+                format!("snapshot_id must be an unsigned integer: {}", e),
+            )
+        })?
+    } else {
+        0
+    };
 
     let key = args[0].as_bytes().to_vec();
 
-    let request = tonic::Request::new(goatkv::GetRequest { key });
+    let request = tonic::Request::new(goatkv::GetRequest { key, snapshot_id });
     let response = client
         .get(request)
         .await
@@ -345,6 +388,59 @@ async fn handle_flush(client: &mut GoatKvServiceClient<Channel>) -> GoatResult<(
     Ok(())
 }
 
+async fn handle_create_snapshot(client: &mut GoatKvServiceClient<Channel>) -> GoatResult<()> {
+    let request = tonic::Request::new(goatkv::CreateSnapshotRequest {});
+    let response = client
+        .create_snapshot(request)
+        .await
+        .map_err(|e| GoatError::unavailable("grpc_create_snapshot", e.to_string()))?;
+    let resp_data = response.into_inner();
+
+    if resp_data.success {
+        println!(
+            "✓ Success: {} (snapshot_id={})",
+            resp_data.message, resp_data.snapshot_id
+        );
+    } else {
+        println!("✗ Failed: {}", resp_data.message);
+    }
+
+    Ok(())
+}
+
+async fn handle_release_snapshot(
+    client: &mut GoatKvServiceClient<Channel>,
+    args: &[&str],
+) -> GoatResult<()> {
+    if args.len() != 1 {
+        return Err(GoatError::invalid_argument(
+            "snapshot-release",
+            "Usage: snapshot-release <snapshot_id>",
+        ));
+    }
+    let snapshot_id = args[0].parse::<u64>().map_err(|e| {
+        GoatError::invalid_argument(
+            "snapshot_id",
+            format!("snapshot_id must be an unsigned integer: {}", e),
+        )
+    })?;
+
+    let request = tonic::Request::new(goatkv::ReleaseSnapshotRequest { snapshot_id });
+    let response = client
+        .release_snapshot(request)
+        .await
+        .map_err(|e| GoatError::unavailable("grpc_release_snapshot", e.to_string()))?;
+    let resp_data = response.into_inner();
+
+    if resp_data.success {
+        println!("✓ Success: {}", resp_data.message);
+    } else {
+        println!("✗ Failed: {}", resp_data.message);
+    }
+
+    Ok(())
+}
+
 /// 执行单次命令
 async fn execute_command(
     mut client: GoatKvServiceClient<Channel>,
@@ -355,8 +451,14 @@ async fn execute_command(
             let args = vec![key.as_str(), value.as_str()];
             handle_put(&mut client, &args).await
         }
-        Commands::Get { key } => {
-            let args = vec![key.as_str()];
+        Commands::Get { key, snapshot_id } => {
+            let snapshot_id_string;
+            let args: Vec<&str> = if snapshot_id == 0 {
+                vec![key.as_str()]
+            } else {
+                snapshot_id_string = snapshot_id.to_string();
+                vec![key.as_str(), snapshot_id_string.as_str()]
+            };
             handle_get(&mut client, &args).await
         }
         Commands::Update { key, value } => {
@@ -368,6 +470,12 @@ async fn execute_command(
             handle_delete(&mut client, &args).await
         }
         Commands::Flush => handle_flush(&mut client).await,
+        Commands::SnapshotCreate => handle_create_snapshot(&mut client).await,
+        Commands::SnapshotRelease { snapshot_id } => {
+            let snapshot_id_string = snapshot_id.to_string();
+            let args = vec![snapshot_id_string.as_str()];
+            handle_release_snapshot(&mut client, &args).await
+        }
     }
 }
 

@@ -60,6 +60,10 @@ impl SequenceNumber {
     pub fn set(&self, value: u64) {
         self.counter.store(value, Ordering::SeqCst);
     }
+
+    pub fn current(&self) -> u64 {
+        self.counter.load(Ordering::SeqCst)
+    }
 }
 
 #[cfg(test)]

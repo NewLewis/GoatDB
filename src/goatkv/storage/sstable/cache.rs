@@ -256,18 +256,21 @@ impl TableCache {
     pub(crate) fn row_cache_get(
         &self,
         version_seqno: u64,
+        read_seq: u64,
         user_key: &[u8],
     ) -> Option<RowCacheValue> {
-        self.row_cache.get(version_seqno, user_key)
+        self.row_cache.get(version_seqno, read_seq, user_key)
     }
 
     pub(crate) fn row_cache_insert(
         &self,
         version_seqno: u64,
+        read_seq: u64,
         user_key: &[u8],
         value: RowCacheValue,
     ) {
-        self.row_cache.insert(version_seqno, user_key, value);
+        self.row_cache
+            .insert(version_seqno, read_seq, user_key, value);
     }
 }
 
@@ -425,13 +428,15 @@ impl RowCacheState {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RowCacheKey {
     version_seqno: u64,
+    read_seq: u64,
     user_key: Vec<u8>,
 }
 
 impl RowCacheKey {
-    fn new(version_seqno: u64, user_key: &[u8]) -> Self {
+    fn new(version_seqno: u64, read_seq: u64, user_key: &[u8]) -> Self {
         Self {
             version_seqno,
+            read_seq,
             user_key: user_key.to_vec(),
         }
     }
@@ -439,6 +444,7 @@ impl RowCacheKey {
     fn shard_hash(&self) -> u64 {
         // 64-bit FNV-1a mix.
         let mut hash = 0xcbf2_9ce4_8422_2325u64 ^ self.version_seqno.rotate_left(17);
+        hash ^= self.read_seq.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         for b in self.user_key.iter().copied() {
             hash ^= b as u64;
             hash = hash.wrapping_mul(0x1000_0000_01b3);
@@ -481,13 +487,13 @@ impl RowCache {
         shard_index_from_u64(key.shard_hash(), self.shards.len())
     }
 
-    fn get(&self, version_seqno: u64, user_key: &[u8]) -> Option<RowCacheValue> {
+    fn get(&self, version_seqno: u64, read_seq: u64, user_key: &[u8]) -> Option<RowCacheValue> {
         if self.capacity_bytes == 0 {
             self.row_misses.fetch_add(1, Ordering::Relaxed);
             return None;
         }
 
-        let cache_key = RowCacheKey::new(version_seqno, user_key);
+        let cache_key = RowCacheKey::new(version_seqno, read_seq, user_key);
         let shard_idx = self.shard_index(&cache_key);
         if self.shard_capacities[shard_idx] == 0 {
             self.row_misses.fetch_add(1, Ordering::Relaxed);
@@ -504,12 +510,12 @@ impl RowCache {
         }
     }
 
-    fn insert(&self, version_seqno: u64, user_key: &[u8], value: RowCacheValue) {
+    fn insert(&self, version_seqno: u64, read_seq: u64, user_key: &[u8], value: RowCacheValue) {
         if self.capacity_bytes == 0 {
             return;
         }
 
-        let key = RowCacheKey::new(version_seqno, user_key);
+        let key = RowCacheKey::new(version_seqno, read_seq, user_key);
         let bytes = key
             .user_key
             .len()
@@ -841,8 +847,9 @@ mod tests {
     use crate::goatkv::core::kv_engine::KvEngine;
     use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
     use crate::goatkv::storage::sstable::SSTableBuilder;
+    use bytes::Bytes;
 
-    use super::TableCache;
+    use super::{RowCacheValue, TableCache};
 
     fn build_sstable(file_id: u64) -> (tempfile::TempDir, PathBuf) {
         let temp_dir = tempfile::TempDir::new().unwrap();
@@ -899,5 +906,57 @@ mod tests {
         let metrics = cache.metrics();
         assert_eq!(metrics.table_hits, 0);
         assert_eq!(metrics.table_misses, 2);
+    }
+
+    #[test]
+    fn row_cache_distinguishes_visibility_sequence() {
+        let cache = TableCache::new(1, 0, 1024 * 1024);
+        let user_key = b"k1";
+        let version_seqno = 100u64;
+
+        cache.row_cache_insert(
+            version_seqno,
+            10,
+            user_key,
+            RowCacheValue::Hit {
+                internal_key: InternalKey::new(user_key.to_vec(), 10, InternalKeyKind::Put),
+                value: Bytes::from_static(b"v10"),
+            },
+        );
+        cache.row_cache_insert(
+            version_seqno,
+            20,
+            user_key,
+            RowCacheValue::Hit {
+                internal_key: InternalKey::new(user_key.to_vec(), 20, InternalKeyKind::Put),
+                value: Bytes::from_static(b"v20"),
+            },
+        );
+
+        let old = cache.row_cache_get(version_seqno, 10, user_key);
+        let new = cache.row_cache_get(version_seqno, 20, user_key);
+        let middle = cache.row_cache_get(version_seqno, 15, user_key);
+
+        match old {
+            Some(RowCacheValue::Hit {
+                internal_key,
+                value,
+            }) => {
+                assert_eq!(internal_key.sequence_number(), 10);
+                assert_eq!(value.as_ref(), b"v10");
+            }
+            other => panic!("unexpected old visibility cache value: {:?}", other),
+        }
+        match new {
+            Some(RowCacheValue::Hit {
+                internal_key,
+                value,
+            }) => {
+                assert_eq!(internal_key.sequence_number(), 20);
+                assert_eq!(value.as_ref(), b"v20");
+            }
+            other => panic!("unexpected new visibility cache value: {:?}", other),
+        }
+        assert!(middle.is_none());
     }
 }

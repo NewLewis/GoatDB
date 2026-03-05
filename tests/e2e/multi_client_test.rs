@@ -56,6 +56,7 @@ async fn test_concurrent_writes_from_multiple_clients() {
             let response = client
                 .get(GetRequest {
                     key: key.into_bytes(),
+                    snapshot_id: 0,
                 })
                 .await
                 .unwrap();
@@ -114,6 +115,7 @@ async fn test_concurrent_read_write() {
                     let _ = client
                         .get(GetRequest {
                             key: format!("key_{}", key_id).into_bytes(),
+                            snapshot_id: 0,
                         })
                         .await;
                     tokio::time::sleep(Duration::from_millis(5)).await;

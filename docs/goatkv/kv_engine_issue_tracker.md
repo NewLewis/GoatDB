@@ -1,6 +1,6 @@
 # GoatKV 引擎问题跟踪清单
 
-更新时间：2026-03-04
+更新时间：2026-03-05
 
 目标：把当前已识别的风险和缺口落成可执行 backlog，按优先级逐条解决并验证。
 
@@ -25,6 +25,19 @@
 - 2026-03-04：启动 `P1-PREFIX-BLOOM-PARTITIONED-FILTER` 修复，已落地 prefix extractor 与 partitioned bloom/filter-index（按 data-block 分区并懒加载），待补充误报率与点查 miss 路径 benchmark。
 - 2026-03-04：完成 GoatKV vs RocksDB 读路径基准对齐：`randread(times=80,key_nums=20000,threads=16)` GoatKV `1542ms` vs RocksDB `436ms`（约慢 `3.54x`）；`hotread(times=120,key_nums=20000,hotset=512,threads=16)` GoatKV `1463ms` vs RocksDB `529ms`（约慢 `2.77x`）。基于代码走读新增 3 个待修复项：`P1-POINT-GET-HOTPATH-DECODE-COPY-AMPLIFICATION`、`P1-PINNED-READ-API-MISSING`、`P1-ROW-CACHE-MISSING`。
 - 2026-03-04：完成读路径阶段 3（block 内 user-key hash index + pinned value + row cache）并复测：`/tmp/goatkv_bench_cmp_stage3` 下 `randread(times=80,key_nums=20000,threads=16)` GoatKV `351ms` vs RocksDB `450ms`；`hotread(times=120,key_nums=20000,hotset=512,threads=16)` GoatKV `461ms` vs RocksDB `563ms`。对照 `row_cache=0`（`/tmp/goatkv_bench_cmp_stage3_norow`）GoatKV `randread=1557ms`、`hotread=1357ms`，确认热点收益主要来自 row cache 与 pinned 短路径。
+- 2026-03-05：完成 GoatKV vs RocksDB 读路径再对齐走读，新增“读路径差异记录（2026-03-05）”章节，沉淀当前实现与配置差异。
+- 2026-03-05：完成快照能力设计草案（参考 RocksDB `ReadOptions::snapshot` / `SnapshotList` / `CompactionIterator` 规则），新增文档 `docs/goatkv/snapshot_design.md`。
+
+## 读路径差异记录（2026-03-05）
+
+- 快照读取机制：GoatKV 在每次 `get` 里通过 `RwLock` 读锁克隆 `mem_table/immutable/version` 快照；RocksDB 通过 `SuperVersion` 引用完成读视图获取。
+- SSTable 文件挑选：GoatKV 采用 L0 反向线扫 + L1+ 单层二分；RocksDB 采用 `FilePicker` 做跨层边界推进与候选范围收缩。
+- 读语义覆盖范围：GoatKV 当前点查语义以 `Put/Delete` 为主；RocksDB 读路径还覆盖 range tombstone、merge、blob、timestamp 等分支。
+- Row cache 键与失效粒度：GoatKV 使用 `(version_seqno, user_key)`，版本切换后旧版本缓存整体失效；RocksDB row cache key 前缀包含文件与序列信息，失效粒度更细。
+- Row cache 填充策略：GoatKV 会缓存 miss 结果；RocksDB 主要在命中并生成 replay log 时写入 row cache。
+- 数据块内点查索引：GoatKV 读取块后会构建 `user_key -> value_range` 哈希索引；RocksDB 默认数据块仍是 binary 查找（需显式配置才启用 data block hash index）。
+- Filter 默认配置：GoatKV 当前构建路径默认写入分区 bloom；RocksDB 默认 `filter_policy=nullptr`，不自动开启 bloom。
+- 基准配置对齐现状：当前 bench 中 GoatKV 显式配置 table/block/row cache；RocksDB 读路径配置大多走默认值，结果仍受配置基线差异影响。
 
 ## 问题清单
 
@@ -446,6 +459,16 @@
     - 新增 `Scan`/`SnapshotGet`/`CompareAndSet`（或等价）RPC 及错误语义约定。
     - 保证范围读取在快照下的可重复性。
     - 增加并发一致性测试与接口文档。
+  - 设计草案：
+    - `docs/goatkv/snapshot_design.md`（v1 先交付快照点查闭环，再扩展到 Scan/CAS）。
+    - Phase 1（必须整体交付）：`SnapshotManager + Get(read_seq) 全链路 + snapshot-aware compaction`。
+    - Phase 2：对外 gRPC `CreateSnapshot/ReleaseSnapshot/Get(snapshot_id)`。
+    - Phase 3：快照读 row cache 可见性键与读路径性能补齐。
+  - 进展记录：
+    - 2026-03-05：Phase 1 已落地（`SnapshotManager`、`get_at_seq` 读链路、snapshot-aware compaction stripe 保留）；新增并通过 `test_snapshot_get_sees_old_value_after_put`、`test_snapshot_get_sees_old_state_after_delete`、`test_snapshot_survives_flush_and_compaction`、`compaction_keeps_snapshot_stripes_for_same_user_key`。
+    - 2026-03-05：Phase 2 已落地：`proto` 新增 `CreateSnapshot/ReleaseSnapshot`，`GetRequest` 增加 `snapshot_id`（`0`=最新读）；server/client 已接入快照 API；新增 e2e `tests/e2e/snapshot_test.rs` 覆盖“快照读旧值”和“释放后 NotFound”。
+    - 2026-03-05：Phase 3 第一阶段已落地：row cache 键从 `(version_seqno, user_key)` 扩展为 `(version_seqno, read_seq, user_key)`，显式快照读启用 row cache 且按可见性序列隔离；新增 `test_snapshot_row_cache_respects_read_seq_visibility` 与 `row_cache_distinguishes_visibility_sequence`。
+    - 2026-03-05：Phase 3 第二阶段已落地：`BlockReader` 增加 `get_by_user_key_with_value_range_at_seq`，`SSTableReader::get_pinned_at_seq` 改为块内按 seq 命中并返回 pinned value（避免全块线扫+value 拷贝）；`Version` 增加 `read_seq >= largest_seqno` 快路径复用普通点查；新增 `test_block_reader_get_by_user_key_at_seq_with_versions`、`test_block_reader_get_by_user_key_at_seq_cross_restart_boundary`、`test_sstable_reader_get_pinned_at_seq_returns_visible_version`、`test_sstable_reader_get_pinned_at_seq_crosses_blocks`。
 
 - [ ] `P1-ONDISK-FORMAT-VERSIONING-GAP`
   - 现象：SSTable/MANIFEST 缺少明确的格式版本演进策略与兼容矩阵定义。

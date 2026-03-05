@@ -242,6 +242,99 @@ impl<'a> BlockReader<'a> {
         self.get_by_user_key_entry(user_key)
     }
 
+    pub(crate) fn get_by_user_key_with_value_range_at_seq(
+        &self,
+        user_key: &[u8],
+        read_seq: u64,
+    ) -> Option<(InternalKey, usize, usize)> {
+        if let Some((internal_key, value_offset, value_len)) = self.get_by_user_key_entry(user_key)
+        {
+            if internal_key.sequence_number() <= read_seq {
+                return Some((internal_key, value_offset, value_len));
+            }
+        }
+
+        if self.restarts.is_empty() {
+            return self.linear_search_range_by_user_key_entry_at_seq(
+                0,
+                self.data_end,
+                user_key,
+                read_seq,
+            );
+        }
+        if self.restart_keys.len() != self.restarts.len() {
+            return self.linear_search_full_by_user_key_entry_at_seq(user_key, read_seq);
+        }
+
+        let prefix_probe = (self.restarts.len() - 1).min(8);
+        if prefix_probe > 0 {
+            let cmp = match self.restart_user_key_cmp(prefix_probe, user_key) {
+                Some(cmp) => cmp,
+                None => {
+                    return self.linear_search_full_by_user_key_entry_at_seq(user_key, read_seq)
+                }
+            };
+            if cmp == Ordering::Greater {
+                let end_pos = self.restarts[prefix_probe] as usize;
+                return self
+                    .linear_search_range_by_user_key_entry_at_seq(0, end_pos, user_key, read_seq);
+            }
+        }
+
+        let mut left = 0usize;
+        let mut right = self.restarts.len();
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let cmp = match self.restart_user_key_cmp(mid, user_key) {
+                Some(cmp) => cmp,
+                None => {
+                    return self.linear_search_full_by_user_key_entry_at_seq(user_key, read_seq)
+                }
+            };
+            if cmp == Ordering::Less {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+
+        if left >= self.restarts.len() {
+            return self.linear_search_from_restart_by_user_key_entry_at_seq(
+                self.restarts.len() - 1,
+                user_key,
+                read_seq,
+            );
+        }
+
+        let cmp_at_left = match self.restart_user_key_cmp(left, user_key) {
+            Some(cmp) => cmp,
+            None => return self.linear_search_full_by_user_key_entry_at_seq(user_key, read_seq),
+        };
+
+        match cmp_at_left {
+            Ordering::Greater => self.linear_search_from_restart_by_user_key_entry_at_seq(
+                left.saturating_sub(1),
+                user_key,
+                read_seq,
+            ),
+            Ordering::Equal => {
+                if left > 0 {
+                    if let Some(found) = self.linear_search_from_restart_by_user_key_entry_at_seq(
+                        left - 1,
+                        user_key,
+                        read_seq,
+                    ) {
+                        return Some(found);
+                    }
+                }
+                self.linear_search_from_restart_by_user_key_entry_at_seq(left, user_key, read_seq)
+            }
+            Ordering::Less => {
+                self.linear_search_from_restart_by_user_key_entry_at_seq(left, user_key, read_seq)
+            }
+        }
+    }
+
     fn get_by_user_key_entry(&self, user_key: &[u8]) -> Option<(InternalKey, usize, usize)> {
         if let Some(entry) = self.user_key_hash_index.get(user_key) {
             return Some((
@@ -533,6 +626,21 @@ impl<'a> BlockReader<'a> {
         self.linear_search_range_by_user_key_entry(0, self.data_end, user_key)
     }
 
+    fn linear_search_from_restart_by_user_key_entry_at_seq(
+        &self,
+        restart_index: usize,
+        user_key: &[u8],
+        read_seq: u64,
+    ) -> Option<(InternalKey, usize, usize)> {
+        let restart_pos = self.restarts[restart_index] as usize;
+        let end_pos = if restart_index + 1 < self.restarts.len() {
+            self.restarts[restart_index + 1] as usize
+        } else {
+            self.data_end
+        };
+        self.linear_search_range_by_user_key_entry_at_seq(restart_pos, end_pos, user_key, read_seq)
+    }
+
     /// 在整个块中进行线性搜索（回退策略）
     fn linear_search_full(&self, key: &[u8]) -> Option<Vec<u8>> {
         let iter = self.iter();
@@ -571,6 +679,14 @@ impl<'a> BlockReader<'a> {
         user_key: &[u8],
     ) -> Option<(InternalKey, usize, usize)> {
         self.linear_search_range_by_user_key_entry(0, self.data_end, user_key)
+    }
+
+    fn linear_search_full_by_user_key_entry_at_seq(
+        &self,
+        user_key: &[u8],
+        read_seq: u64,
+    ) -> Option<(InternalKey, usize, usize)> {
+        self.linear_search_range_by_user_key_entry_at_seq(0, self.data_end, user_key, read_seq)
     }
 
     fn linear_search_range_by_user_key_entry(
@@ -620,6 +736,76 @@ impl<'a> BlockReader<'a> {
                     return Some((internal_key, entry.value_offset, entry.value.len()));
                 }
                 Ordering::Greater => {
+                    return None;
+                }
+            }
+        }
+
+        None
+    }
+
+    fn linear_search_range_by_user_key_entry_at_seq(
+        &self,
+        start_pos: usize,
+        end_pos: usize,
+        user_key: &[u8],
+        read_seq: u64,
+    ) -> Option<(InternalKey, usize, usize)> {
+        let mut current_pos = start_pos;
+        let mut prev_key = Vec::new();
+        let mut seen_target_user_key = false;
+
+        while current_pos < end_pos {
+            let entry = self.decode_entry_view_at(current_pos).ok()?;
+            if entry.unshared_key.is_empty() && entry.value.is_empty() {
+                return None;
+            }
+
+            if prev_key.is_empty() {
+                if entry.shared != 0 {
+                    return None;
+                }
+                prev_key.extend_from_slice(entry.unshared_key);
+            } else {
+                let shared = entry.shared as usize;
+                if shared > prev_key.len() {
+                    return None;
+                }
+                prev_key.truncate(shared);
+                prev_key.extend_from_slice(entry.unshared_key);
+            }
+
+            let full_user_key = match Self::user_key_of_internal_key(&prev_key) {
+                Some(k) => k,
+                None => {
+                    current_pos += entry.total_len;
+                    continue;
+                }
+            };
+
+            match full_user_key.cmp(user_key) {
+                Ordering::Less => {
+                    current_pos += entry.total_len;
+                }
+                Ordering::Equal => {
+                    seen_target_user_key = true;
+                    let seq = match Self::sequence_of_internal_key(&prev_key) {
+                        Some(seq) => seq,
+                        None => {
+                            current_pos += entry.total_len;
+                            continue;
+                        }
+                    };
+                    if seq <= read_seq {
+                        let internal_key = Self::decode_internal_key_slice(&prev_key)?;
+                        return Some((internal_key, entry.value_offset, entry.value.len()));
+                    }
+                    current_pos += entry.total_len;
+                }
+                Ordering::Greater => {
+                    if seen_target_user_key {
+                        return None;
+                    }
                     return None;
                 }
             }
@@ -746,6 +932,17 @@ impl<'a> BlockReader<'a> {
             raw_key[..n - 8].to_vec(),
             encoded,
         ))
+    }
+
+    fn sequence_of_internal_key(raw_key: &[u8]) -> Option<u64> {
+        if raw_key.len() < 8 {
+            return None;
+        }
+        let n = raw_key.len();
+        let mut encoded_trailer = [0u8; 8];
+        encoded_trailer.copy_from_slice(&raw_key[n - 8..]);
+        let encoded = !u64::from_be_bytes(encoded_trailer);
+        Some(encoded >> 8)
     }
 
     /// 创建块的迭代器
@@ -1024,5 +1221,56 @@ mod tests {
         let (internal_key, value) = reader.get_by_user_key(b"bb").unwrap();
         assert_eq!(internal_key.serialize(), expected_latest_bb_key);
         assert_eq!(value, b"bb_200".to_vec());
+    }
+
+    #[test]
+    fn test_block_reader_get_by_user_key_at_seq_with_versions() {
+        let mut builder = BlockBuilder::new();
+        let k1_v30 = InternalKey::new(b"k1".to_vec(), 30, InternalKeyKind::Put).serialize();
+        let k1_v20 = InternalKey::new(b"k1".to_vec(), 20, InternalKeyKind::Put).serialize();
+        let k1_v10 = InternalKey::new(b"k1".to_vec(), 10, InternalKeyKind::Put).serialize();
+        builder.add(&k1_v30, b"v30");
+        builder.add(&k1_v20, b"v20");
+        builder.add(&k1_v10, b"v10");
+        let (data, _) = builder.finish();
+
+        let reader = BlockReader::new(data).unwrap();
+        let (internal_key, _, _) = reader
+            .get_by_user_key_with_value_range_at_seq(b"k1", 25)
+            .unwrap();
+        assert_eq!(internal_key.sequence_number(), 20);
+
+        let (internal_key, _, _) = reader
+            .get_by_user_key_with_value_range_at_seq(b"k1", 10)
+            .unwrap();
+        assert_eq!(internal_key.sequence_number(), 10);
+        assert!(reader
+            .get_by_user_key_with_value_range_at_seq(b"k1", 5)
+            .is_none());
+    }
+
+    #[test]
+    fn test_block_reader_get_by_user_key_at_seq_cross_restart_boundary() {
+        let mut builder = BlockBuilder::new();
+
+        for seq in (86u64..=100u64).rev() {
+            let key = InternalKey::new(b"aa".to_vec(), seq, InternalKeyKind::Put).serialize();
+            let value = format!("aa_{}", seq).into_bytes();
+            builder.add(&key, &value);
+        }
+
+        for seq in (180u64..=200u64).rev() {
+            let key = InternalKey::new(b"bb".to_vec(), seq, InternalKeyKind::Put).serialize();
+            let value = format!("bb_{}", seq).into_bytes();
+            builder.add(&key, &value);
+        }
+
+        let (data, _) = builder.finish();
+        let reader = BlockReader::new(data).unwrap();
+
+        let (internal_key, _, _) = reader
+            .get_by_user_key_with_value_range_at_seq(b"bb", 189)
+            .unwrap();
+        assert_eq!(internal_key.sequence_number(), 189);
     }
 }

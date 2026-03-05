@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use ouroboros::self_referencing;
+use std::cmp::Ordering;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 use crate::goatkv::core::skip_list::{Iter, SkipList};
@@ -43,6 +44,23 @@ impl MemTableInner {
             }
             None => None,
         }
+    }
+
+    pub fn get_pinned_at_seq(&self, key: &[u8], read_seq: u64) -> Option<(InternalKey, Bytes)> {
+        let guard = self.skiplist.read().unwrap();
+        let mut iter = guard.seek_iter(key);
+        while let Some((internal_key, value)) = iter.next() {
+            match internal_key.user_key().cmp(key) {
+                Ordering::Less => continue,
+                Ordering::Equal => {
+                    if internal_key.sequence_number() <= read_seq {
+                        return Some((internal_key, value));
+                    }
+                }
+                Ordering::Greater => break,
+            }
+        }
+        None
     }
 
     /// 查找键值对，返回 (InternalKey, value) 元组
@@ -131,6 +149,10 @@ impl MemTable {
         self.inner.get_pinned(key)
     }
 
+    pub fn get_pinned_at_seq(&self, key: &[u8], read_seq: u64) -> Option<(InternalKey, Bytes)> {
+        self.inner.get_pinned_at_seq(key, read_seq)
+    }
+
     /// 查找键值对，返回 (InternalKey, value) 元组
     pub fn seek(&self, key: &[u8]) -> Option<(InternalKey, Vec<u8>)> {
         self.inner.seek(key)
@@ -179,6 +201,10 @@ impl ImmutableMemTable {
 
     pub fn get_pinned(&self, key: &[u8]) -> Option<(InternalKey, Bytes)> {
         self.inner.get_pinned(key)
+    }
+
+    pub fn get_pinned_at_seq(&self, key: &[u8], read_seq: u64) -> Option<(InternalKey, Bytes)> {
+        self.inner.get_pinned_at_seq(key, read_seq)
     }
 
     /// 查找键值对，返回 (InternalKey, value) 元组

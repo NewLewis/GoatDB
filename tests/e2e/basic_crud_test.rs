@@ -26,6 +26,7 @@ async fn test_write_and_read() {
     // 读取数据
     let get_req = GetRequest {
         key: b"test_key".to_vec(),
+        snapshot_id: 0,
     };
     let response = client.get(get_req).await.unwrap();
     let data = response.into_inner();
@@ -66,6 +67,7 @@ async fn test_update_existing_key() {
     let get_resp = client
         .get(GetRequest {
             key: b"key1".to_vec(),
+            snapshot_id: 0,
         })
         .await
         .unwrap();
@@ -104,6 +106,7 @@ async fn test_delete_key() {
     let get_resp = client
         .get(GetRequest {
             key: b"to_delete".to_vec(),
+            snapshot_id: 0,
         })
         .await
         .unwrap();
@@ -124,6 +127,7 @@ async fn test_get_non_existent_key() {
     let get_resp = client
         .get(GetRequest {
             key: b"non_existent_key".to_vec(),
+            snapshot_id: 0,
         })
         .await
         .unwrap();
@@ -167,6 +171,7 @@ async fn test_write_same_key_multiple_times() {
     let get_resp = client
         .get(GetRequest {
             key: b"repeated_key".to_vec(),
+            snapshot_id: 0,
         })
         .await
         .unwrap();
@@ -205,7 +210,13 @@ async fn test_multiple_keys_crud() {
 
     // 验证所有数据都能正确读取
     for (key, expected_value) in &test_cases {
-        let response = client.get(GetRequest { key: key.clone() }).await.unwrap();
+        let response = client
+            .get(GetRequest {
+                key: key.clone(),
+                snapshot_id: 0,
+            })
+            .await
+            .unwrap();
 
         let data = response.into_inner();
         assert!(data.success);
@@ -226,6 +237,7 @@ async fn test_multiple_keys_crud() {
     let get_response = client
         .get(GetRequest {
             key: b"key_b".to_vec(),
+            snapshot_id: 0,
         })
         .await
         .unwrap();
@@ -244,6 +256,7 @@ async fn test_multiple_keys_crud() {
     let get_deleted = client
         .get(GetRequest {
             key: b"key_c".to_vec(),
+            snapshot_id: 0,
         })
         .await
         .unwrap();

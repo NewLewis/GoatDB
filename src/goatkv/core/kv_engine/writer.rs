@@ -241,6 +241,7 @@ impl KvWriter {
         lsm_state: Arc<RwLock<LSMState>>,
         write_gate: Arc<RwLock<()>>,
         options: Arc<KvEngineOptions>,
+        initial_published_seq: u64,
     ) -> Self {
         Self {
             wal_writer,
@@ -250,10 +251,14 @@ impl KvWriter {
             state: Mutex::new(WriteState::new()),
             state_cv: Condvar::new(),
             options,
-            last_published_seq: AtomicU64::new(0),
+            last_published_seq: AtomicU64::new(initial_published_seq),
             flush_requested: AtomicBool::new(false),
             write_pressure_level: AtomicU8::new(WritePressureLevel::Normal.as_u8()),
         }
+    }
+
+    pub fn last_published_sequence(&self) -> u64 {
+        self.last_published_seq.load(Ordering::Acquire)
     }
 
     pub(crate) fn submit_write<F>(&self, ops: Vec<WriteOp>, flush_fn: F) -> GoatResult<()>
@@ -1044,6 +1049,7 @@ mod tests {
             lsm_state.clone(),
             write_gate,
             Arc::new(options),
+            start.saturating_sub(1),
         );
         (writer, lsm_state)
     }

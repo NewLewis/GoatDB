@@ -16,6 +16,7 @@ use crate::goatkv::core::flush_worker::{CompactionConfig, FlushTask, FlushWorker
 use crate::goatkv::core::lsm_state::{ImmutableMemTableEntry, LSMState};
 use crate::goatkv::core::mem_table::{ImmutableMemTable, MemTable};
 use crate::goatkv::core::sequence_number::SequenceNumber;
+use crate::goatkv::core::snapshot_manager::{SnapshotHandle, SnapshotManager};
 use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::format::internal_key::SEQUENCE_NUMBER_MAX;
 use crate::goatkv::metadata::version::Version;
@@ -72,6 +73,8 @@ pub struct KvEngine {
     manifest_paths: Arc<ManifestPaths>,
     /// 后台刷盘 Worker
     flush_worker: FlushWorker,
+    /// 活跃快照管理器
+    snapshot_manager: Arc<RwLock<SnapshotManager>>,
     /// 读取协调器
     reader: KvReader,
     /// 写入协调器
@@ -197,6 +200,34 @@ impl KvEngine {
 
     pub fn get(&self, key: &[u8]) -> GoatResult<Option<Vec<u8>>> {
         self.reader.get(key)
+    }
+
+    pub fn create_snapshot(&self) -> GoatResult<SnapshotHandle> {
+        let seq = self.writer.last_published_sequence();
+        let mut manager = self.snapshot_manager.write().unwrap();
+        Ok(manager.create(seq))
+    }
+
+    pub fn release_snapshot(&self, snapshot_id: u64) -> GoatResult<()> {
+        let mut manager = self.snapshot_manager.write().unwrap();
+        if manager.release(snapshot_id) {
+            Ok(())
+        } else {
+            Err(GoatError::not_found(
+                "snapshot",
+                format!("snapshot {} not found", snapshot_id),
+            ))
+        }
+    }
+
+    pub fn get_with_snapshot(&self, key: &[u8], snapshot_id: u64) -> GoatResult<Option<Vec<u8>>> {
+        let seq = {
+            let manager = self.snapshot_manager.read().unwrap();
+            manager.lookup_sequence(snapshot_id).ok_or_else(|| {
+                GoatError::not_found("snapshot", format!("snapshot {} not found", snapshot_id))
+            })?
+        };
+        self.reader.get_at_seq(key, seq)
     }
 
     pub fn read_cache_metrics(&self) -> Option<ReadCacheMetrics> {
@@ -410,10 +441,12 @@ impl KvEngine {
             cleanup_worker,
             current_log_number,
         } = input;
+        let snapshot_manager = Arc::new(RwLock::new(SnapshotManager::new()));
         let flush_worker = FlushWorker::new(
             lsm_state.clone(),
             version_set.clone(),
             sstable_paths.clone(),
+            snapshot_manager.clone(),
             options.flush_failure_streak_limit,
             CompactionConfig {
                 l0_compaction_file_trigger: options.l0_compaction_file_trigger,
@@ -427,12 +460,14 @@ impl KvEngine {
         let wal_writer = Arc::new(wal_writer);
         let options = Arc::new(options);
         let write_gate = Arc::new(RwLock::new(()));
+        let initial_published_seq = sequence_number.current().saturating_sub(1);
         let writer = KvWriter::new(
             wal_writer.clone(),
             sequence_number,
             lsm_state.clone(),
             write_gate.clone(),
             options.clone(),
+            initial_published_seq,
         );
         let reader = KvReader::new(lsm_state.clone());
         Self {
@@ -444,6 +479,7 @@ impl KvEngine {
             write_gate,
             options,
             flush_worker,
+            snapshot_manager,
             reader,
             writer,
             cleanup_worker,
@@ -779,6 +815,30 @@ mod tests {
             .expect("build tokio runtime for kv engine tests")
     }
 
+    fn wait_for_base_level_compaction(engine: &KvEngine, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let (l0_len, non_l0_file_count) = {
+                let vs = engine.version_set.read().unwrap();
+                let v = vs.current();
+                let non_l0_file_count = (1..v.num_levels())
+                    .map(|level| v.get_files(level).len())
+                    .sum::<usize>();
+                (v.get_files(0).len(), non_l0_file_count)
+            };
+            if l0_len <= 4 && non_l0_file_count > 0 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timeout waiting base-level compaction: l0={}, non_l0_files={}",
+                    l0_len, non_l0_file_count
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn test_put_and_get() {
         let rt = test_runtime();
@@ -857,6 +917,132 @@ mod tests {
             Some(b"updated_value2".to_vec())
         );
         assert_eq!(engine.get(b"key3").unwrap(), Some(b"value3".to_vec()));
+    }
+
+    #[test]
+    fn test_snapshot_get_sees_old_value_after_put() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"k1".to_vec(), b"v1".to_vec()).unwrap();
+        let snapshot = engine.create_snapshot().unwrap();
+
+        engine.put(b"k1".to_vec(), b"v2".to_vec()).unwrap();
+
+        assert_eq!(
+            engine.get_with_snapshot(b"k1", snapshot.id).unwrap(),
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(engine.get(b"k1").unwrap(), Some(b"v2".to_vec()));
+        engine.release_snapshot(snapshot.id).unwrap();
+    }
+
+    #[test]
+    fn test_snapshot_get_sees_old_state_after_delete() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"k1".to_vec(), b"v1".to_vec()).unwrap();
+        let snapshot = engine.create_snapshot().unwrap();
+
+        engine.delete(b"k1".to_vec()).unwrap();
+
+        assert_eq!(
+            engine.get_with_snapshot(b"k1", snapshot.id).unwrap(),
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(engine.get(b"k1").unwrap(), None);
+        engine.release_snapshot(snapshot.id).unwrap();
+    }
+
+    #[test]
+    fn test_snapshot_survives_flush_and_compaction() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"k1".to_vec(), b"v1".to_vec()).unwrap();
+        engine.flush();
+        let snapshot = engine.create_snapshot().unwrap();
+
+        for i in 2..=10u64 {
+            engine
+                .put(b"k1".to_vec(), format!("v{}", i).into_bytes())
+                .unwrap();
+            engine.flush();
+        }
+
+        wait_for_base_level_compaction(&engine, Duration::from_secs(5));
+
+        assert_eq!(
+            engine.get_with_snapshot(b"k1", snapshot.id).unwrap(),
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(engine.get(b"k1").unwrap(), Some(b"v10".to_vec()));
+        engine.release_snapshot(snapshot.id).unwrap();
+    }
+
+    #[test]
+    fn test_snapshot_row_cache_respects_read_seq_visibility() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"k1".to_vec(), b"v1".to_vec()).unwrap();
+        engine.flush();
+        engine
+            .wait_for_immutable_memtables(Duration::from_secs(3))
+            .unwrap();
+        let snapshot_v1 = engine.create_snapshot().unwrap();
+
+        engine.put(b"k1".to_vec(), b"v2".to_vec()).unwrap();
+        engine.flush();
+        engine
+            .wait_for_immutable_memtables(Duration::from_secs(3))
+            .unwrap();
+        let snapshot_v2 = engine.create_snapshot().unwrap();
+
+        assert_eq!(
+            engine.get_with_snapshot(b"k1", snapshot_v1.id).unwrap(),
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(
+            engine.get_with_snapshot(b"k1", snapshot_v2.id).unwrap(),
+            Some(b"v2".to_vec())
+        );
+        assert_eq!(
+            engine.get_with_snapshot(b"k1", snapshot_v1.id).unwrap(),
+            Some(b"v1".to_vec())
+        );
+
+        let metrics = engine.read_cache_metrics().unwrap();
+        assert!(
+            metrics.row_misses >= 2,
+            "expected at least two row cache misses for two visibility keys, got {:?}",
+            metrics
+        );
+        assert!(
+            metrics.row_hits >= 1,
+            "expected row cache hit on repeated snapshot read, got {:?}",
+            metrics
+        );
+
+        engine.release_snapshot(snapshot_v1.id).unwrap();
+        engine.release_snapshot(snapshot_v2.id).unwrap();
+    }
+
+    #[test]
+    fn test_release_unknown_snapshot_returns_not_found() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        let err = engine
+            .release_snapshot(42)
+            .expect_err("release unknown snapshot should fail");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 
     #[test]
@@ -982,27 +1168,7 @@ mod tests {
             engine.flush();
         }
 
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            let (l0_len, non_l0_file_count) = {
-                let vs = engine.version_set.read().unwrap();
-                let v = vs.current();
-                let non_l0_file_count = (1..v.num_levels())
-                    .map(|level| v.get_files(level).len())
-                    .sum::<usize>();
-                (v.get_files(0).len(), non_l0_file_count)
-            };
-            if l0_len <= 4 && non_l0_file_count > 0 {
-                break;
-            }
-            if Instant::now() >= deadline {
-                panic!(
-                    "timeout waiting base-level compaction: l0={}, non_l0_files={}",
-                    l0_len, non_l0_file_count
-                );
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
+        wait_for_base_level_compaction(&engine, Duration::from_secs(3));
     }
 
     #[test]

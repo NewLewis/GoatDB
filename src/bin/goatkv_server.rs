@@ -7,7 +7,8 @@ use goat_db::goatkv::utils::{init_logging, KvEngineOptions};
 use goat_db::goatkv::{Error as GoatError, Result as GoatResult};
 use goatkv::{
     goat_kv_service_server::{GoatKvService, GoatKvServiceServer},
-    DeleteRequest, DeleteResponse, FlushRequest, FlushResponse, GetRequest, GetResponse,
+    CreateSnapshotRequest, CreateSnapshotResponse, DeleteRequest, DeleteResponse, FlushRequest,
+    FlushResponse, GetRequest, GetResponse, ReleaseSnapshotRequest, ReleaseSnapshotResponse,
     UpdateRequest, UpdateResponse, WriteRequest, WriteResponse,
 };
 use tokio::signal;
@@ -73,14 +74,25 @@ impl GoatKvService for GoatKVServiceImpl {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         let req = request.into_inner();
 
-        debug!("Received get request - key_len: {}", req.key.len());
+        debug!(
+            "Received get request - key_len: {}, snapshot_id: {}",
+            req.key.len(),
+            req.snapshot_id
+        );
 
         // 验证输入
         if req.key.is_empty() {
             return Err(Status::invalid_argument("Key cannot be empty"));
         }
 
-        match self.engine.get(&req.key).map_err(Self::map_engine_err)? {
+        let value = if req.snapshot_id == 0 {
+            self.engine.get(&req.key)
+        } else {
+            self.engine.get_with_snapshot(&req.key, req.snapshot_id)
+        }
+        .map_err(Self::map_engine_err)?;
+
+        match value {
             Some(value) => {
                 let reply = GetResponse {
                     success: true,
@@ -168,6 +180,44 @@ impl GoatKvService for GoatKVServiceImpl {
             message: "Flush triggered successfully".to_string(),
         };
 
+        Ok(Response::new(reply))
+    }
+
+    async fn create_snapshot(
+        &self,
+        _request: Request<CreateSnapshotRequest>,
+    ) -> Result<Response<CreateSnapshotResponse>, Status> {
+        debug!("Received create_snapshot request");
+
+        let snapshot = self
+            .engine
+            .create_snapshot()
+            .map_err(Self::map_engine_err)?;
+        let reply = CreateSnapshotResponse {
+            success: true,
+            message: "Snapshot created successfully".to_string(),
+            snapshot_id: snapshot.id,
+        };
+        Ok(Response::new(reply))
+    }
+
+    async fn release_snapshot(
+        &self,
+        request: Request<ReleaseSnapshotRequest>,
+    ) -> Result<Response<ReleaseSnapshotResponse>, Status> {
+        let req = request.into_inner();
+        debug!(
+            "Received release_snapshot request - snapshot_id: {}",
+            req.snapshot_id
+        );
+
+        self.engine
+            .release_snapshot(req.snapshot_id)
+            .map_err(Self::map_engine_err)?;
+        let reply = ReleaseSnapshotResponse {
+            success: true,
+            message: "Snapshot released successfully".to_string(),
+        };
         Ok(Response::new(reply))
     }
 }

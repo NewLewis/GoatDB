@@ -73,6 +73,11 @@ path = "tests/e2e/edge_cases_test.rs"
 harness = true
 
 [[test]]
+name = "e2e_snapshot"
+path = "tests/e2e/snapshot_test.rs"
+harness = true
+
+[[test]]
 name = "integration_recovery"
 path = "tests/integration/recovery_test.rs"
 harness = true

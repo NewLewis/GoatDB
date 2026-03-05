@@ -5,6 +5,7 @@ use std::thread;
 
 use crate::goatkv::core::lsm_state::LSMState;
 use crate::goatkv::core::mem_table::ImmutableMemTable;
+use crate::goatkv::core::snapshot_manager::SnapshotManager;
 use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::format::internal_key::InternalKey;
 use crate::goatkv::metadata::file_metadata::{FileMetadata, TableProperties};
@@ -179,6 +180,7 @@ impl FlushWorker {
         lsm_state: Arc<RwLock<LSMState>>,
         version_set: Arc<RwLock<VersionSet>>,
         sstable_paths: Arc<SstablePaths>,
+        snapshot_manager: Arc<RwLock<SnapshotManager>>,
         flush_failure_streak_limit: usize,
         compaction_config: CompactionConfig,
         bloom_prefix_extractor_len: usize,
@@ -193,12 +195,14 @@ impl FlushWorker {
             let lsm_state = Arc::clone(&lsm_state);
             let version_set = Arc::clone(&version_set);
             let sstable_paths = Arc::clone(&sstable_paths);
+            let snapshot_manager = Arc::clone(&snapshot_manager);
             thread::spawn(move || {
                 Self::run_compaction_loop(
                     compaction_rx,
                     lsm_state,
                     version_set,
                     sstable_paths,
+                    snapshot_manager,
                     compaction_config,
                     bloom_prefix_extractor_len,
                 );
@@ -404,6 +408,7 @@ impl FlushWorker {
         lsm_state: Arc<RwLock<LSMState>>,
         version_set: Arc<RwLock<VersionSet>>,
         sstable_paths: Arc<SstablePaths>,
+        snapshot_manager: Arc<RwLock<SnapshotManager>>,
         compaction_config: CompactionConfig,
         bloom_prefix_extractor_len: usize,
     ) {
@@ -412,6 +417,7 @@ impl FlushWorker {
                 &lsm_state,
                 &version_set,
                 &sstable_paths,
+                &snapshot_manager,
                 compaction_config,
                 bloom_prefix_extractor_len,
             );
@@ -466,6 +472,7 @@ impl FlushWorker {
         lsm_state: &Arc<RwLock<LSMState>>,
         version_set: &Arc<RwLock<VersionSet>>,
         sstable_paths: &Arc<SstablePaths>,
+        snapshot_manager: &Arc<RwLock<SnapshotManager>>,
         compaction_config: CompactionConfig,
         bloom_prefix_extractor_len: usize,
     ) {
@@ -479,11 +486,13 @@ impl FlushWorker {
             let Some(plan) = plan else {
                 break;
             };
+            let snapshot_seqs = snapshot_manager.read().unwrap().snapshot_sequences_sorted();
 
             if !Self::compact_one_level(
                 lsm_state,
                 version_set,
                 sstable_paths,
+                &snapshot_seqs,
                 plan,
                 bloom_prefix_extractor_len,
             ) {
@@ -726,6 +735,7 @@ impl FlushWorker {
         lsm_state: &Arc<RwLock<LSMState>>,
         version_set: &Arc<RwLock<VersionSet>>,
         sstable_paths: &Arc<SstablePaths>,
+        snapshot_seqs: &[u64],
         plan: CompactionPlan,
         bloom_prefix_extractor_len: usize,
     ) -> bool {
@@ -791,6 +801,7 @@ impl FlushWorker {
             version_set,
             sstable_paths,
             &mut stream,
+            snapshot_seqs,
             &plan.grandparent_files,
             plan.grandparent_overlap_bytes_limit,
             bloom_prefix_extractor_len,
@@ -840,6 +851,7 @@ impl FlushWorker {
         version_set: &Arc<RwLock<VersionSet>>,
         sstable_paths: &SstablePaths,
         stream: &mut CompactionStream,
+        snapshot_seqs: &[u64],
         grandparent_files: &[Arc<FileMetadata>],
         grandparent_overlap_bytes_limit: u64,
         bloom_prefix_extractor_len: usize,
@@ -851,15 +863,18 @@ impl FlushWorker {
         let mut current_entries = 0usize;
         let mut max_seq = 0u64;
         let mut last_emitted_user_key: Option<Vec<u8>> = None;
+        let mut last_emitted_snapshot_stripe: Option<u64> = None;
 
         while let Some((internal_key, value)) = stream.next_entry()? {
             max_seq = max_seq.max(internal_key.sequence_number());
-
-            if last_emitted_user_key
+            let snapshot_stripe =
+                Self::find_earliest_visible_snapshot(snapshot_seqs, internal_key.sequence_number());
+            let same_user_key = last_emitted_user_key
                 .as_ref()
                 .map(|k| k.as_slice() == internal_key.user_key())
-                .unwrap_or(false)
-            {
+                .unwrap_or(false);
+
+            if same_user_key && last_emitted_snapshot_stripe == Some(snapshot_stripe) {
                 continue;
             }
 
@@ -924,6 +939,7 @@ impl FlushWorker {
             }
             current_entries += 1;
             last_emitted_user_key = Some(internal_key.user_key().to_vec());
+            last_emitted_snapshot_stripe = Some(snapshot_stripe);
         }
 
         if let (Some(mut current_builder), Some(file_id)) = (builder.take(), current_file_id.take())
@@ -940,6 +956,13 @@ impl FlushWorker {
         }
 
         Ok((outputs, max_seq))
+    }
+
+    fn find_earliest_visible_snapshot(snapshot_seqs: &[u64], sequence: u64) -> u64 {
+        match snapshot_seqs.binary_search(&sequence) {
+            Ok(idx) => snapshot_seqs[idx],
+            Err(idx) => snapshot_seqs.get(idx).copied().unwrap_or(u64::MAX),
+        }
     }
 
     fn cleanup_generated_sstables(sstable_paths: &SstablePaths, file_ids: &[u64]) {
@@ -1206,7 +1229,8 @@ mod tests {
             grandparent_overlap_bytes_limit: u64::MAX,
         };
 
-        let ok = FlushWorker::compact_one_level(&lsm_state, &version_set, &sstable_paths, plan, 0);
+        let ok =
+            FlushWorker::compact_one_level(&lsm_state, &version_set, &sstable_paths, &[], plan, 0);
         assert!(!ok, "compaction should fail when apply_edit fails");
         assert!(
             version_set.read().unwrap().next_file_number() > expected_output_file_id,
@@ -1219,5 +1243,143 @@ mod tests {
             "orphan compaction output should be cleaned: {:?}",
             orphan_output
         );
+    }
+
+    #[test]
+    fn compaction_keeps_snapshot_stripes_for_same_user_key() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let (_wal_paths, sstable_paths, manifest_paths) =
+            KvEngine::init_db_paths(temp_dir.path()).expect("init paths");
+        let (obsolete_tx, _obsolete_rx) = unbounded_channel::<CleanupTask>();
+
+        let source_file = build_sstable_file(
+            &sstable_paths,
+            obsolete_tx.clone(),
+            200,
+            vec![
+                (
+                    InternalKey::new(b"k1".to_vec(), 30, InternalKeyKind::Put),
+                    b"v30".to_vec(),
+                ),
+                (
+                    InternalKey::new(b"k1".to_vec(), 20, InternalKeyKind::Put),
+                    b"v20".to_vec(),
+                ),
+                (
+                    InternalKey::new(b"k1".to_vec(), 10, InternalKeyKind::Put),
+                    b"v10".to_vec(),
+                ),
+                (
+                    InternalKey::new(b"k2".to_vec(), 8, InternalKeyKind::Put),
+                    b"v8".to_vec(),
+                ),
+            ],
+        );
+        let source_files = vec![source_file];
+        let target_files = Vec::new();
+        let version_set = Arc::new(RwLock::new(
+            VersionSet::new_with_options(
+                manifest_paths,
+                sstable_paths.clone(),
+                VersionSetOptions {
+                    num_levels: 3,
+                    ..VersionSetOptions::default()
+                },
+                obsolete_tx.clone(),
+            )
+            .expect("create version set"),
+        ));
+
+        let mut stream_without_snapshot =
+            CompactionStream::from_files(&sstable_paths, &source_files, &target_files)
+                .expect("build stream without snapshot");
+        let (outputs_without_snapshot, _) = FlushWorker::build_compacted_sstables(
+            &version_set,
+            &sstable_paths,
+            &mut stream_without_snapshot,
+            &[],
+            &[],
+            u64::MAX,
+            0,
+        )
+        .expect("build compacted sstable without snapshot");
+        assert_eq!(outputs_without_snapshot.len(), 1);
+        let output_file_id = outputs_without_snapshot[0].0;
+        let entries_without_snapshot =
+            SSTableReader::open(sstable_paths.sstable_path_by_id(output_file_id))
+                .expect("open output sstable without snapshot")
+                .scan_all()
+                .expect("scan output sstable without snapshot");
+        let k1_versions_without_snapshot: Vec<u64> = entries_without_snapshot
+            .iter()
+            .filter(|(key, _)| key.user_key() == b"k1")
+            .map(|(key, _)| key.sequence_number())
+            .collect();
+        assert_eq!(k1_versions_without_snapshot, vec![30]);
+
+        let mut stream_with_snapshot =
+            CompactionStream::from_files(&sstable_paths, &source_files, &target_files)
+                .expect("build stream with snapshot");
+        let (outputs_with_snapshot, _) = FlushWorker::build_compacted_sstables(
+            &version_set,
+            &sstable_paths,
+            &mut stream_with_snapshot,
+            &[15],
+            &[],
+            u64::MAX,
+            0,
+        )
+        .expect("build compacted sstable with snapshot");
+        assert_eq!(outputs_with_snapshot.len(), 1);
+        let output_file_id = outputs_with_snapshot[0].0;
+        let entries_with_snapshot =
+            SSTableReader::open(sstable_paths.sstable_path_by_id(output_file_id))
+                .expect("open output sstable with snapshot")
+                .scan_all()
+                .expect("scan output sstable with snapshot");
+        let k1_versions_with_snapshot: Vec<u64> = entries_with_snapshot
+            .iter()
+            .filter(|(key, _)| key.user_key() == b"k1")
+            .map(|(key, _)| key.sequence_number())
+            .collect();
+        assert_eq!(k1_versions_with_snapshot, vec![30, 10]);
+
+        let source_after_snapshot: Vec<Arc<FileMetadata>> = outputs_with_snapshot
+            .iter()
+            .map(|(file_id, props)| {
+                Arc::new(FileMetadata::from_props_with_sstable_paths(
+                    *file_id,
+                    props.clone(),
+                    obsolete_tx.clone(),
+                    &sstable_paths,
+                ))
+            })
+            .collect();
+        let mut stream_after_release =
+            CompactionStream::from_files(&sstable_paths, &source_after_snapshot, &target_files)
+                .expect("build stream after snapshot release");
+        let (outputs_after_release, _) = FlushWorker::build_compacted_sstables(
+            &version_set,
+            &sstable_paths,
+            &mut stream_after_release,
+            &[],
+            &[],
+            u64::MAX,
+            0,
+        )
+        .expect("build compacted sstable after snapshot release");
+        assert_eq!(outputs_after_release.len(), 1);
+        let output_file_id = outputs_after_release[0].0;
+        let entries_after_release =
+            SSTableReader::open(sstable_paths.sstable_path_by_id(output_file_id))
+                .expect("open output sstable after snapshot release")
+                .scan_all()
+                .expect("scan output sstable after snapshot release");
+        let k1_versions_after_release: Vec<u64> = entries_after_release
+            .iter()
+            .filter(|(key, _)| key.user_key() == b"k1")
+            .map(|(key, _)| key.sequence_number())
+            .collect();
+        assert_eq!(k1_versions_after_release, vec![30]);
     }
 }

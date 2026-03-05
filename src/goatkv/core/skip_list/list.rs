@@ -136,6 +136,14 @@ where
         }
     }
 
+    pub fn seek_iter(&self, key: &[u8]) -> Iter<'_, K> {
+        let current = self.find_ge(key);
+        Iter {
+            current,
+            _marker: PhantomData,
+        }
+    }
+
     /// 范围迭代器
     pub fn range<'a>(&'a self, start: &'a K, end: &'a K) -> RangeIter<'a, K> {
         let start_node = self.find_ge(start.user_key());

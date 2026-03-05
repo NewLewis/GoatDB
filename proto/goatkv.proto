@@ -7,6 +7,8 @@ service GoatKVService {
   rpc Update(UpdateRequest) returns (UpdateResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
   rpc Flush(FlushRequest) returns (FlushResponse);
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+  rpc ReleaseSnapshot(ReleaseSnapshotRequest) returns (ReleaseSnapshotResponse);
 }
 
 message WriteRequest {
@@ -21,6 +23,7 @@ message WriteResponse {
 
 message GetRequest {
   bytes key = 1;
+  uint64 snapshot_id = 2;
 }
 
 message GetResponse {
@@ -51,6 +54,23 @@ message DeleteResponse {
 message FlushRequest {}
 
 message FlushResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message CreateSnapshotRequest {}
+
+message CreateSnapshotResponse {
+  bool success = 1;
+  string message = 2;
+  uint64 snapshot_id = 3;
+}
+
+message ReleaseSnapshotRequest {
+  uint64 snapshot_id = 1;
+}
+
+message ReleaseSnapshotResponse {
   bool success = 1;
   string message = 2;
 }

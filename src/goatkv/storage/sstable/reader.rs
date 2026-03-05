@@ -198,6 +198,10 @@ impl SSTableReader {
         Ok(key)
     }
 
+    fn user_key_of_internal_key(raw_key: &[u8]) -> Option<&[u8]> {
+        raw_key.get(..raw_key.len().checked_sub(8)?)
+    }
+
     fn checksum_for_block(block: &[u8]) -> u32 {
         let mut hasher = Hasher::new();
         hasher.update(block);
@@ -704,6 +708,67 @@ impl SSTableReader {
         Ok(None)
     }
 
+    pub(crate) fn get_pinned_at_seq(
+        &self,
+        key: &[u8],
+        read_seq: u64,
+    ) -> GoatResult<Option<(InternalKey, PinnedValue)>> {
+        let probe_key = InternalKey::new(key.to_vec(), SEQUENCE_NUMBER_MAX, InternalKeyKind::Put);
+        let Some(start_block_index) = self.find_block_index_for_key(&probe_key.serialize()) else {
+            return Ok(None);
+        };
+        let mut seen_target_user_key = false;
+
+        for block_index in start_block_index..self.index_entries.len() {
+            if !self.may_contain_for_block(key, block_index)? {
+                continue;
+            }
+            let entry = &self.index_entries[block_index];
+            let block_payload =
+                self.load_data_block_payload(entry.block_offset, entry.block_size)?;
+            let block_search_index = self.load_block_search_index(block_index, &block_payload)?;
+            let block_reader =
+                BlockReader::with_search_index(block_payload.as_ref(), block_search_index)
+                    .map_err(|e| Self::corruption(format!("Failed to parse data block: {}", e)))?;
+
+            if let Some((internal_key, value_offset, value_len)) =
+                block_reader.get_by_user_key_with_value_range_at_seq(key, read_seq)
+            {
+                internal_key
+                    .kind()
+                    .map_err(|e| Self::corruption(format!("invalid internal key kind: {}", e)))?;
+                let pinned =
+                    PinnedValue::from_block(block_payload.clone(), value_offset, value_len)
+                        .ok_or_else(|| {
+                            Self::corruption(format!(
+                                "failed to pin value range: offset={}, len={}, block_len={}",
+                                value_offset,
+                                value_len,
+                                block_payload.len()
+                            ))
+                        })?;
+                return Ok(Some((internal_key, pinned)));
+            }
+
+            if block_reader.get_by_user_key_with_value_range(key).is_some() {
+                seen_target_user_key = true;
+                continue;
+            }
+
+            if seen_target_user_key {
+                return Ok(None);
+            }
+
+            if let Some(separator_user_key) = Self::user_key_of_internal_key(&entry.separator) {
+                if separator_user_key > key {
+                    return Ok(None);
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Full scan of all entries in this SSTable.
     pub fn scan_all(&self) -> GoatResult<Vec<(InternalKey, Vec<u8>)>> {
         let mut entries = Vec::new();
@@ -1023,6 +1088,53 @@ mod tests {
         assert!(result.is_ok());
         let value = result.unwrap();
         assert_eq!(value, None);
+    }
+
+    #[test]
+    fn test_sstable_reader_get_pinned_at_seq_returns_visible_version() {
+        let temp_dir = TempDir::new().unwrap();
+        let (_, sstable_paths, _) = KvEngine::init_db_paths(temp_dir.path()).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &sstable_paths, 0).unwrap();
+
+        for seq in (10u64..=30u64).rev() {
+            let internal_key = InternalKey::new(b"k1".to_vec(), seq, InternalKeyKind::Put);
+            builder
+                .write(&internal_key.serialize(), format!("v{}", seq).as_bytes())
+                .unwrap();
+        }
+        builder.finish().unwrap();
+
+        let reader = SSTableReader::open(sstable_paths.sstable_path_by_id(1)).unwrap();
+
+        let (internal_key, value) = reader.get_pinned_at_seq(b"k1", 25).unwrap().unwrap();
+        assert_eq!(internal_key.sequence_number(), 25);
+        assert_eq!(value.as_slice(), b"v25");
+
+        assert!(reader.get_pinned_at_seq(b"k1", 5).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_sstable_reader_get_pinned_at_seq_crosses_blocks() {
+        let temp_dir = TempDir::new().unwrap();
+        let (_, sstable_paths, _) = KvEngine::init_db_paths(temp_dir.path()).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &sstable_paths, 0).unwrap();
+
+        for seq in (1u64..=200u64).rev() {
+            let internal_key = InternalKey::new(b"k1".to_vec(), seq, InternalKeyKind::Put);
+            let value = vec![(seq % 251) as u8; 256];
+            builder.write(&internal_key.serialize(), &value).unwrap();
+        }
+        builder.finish().unwrap();
+
+        let reader = SSTableReader::open(sstable_paths.sstable_path_by_id(1)).unwrap();
+        assert!(
+            reader.index_entry_count() > 1,
+            "test requires multiple data blocks"
+        );
+
+        let (internal_key, value) = reader.get_pinned_at_seq(b"k1", 123).unwrap().unwrap();
+        assert_eq!(internal_key.sequence_number(), 123);
+        assert_eq!(value.as_slice(), vec![(123 % 251) as u8; 256].as_slice());
     }
 
     #[test]

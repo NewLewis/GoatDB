@@ -27,7 +27,13 @@ async fn test_rejects_empty_key_requests() {
         .unwrap_err();
     assert_eq!(status.code(), Code::InvalidArgument);
 
-    let status = client.get(GetRequest { key: vec![] }).await.unwrap_err();
+    let status = client
+        .get(GetRequest {
+            key: vec![],
+            snapshot_id: 0,
+        })
+        .await
+        .unwrap_err();
     assert_eq!(status.code(), Code::InvalidArgument);
 
     let status = client
@@ -78,6 +84,7 @@ async fn test_update_nonexistent_key_is_upsert() {
     let get_resp = client
         .get(GetRequest {
             key: b"missing_key".to_vec(),
+            snapshot_id: 0,
         })
         .await
         .unwrap()
@@ -105,7 +112,10 @@ async fn test_binary_and_large_value_roundtrip() {
         .await
         .unwrap();
     let resp = client
-        .get(GetRequest { key: binary_key })
+        .get(GetRequest {
+            key: binary_key,
+            snapshot_id: 0,
+        })
         .await
         .unwrap()
         .into_inner();
@@ -122,7 +132,10 @@ async fn test_binary_and_large_value_roundtrip() {
         .await
         .unwrap();
     let resp = client
-        .get(GetRequest { key: large_key })
+        .get(GetRequest {
+            key: large_key,
+            snapshot_id: 0,
+        })
         .await
         .unwrap()
         .into_inner();
@@ -174,6 +187,7 @@ async fn test_persistence_across_restart() {
     let resp = client
         .get(GetRequest {
             key: b"persist_key".to_vec(),
+            snapshot_id: 0,
         })
         .await
         .unwrap()
@@ -205,6 +219,7 @@ async fn test_delete_nonexistent_key_is_idempotent() {
     let get_resp = client
         .get(GetRequest {
             key: b"missing_key".to_vec(),
+            snapshot_id: 0,
         })
         .await
         .unwrap()
@@ -235,6 +250,7 @@ async fn test_flush_then_immediate_read_consistency() {
     let resp = client
         .get(GetRequest {
             key: b"flush_key".to_vec(),
+            snapshot_id: 0,
         })
         .await
         .unwrap()
@@ -275,6 +291,7 @@ async fn test_l0_newest_file_wins_on_overlap() {
     let resp = client
         .get(GetRequest {
             key: b"overlap_key".to_vec(),
+            snapshot_id: 0,
         })
         .await
         .unwrap()
@@ -301,6 +318,7 @@ async fn test_empty_flush_is_noop() {
     let resp = client
         .get(GetRequest {
             key: b"missing_key".to_vec(),
+            snapshot_id: 0,
         })
         .await
         .unwrap()
@@ -318,6 +336,7 @@ async fn test_empty_flush_is_noop() {
     let resp = client
         .get(GetRequest {
             key: b"after_empty_flush".to_vec(),
+            snapshot_id: 0,
         })
         .await
         .unwrap()

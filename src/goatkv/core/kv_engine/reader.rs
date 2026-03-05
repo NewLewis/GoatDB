@@ -32,6 +32,21 @@ impl KvReader {
         Self::get_from_version(&version, key).map(|result| result.map(|value| value.to_vec()))
     }
 
+    pub fn get_at_seq(&self, key: &[u8], read_seq: u64) -> GoatResult<Option<Vec<u8>>> {
+        let (mem_table, immutable_mem_tables, version) = self.snapshot_read_state();
+
+        if let Some(result) = Self::get_from_memtable_at_seq(&mem_table, key, read_seq)? {
+            return Ok(result.map(|value| value.to_vec()));
+        }
+        for entry in immutable_mem_tables.iter().rev() {
+            if let Some(result) = Self::get_from_immutable_at_seq(entry, key, read_seq)? {
+                return Ok(result.map(|value| value.to_vec()));
+            }
+        }
+        Self::get_from_version_at_seq(&version, key, read_seq)
+            .map(|result| result.map(|value| value.to_vec()))
+    }
+
     fn snapshot_read_state(
         &self,
     ) -> (
@@ -63,6 +78,23 @@ impl KvReader {
             .transpose()
     }
 
+    fn get_from_memtable_at_seq(
+        mem_table: &Arc<MemTable>,
+        key: &[u8],
+        read_seq: u64,
+    ) -> GoatResult<Option<Option<PinnedValue>>> {
+        mem_table
+            .get_pinned_at_seq(key, read_seq)
+            .map(|(internal_key, value)| {
+                Ok(if internal_key.kind()? == InternalKeyKind::Delete {
+                    None
+                } else {
+                    Some(PinnedValue::from_bytes(value))
+                })
+            })
+            .transpose()
+    }
+
     fn get_from_immutable(
         entry: &ImmutableMemTableEntry,
         key: &[u8],
@@ -80,8 +112,43 @@ impl KvReader {
             .transpose()
     }
 
+    fn get_from_immutable_at_seq(
+        entry: &ImmutableMemTableEntry,
+        key: &[u8],
+        read_seq: u64,
+    ) -> GoatResult<Option<Option<PinnedValue>>> {
+        entry
+            .table
+            .get_pinned_at_seq(key, read_seq)
+            .map(|(internal_key, value)| {
+                Ok(if internal_key.kind()? == InternalKeyKind::Delete {
+                    None
+                } else {
+                    Some(PinnedValue::from_bytes(value))
+                })
+            })
+            .transpose()
+    }
+
     fn get_from_version(version: &Arc<Version>, key: &[u8]) -> GoatResult<Option<PinnedValue>> {
         match version.get_pinned(key)? {
+            Some((internal_key, value)) => {
+                if internal_key.kind()? == InternalKeyKind::Delete {
+                    Ok(None)
+                } else {
+                    Ok(Some(value))
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn get_from_version_at_seq(
+        version: &Arc<Version>,
+        key: &[u8],
+        read_seq: u64,
+    ) -> GoatResult<Option<PinnedValue>> {
+        match version.get_pinned_at_seq(key, read_seq)? {
             Some((internal_key, value)) => {
                 if internal_key.kind()? == InternalKeyKind::Delete {
                     Ok(None)
