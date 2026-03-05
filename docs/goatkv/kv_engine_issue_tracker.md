@@ -24,6 +24,7 @@
 - 2026-03-04：完成 `P1-WRITE-STALL-BY-COMPACTION-PRESSURE` 修复与回归，新增 L0/pending-compaction 两级 slowdown/stop 策略、可配置阈值与写压状态转移日志；`cargo test --lib`、`cargo clippy --all-targets --all-features -- -D warnings` 通过。
 - 2026-03-04：启动 `P1-PREFIX-BLOOM-PARTITIONED-FILTER` 修复，已落地 prefix extractor 与 partitioned bloom/filter-index（按 data-block 分区并懒加载），待补充误报率与点查 miss 路径 benchmark。
 - 2026-03-04：完成 GoatKV vs RocksDB 读路径基准对齐：`randread(times=80,key_nums=20000,threads=16)` GoatKV `1542ms` vs RocksDB `436ms`（约慢 `3.54x`）；`hotread(times=120,key_nums=20000,hotset=512,threads=16)` GoatKV `1463ms` vs RocksDB `529ms`（约慢 `2.77x`）。基于代码走读新增 3 个待修复项：`P1-POINT-GET-HOTPATH-DECODE-COPY-AMPLIFICATION`、`P1-PINNED-READ-API-MISSING`、`P1-ROW-CACHE-MISSING`。
+- 2026-03-04：完成读路径阶段 3（block 内 user-key hash index + pinned value + row cache）并复测：`/tmp/goatkv_bench_cmp_stage3` 下 `randread(times=80,key_nums=20000,threads=16)` GoatKV `351ms` vs RocksDB `450ms`；`hotread(times=120,key_nums=20000,hotset=512,threads=16)` GoatKV `461ms` vs RocksDB `563ms`。对照 `row_cache=0`（`/tmp/goatkv_bench_cmp_stage3_norow`）GoatKV `randread=1557ms`、`hotread=1357ms`，确认热点收益主要来自 row cache 与 pinned 短路径。
 
 ## 问题清单
 
@@ -493,7 +494,7 @@
     - 2026-03-04：`SSTableReader` 已支持 partitioned bloom 解析与按分区懒加载，`may_contain/get` 复用 data-block 索引定位 filter 分区，避免 open 时一次性读取整段 bloom。
     - 2026-03-04：新增回归 `test_partitioned_bloom_respects_prefix_extractor`、`test_partitioned_bloom_loads_partitions_lazily`。
 
-- [ ] `P1-POINT-GET-HOTPATH-DECODE-COPY-AMPLIFICATION`
+- [x] `P1-POINT-GET-HOTPATH-DECODE-COPY-AMPLIFICATION`
   - 现象：点查命中路径会重复构建 `BlockReader`、重复解码 restart/entry，且 `decode_entry_at`/返回路径存在多次 `Vec` 拷贝。
   - 影响：在 table/block cache 命中较高时，读性能主要受 CPU 解码与内存拷贝限制，导致 randread/hotread 仍明显落后 RocksDB。
   - 代码定位：
@@ -511,8 +512,12 @@
     - 2026-03-04：阶段 2 完成：`BlockReader::get_by_user_key` 改为直接返回 `InternalKey`，去掉命中路径 `raw_internal_key -> decode_internal_key` 的二次解码与额外拷贝；`SSTableReader::get` 保留 kind 校验语义。
     - 2026-03-04：新增/回归验证通过：`cargo test --lib test_block_reader_get_by_user_key -- --nocapture`、`cargo test --lib test_sstable_reader_reuses_cached_block_search_index_for_hot_get -- --nocapture`、`cargo test --lib test_sstable_reader_reports_invalid_internal_key_kind -- --nocapture`。
     - 2026-03-04：基准复测（`/tmp/goatkv_bench_cmp_stage2`）`randread`：GoatKV `1768ms` vs RocksDB `466ms`（约 `3.79x`）；`hotread`：GoatKV `1600ms` vs RocksDB `560ms`（约 `2.86x`）。同目录 GoatKV 复测（`/tmp/goatkv_bench_cmp/goatkv`）`randread=1677ms`、`hotread=1746ms`；当前阶段尚未观察到稳定收益，保持 issue open。
+  - 关闭记录：
+    - 2026-03-04：`BlockSearchIndex` 新增 block 内 `user_key -> (InternalKey, value_range)` 哈希索引，`get_by_user_key` 优先走哈希命中，回退 restart/range 扫描。
+    - 2026-03-04：`SSTableReader::get_pinned` 改为消费 `value_range`，避免点查命中路径重复 entry 解码与 value 二次拷贝。
+    - 2026-03-04：`cargo test --lib` 全量通过（135/135）。
 
-- [ ] `P1-PINNED-READ-API-MISSING`
+- [x] `P1-PINNED-READ-API-MISSING`
   - 现象：当前引擎读接口统一返回 `Vec<u8>`，缺少 pinned/zero-copy 读取语义与生命周期管理接口。
   - 影响：热点读下即便 block cache 命中，仍需拷贝 value，放大内存带宽与分配开销。
   - 代码定位：
@@ -524,6 +529,10 @@
     - 增加引擎内部 pinned value 表达（如借用切片/引用计数块句柄）。
     - 在不破坏现有 API 的前提下提供 zero-copy 快路径（可先内部使用）。
     - 热点读 benchmark 显示单位请求拷贝字节下降。
+  - 关闭记录：
+    - 2026-03-04：新增 `PinnedValue` 内部表达（支持 `Arc<[u8]> + range`），`SSTableReader::get_pinned` 命中 block cache 时可零拷贝 pin value。
+    - 2026-03-04：`Version::get_pinned`、`KvReader`、`MemTable::get_pinned` 全链路接入 pinned 快路径；外部 `KvEngine::get` API 仍保持 `Vec<u8>` 兼容。
+    - 2026-03-04：`cargo test --lib` 全量通过（135/135）。
 
 - [ ] `P1-READAHEAD-ITERATOR-OPT`
   - 现象：SSTable 迭代读取仍按块同步拉取，缺少 readahead/prefetch 机制和顺序扫描专项优化。
@@ -551,7 +560,7 @@
     - 批量路径复用 table/block cache probe 与文件打开结果。
     - 增加 batch size 梯度基准，验证吞吐提升。
 
-- [ ] `P1-ROW-CACHE-MISSING`
+- [x] `P1-ROW-CACHE-MISSING`
   - 现象：当前读缓存仅覆盖 table cache 与 data block cache，缺少按 user key/value 结果缓存层。
   - 影响：热点 key 高命中场景仍需经历索引定位、块解码与版本过滤，无法获得与 RocksDB row cache 类似的短路径收益。
   - 代码定位：
@@ -562,6 +571,10 @@
     - 增加可配置 row cache（容量、命中/驱逐指标、与 snapshot/seq 可见性约束）。
     - 与现有 table/block cache 协同，避免重复缓存和不可控内存膨胀。
     - hotread benchmark 在热点 key 分布下有可量化提升。
+  - 关闭记录：
+    - 2026-03-04：新增可配置 `row_cache_capacity_bytes`（`KvEngineOptions`/`VersionSetOptions`）与 row cache 指标（`row_hit/miss/evict`），并接入 benchmark CLI 参数 `--row-cache-capacity-mb`。
+    - 2026-03-04：`Version` 读路径新增按 `(version_seqno, user_key)` 维度 row cache，满足 snapshot/可见性隔离；支持 miss 结果缓存（negative cache）。
+    - 2026-03-04：基准验证：`/tmp/goatkv_bench_cmp_stage3` 下 GoatKV `randread=351ms`、`hotread=461ms`；对照 `row_cache=0`（`/tmp/goatkv_bench_cmp_stage3_norow`）分别为 `1557ms`、`1357ms`。
 
 - [ ] `P1-PARALLEL-COMPACTION-SUBCOMPACTION`
   - 现象：当前 compaction 由单线程循环串行执行，未支持 subcompaction 并行拆分。
@@ -655,16 +668,13 @@
 1. `P1-OBSERVABILITY-HEALTH-GAP`
 2. `P1-ONDISK-FORMAT-VERSIONING-GAP`
 3. `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
-4. `P1-POINT-GET-HOTPATH-DECODE-COPY-AMPLIFICATION`
-5. `P1-PINNED-READ-API-MISSING`
-6. `P1-PREFIX-BLOOM-PARTITIONED-FILTER`
-7. `P1-ROW-CACHE-MISSING`
-8. `P1-READAHEAD-ITERATOR-OPT`
-9. `P1-MULTIGET-BATCH-READ-PATH`
-10. `P1-PARALLEL-COMPACTION-SUBCOMPACTION`
-11. `P1-PER-LEVEL-COMPRESSION`
-12. `P2-WAL-PREALLOC-BYTES-PER-SYNC`
-13. `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
+4. `P1-PREFIX-BLOOM-PARTITIONED-FILTER`
+5. `P1-READAHEAD-ITERATOR-OPT`
+6. `P1-MULTIGET-BATCH-READ-PATH`
+7. `P1-PARALLEL-COMPACTION-SUBCOMPACTION`
+8. `P1-PER-LEVEL-COMPRESSION`
+9. `P2-WAL-PREALLOC-BYTES-PER-SYNC`
+10. `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
 
 ## 逐项关闭记录（执行时填写）
 

@@ -45,6 +45,10 @@ struct Cli {
     #[arg(long, default_value_t = 64)]
     block_cache_capacity_mb: usize,
 
+    /// Row cache size for GoatKV in MB (0 disables row cache)
+    #[arg(long, default_value_t = 32)]
+    row_cache_capacity_mb: usize,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -530,15 +534,19 @@ fn goatkv_options_from_cli(cli: &Cli, base_dir: &Path) -> KvEngineOptions {
         .with_wal_sync(cli.wal_sync)
         .with_table_cache_capacity(cli.table_cache_capacity)
         .with_block_cache_capacity_bytes(cli.block_cache_capacity_mb.saturating_mul(1024 * 1024))
+        .with_row_cache_capacity_bytes(cli.row_cache_capacity_mb.saturating_mul(1024 * 1024))
 }
 
 fn print_cache_metrics(engine: &KvEngine) {
     if let Some(metrics) = engine.read_cache_metrics() {
         println!(
-            "cache_metrics table_hit={} table_miss={} table_evict={} block_hit={} block_miss={} block_evict={}",
+            "cache_metrics table_hit={} table_miss={} table_evict={} row_hit={} row_miss={} row_evict={} block_hit={} block_miss={} block_evict={}",
             metrics.table_hits,
             metrics.table_misses,
             metrics.table_evictions,
+            metrics.row_hits,
+            metrics.row_misses,
+            metrics.row_evictions,
             metrics.block_hits,
             metrics.block_misses,
             metrics.block_evictions,

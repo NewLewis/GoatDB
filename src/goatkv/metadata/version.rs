@@ -5,7 +5,9 @@ use std::sync::Arc;
 use crate::goatkv::error::{Error as GoatError, ErrorKind as GoatErrorKind, Result as GoatResult};
 use crate::goatkv::format::internal_key::InternalKey;
 use crate::goatkv::metadata::file_metadata::FileMetadata;
-use crate::goatkv::storage::sstable::{ReadCacheMetrics, SSTableReader, TableCache};
+use crate::goatkv::storage::sstable::{
+    PinnedValue, ReadCacheMetrics, RowCacheValue, SSTableReader, TableCache,
+};
 use crate::goatkv::utils::paths::SstablePaths;
 
 /// Version 代表某一时刻数据库的完整状态
@@ -127,8 +129,25 @@ impl Version {
 
     /// 查找包含指定 key 的 SSTable
     /// 返回 (level, file_meta) 如果找到
-    // todo table cache
     pub fn get(&self, key: &[u8]) -> GoatResult<Option<(InternalKey, Vec<u8>)>> {
+        self.get_pinned(key)
+            .map(|result| result.map(|(internal_key, value)| (internal_key, value.to_vec())))
+    }
+
+    pub(crate) fn get_pinned(&self, key: &[u8]) -> GoatResult<Option<(InternalKey, PinnedValue)>> {
+        if let Some(cached) = self.get_cached_row(key) {
+            return Ok(cached);
+        }
+
+        let result = self.load_from_sstables_pinned(key)?;
+        self.cache_row_result(key, &result);
+        Ok(result)
+    }
+
+    fn load_from_sstables_pinned(
+        &self,
+        key: &[u8],
+    ) -> GoatResult<Option<(InternalKey, PinnedValue)>> {
         // 先检查 Level 0
         // Level 0 文件可能重叠，必须从最新的 SSTable 开始查找，避免返回旧值
         for file in self.files[0].iter().rev() {
@@ -141,7 +160,7 @@ impl Version {
                     .open_sstable_reader(file.file_id, sstable_path)
                     .map_err(|e| Self::map_sstable_open_err(sstable_path, e))?;
                 match reader
-                    .get(key)
+                    .get_pinned(key)
                     .map_err(|e| Self::map_sstable_read_err(sstable_path, e))?
                 {
                     Some(result) => return Ok(Some(result)),
@@ -158,12 +177,38 @@ impl Version {
                     .open_sstable_reader(file.file_id, sstable_path)
                     .map_err(|e| Self::map_sstable_open_err(sstable_path, e))?;
                 return reader
-                    .get(key)
+                    .get_pinned(key)
                     .map_err(|e| Self::map_sstable_read_err(sstable_path, e));
             }
         }
 
         Ok(None)
+    }
+
+    fn get_cached_row(&self, key: &[u8]) -> Option<Option<(InternalKey, PinnedValue)>> {
+        let cache = self.table_cache.as_ref()?;
+        let cached = cache.row_cache_get(self.creation_seqno, key)?;
+        match cached {
+            RowCacheValue::Hit {
+                internal_key,
+                value,
+            } => Some(Some((internal_key, PinnedValue::from_bytes(value)))),
+            RowCacheValue::Miss => Some(None),
+        }
+    }
+
+    fn cache_row_result(&self, key: &[u8], result: &Option<(InternalKey, PinnedValue)>) {
+        let Some(cache) = self.table_cache.as_ref() else {
+            return;
+        };
+        let cached = match result {
+            Some((internal_key, value)) => RowCacheValue::Hit {
+                internal_key: internal_key.clone(),
+                value: bytes::Bytes::copy_from_slice(value.as_slice()),
+            },
+            None => RowCacheValue::Miss,
+        };
+        cache.row_cache_insert(self.creation_seqno, key, cached);
     }
 
     /// 在指定层级（非 Level 0）中查找包含 key 的文件

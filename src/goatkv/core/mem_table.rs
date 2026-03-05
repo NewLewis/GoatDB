@@ -28,7 +28,12 @@ impl MemTableInner {
 
     /// 获取值
     pub fn get(&self, key: &[u8]) -> Option<(InternalKey, Vec<u8>)> {
-        match self.seek(key) {
+        self.get_pinned(key)
+            .map(|(internal_key, value)| (internal_key, value.to_vec()))
+    }
+
+    pub fn get_pinned(&self, key: &[u8]) -> Option<(InternalKey, Bytes)> {
+        match self.seek_pinned(key) {
             Some((inter_key, value)) => {
                 if inter_key.user_key() == key {
                     Some((inter_key, value))
@@ -42,11 +47,17 @@ impl MemTableInner {
 
     /// 查找键值对，返回 (InternalKey, value) 元组
     pub fn seek(&self, key: &[u8]) -> Option<(InternalKey, Vec<u8>)> {
+        self.seek_pinned(key)
+            .map(|(internal_key, value)| (internal_key, value.to_vec()))
+    }
+
+    /// 查找键值对，返回 (InternalKey, Bytes) 元组（零拷贝克隆）。
+    pub fn seek_pinned(&self, key: &[u8]) -> Option<(InternalKey, Bytes)> {
         self.skiplist
             .read()
             .unwrap()
             .seek(key)
-            .map(|(k, v)| (k.clone(), v.clone().into()))
+            .map(|(k, v)| (k.clone(), v.clone()))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (InternalKey, Bytes)> + '_ {
@@ -116,9 +127,17 @@ impl MemTable {
         self.inner.get(key)
     }
 
+    pub fn get_pinned(&self, key: &[u8]) -> Option<(InternalKey, Bytes)> {
+        self.inner.get_pinned(key)
+    }
+
     /// 查找键值对，返回 (InternalKey, value) 元组
     pub fn seek(&self, key: &[u8]) -> Option<(InternalKey, Vec<u8>)> {
         self.inner.seek(key)
+    }
+
+    pub fn seek_pinned(&self, key: &[u8]) -> Option<(InternalKey, Bytes)> {
+        self.inner.seek_pinned(key)
     }
 
     /// 是否需要 flush 到 immutable memtable
@@ -158,9 +177,17 @@ impl ImmutableMemTable {
         self.inner.get(key)
     }
 
+    pub fn get_pinned(&self, key: &[u8]) -> Option<(InternalKey, Bytes)> {
+        self.inner.get_pinned(key)
+    }
+
     /// 查找键值对，返回 (InternalKey, value) 元组
     pub fn seek(&self, key: &[u8]) -> Option<(InternalKey, Vec<u8>)> {
         self.inner.seek(key)
+    }
+
+    pub fn seek_pinned(&self, key: &[u8]) -> Option<(InternalKey, Bytes)> {
+        self.inner.seek_pinned(key)
     }
 
     pub fn len(&self) -> usize {

@@ -117,6 +117,9 @@ pub struct VersionSetOptions {
 
     /// Block cache 容量（字节，0 表示禁用 block cache）
     pub block_cache_capacity_bytes: usize,
+
+    /// Row cache 容量（字节，0 表示禁用 row cache）
+    pub row_cache_capacity_bytes: usize,
 }
 
 impl Default for VersionSetOptions {
@@ -128,6 +131,7 @@ impl Default for VersionSetOptions {
             num_levels: 7,
             table_cache_capacity: 64,
             block_cache_capacity_bytes: 64 * 1024 * 1024,
+            row_cache_capacity_bytes: 32 * 1024 * 1024,
         }
     }
 }
@@ -141,6 +145,7 @@ impl From<&KvEngineOptions> for VersionSetOptions {
             num_levels: options.num_levels,
             table_cache_capacity: options.table_cache_capacity,
             block_cache_capacity_bytes: options.block_cache_capacity_bytes,
+            row_cache_capacity_bytes: options.row_cache_capacity_bytes,
         }
     }
 }
@@ -163,15 +168,18 @@ impl VersionSet {
         options: VersionSetOptions,
         obsolete_sender: UnboundedSender<CleanupTask>,
     ) -> GoatResult<Self> {
-        let table_cache =
-            if options.table_cache_capacity == 0 && options.block_cache_capacity_bytes == 0 {
-                None
-            } else {
-                Some(Arc::new(TableCache::new(
-                    options.table_cache_capacity,
-                    options.block_cache_capacity_bytes,
-                )))
-            };
+        let table_cache = if options.table_cache_capacity == 0
+            && options.block_cache_capacity_bytes == 0
+            && options.row_cache_capacity_bytes == 0
+        {
+            None
+        } else {
+            Some(Arc::new(TableCache::new(
+                options.table_cache_capacity,
+                options.block_cache_capacity_bytes,
+                options.row_cache_capacity_bytes,
+            )))
+        };
 
         // 创建空的当前版本：没有任何 SSTable
         let current = Arc::new(Version::new_with_cache(

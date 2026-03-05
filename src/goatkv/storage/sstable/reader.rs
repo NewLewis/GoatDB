@@ -4,6 +4,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use bytes::Bytes;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
@@ -56,6 +57,66 @@ struct PartitionedBloomFilter {
     prefix_extractor_len: usize,
     partitions: Vec<BloomPartitionIndexEntry>,
     loaded_partitions: Mutex<HashMap<usize, Arc<BloomFilter>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PinnedValue {
+    repr: PinnedValueRepr,
+}
+
+#[derive(Debug, Clone)]
+enum PinnedValueRepr {
+    Shared {
+        payload: Arc<[u8]>,
+        offset: usize,
+        len: usize,
+    },
+    Owned(Bytes),
+}
+
+impl PinnedValue {
+    pub(crate) fn from_block(payload: Arc<[u8]>, offset: usize, len: usize) -> Option<Self> {
+        let end = offset.checked_add(len)?;
+        if end > payload.len() {
+            return None;
+        }
+        Some(Self {
+            repr: PinnedValueRepr::Shared {
+                payload,
+                offset,
+                len,
+            },
+        })
+    }
+
+    pub(crate) fn from_bytes(bytes: Bytes) -> Self {
+        Self {
+            repr: PinnedValueRepr::Owned(bytes),
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        match &self.repr {
+            PinnedValueRepr::Shared {
+                payload,
+                offset,
+                len,
+            } => &payload[*offset..(*offset + *len)],
+            PinnedValueRepr::Owned(bytes) => bytes.as_ref(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.as_slice().to_vec()
+    }
 }
 
 /// SSTable 读取器，用于读取和查询 SSTable 文件
@@ -535,11 +596,7 @@ impl SSTableReader {
         Ok(block_data)
     }
 
-    fn load_data_block_payload(
-        &self,
-        block_offset: u64,
-        block_size: u64,
-    ) -> GoatResult<Arc<Vec<u8>>> {
+    fn load_data_block_payload(&self, block_offset: u64, block_size: u64) -> GoatResult<Arc<[u8]>> {
         if let (Some(file_id), Some(block_cache)) = (self.file_id, self.block_cache.as_ref()) {
             let cache_key = BlockCacheKey::new(file_id, block_offset, block_size);
             if let Some(payload) = block_cache.get(&cache_key) {
@@ -551,14 +608,14 @@ impl SSTableReader {
         }
 
         let block_data = self.read_block_from_file(block_offset, block_size)?;
-        let block_payload = Self::verify_block_checksum(&block_data, "data block")?.to_vec();
-        Ok(Arc::new(block_payload))
+        let block_payload = Self::verify_block_checksum(&block_data, "data block")?;
+        Ok(Arc::from(block_payload.to_vec().into_boxed_slice()))
     }
 
     fn load_block_search_index(
         &self,
         block_index: usize,
-        block_payload: &Arc<Vec<u8>>,
+        block_payload: &Arc<[u8]>,
     ) -> GoatResult<Arc<BlockSearchIndex>> {
         let Some(slot) = self.block_search_indexes.get(block_index) else {
             return Err(Self::corruption(format!(
@@ -572,7 +629,7 @@ impl SSTableReader {
         }
 
         let parsed = Arc::new(
-            BlockReader::parse_search_index(block_payload.as_slice()).map_err(|e| {
+            BlockReader::parse_search_index(block_payload.as_ref()).map_err(|e| {
                 Self::corruption(format!("Failed to parse data block index: {}", e))
             })?,
         );
@@ -582,6 +639,11 @@ impl SSTableReader {
 
     /// 在 SSTable 中查找指定的 key (UserKey)
     pub fn get(&self, key: &[u8]) -> GoatResult<Option<(InternalKey, Vec<u8>)>> {
+        self.get_pinned(key)
+            .map(|opt| opt.map(|(internal_key, value)| (internal_key, value.to_vec())))
+    }
+
+    pub(crate) fn get_pinned(&self, key: &[u8]) -> GoatResult<Option<(InternalKey, PinnedValue)>> {
         let probe_key = InternalKey::new(key.to_vec(), SEQUENCE_NUMBER_MAX, InternalKeyKind::Put);
 
         let block_info = self.find_block_for_key(&probe_key.serialize());
@@ -602,7 +664,7 @@ impl SSTableReader {
 
         // 4. 在数据块中查找 key
         let block_reader =
-            match BlockReader::with_search_index(block_payload.as_slice(), block_search_index) {
+            match BlockReader::with_search_index(block_payload.as_ref(), block_search_index) {
                 Ok(reader) => reader,
                 Err(e) => {
                     return Err(Self::corruption(format!(
@@ -612,11 +674,31 @@ impl SSTableReader {
                 }
             };
 
-        if let Some((internal_key, value)) = block_reader.get_by_user_key(key) {
+        if let Some((internal_key, value_offset, value_len)) =
+            block_reader.get_by_user_key_with_value_range(key)
+        {
             internal_key
                 .kind()
                 .map_err(|e| Self::corruption(format!("invalid internal key kind: {}", e)))?;
-            return Ok(Some((internal_key, value)));
+            let end = value_offset.saturating_add(value_len);
+            if end > block_payload.len() {
+                return Err(Self::corruption(format!(
+                    "value range out of data block bounds: offset={}, len={}, block_len={}",
+                    value_offset,
+                    value_len,
+                    block_payload.len()
+                )));
+            }
+            let pinned = PinnedValue::from_block(block_payload.clone(), value_offset, value_len)
+                .ok_or_else(|| {
+                    Self::corruption(format!(
+                        "failed to pin value range: offset={}, len={}, block_len={}",
+                        value_offset,
+                        value_len,
+                        block_payload.len()
+                    ))
+                })?;
+            return Ok(Some((internal_key, pinned)));
         }
 
         Ok(None)
@@ -628,7 +710,7 @@ impl SSTableReader {
         for entry in &self.index_entries {
             let block_payload =
                 self.load_data_block_payload(entry.block_offset, entry.block_size)?;
-            let block_reader = BlockReader::new(block_payload.as_slice()).map_err(|e| {
+            let block_reader = BlockReader::new(block_payload.as_ref()).map_err(|e| {
                 Self::corruption(format!("Failed to parse data block during scan: {}", e))
             })?;
             for (k, v) in block_reader.iter() {
@@ -781,7 +863,7 @@ impl SSTableScanIterator {
             let block_payload = self
                 .reader
                 .load_data_block_payload(entry.block_offset, entry.block_size)?;
-            let block_reader = BlockReader::new(block_payload.as_slice()).map_err(|e| {
+            let block_reader = BlockReader::new(block_payload.as_ref()).map_err(|e| {
                 SSTableReader::corruption(format!("Failed to parse data block during scan: {}", e))
             })?;
 

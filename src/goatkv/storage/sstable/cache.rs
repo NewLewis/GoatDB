@@ -4,18 +4,25 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::goatkv::error::Result as GoatResult;
+use crate::goatkv::format::internal_key::InternalKey;
+use bytes::Bytes;
 
 use super::reader::SSTableReader;
 
 const TABLE_CACHE_MAX_SHARDS: usize = 16;
 const BLOCK_CACHE_MAX_SHARDS: usize = 16;
+const ROW_CACHE_MAX_SHARDS: usize = 16;
 const MIN_BLOCK_BYTES_PER_SHARD: usize = 64 * 1024;
+const MIN_ROW_BYTES_PER_SHARD: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReadCacheMetrics {
     pub table_hits: u64,
     pub table_misses: u64,
     pub table_evictions: u64,
+    pub row_hits: u64,
+    pub row_misses: u64,
+    pub row_evictions: u64,
     pub block_hits: u64,
     pub block_misses: u64,
     pub block_evictions: u64,
@@ -26,6 +33,7 @@ pub struct TableCache {
     capacity: usize,
     shards: Vec<RwLock<TableCacheState>>,
     shard_capacities: Vec<usize>,
+    row_cache: Arc<RowCache>,
     block_cache: Arc<BlockCache>,
     table_hits: AtomicU64,
     table_misses: AtomicU64,
@@ -147,7 +155,11 @@ impl TableCacheState {
 }
 
 impl TableCache {
-    pub fn new(capacity: usize, block_cache_capacity_bytes: usize) -> Self {
+    pub fn new(
+        capacity: usize,
+        block_cache_capacity_bytes: usize,
+        row_cache_capacity_bytes: usize,
+    ) -> Self {
         let table_shard_count = if capacity == 0 {
             1
         } else {
@@ -162,6 +174,7 @@ impl TableCache {
             capacity,
             shards,
             shard_capacities,
+            row_cache: Arc::new(RowCache::new(row_cache_capacity_bytes)),
             block_cache: Arc::new(BlockCache::new(block_cache_capacity_bytes)),
             table_hits: AtomicU64::new(0),
             table_misses: AtomicU64::new(0),
@@ -225,14 +238,311 @@ impl TableCache {
     }
 
     pub fn metrics(&self) -> ReadCacheMetrics {
+        let row = self.row_cache.metrics();
         let block = self.block_cache.metrics();
         ReadCacheMetrics {
             table_hits: self.table_hits.load(Ordering::Relaxed),
             table_misses: self.table_misses.load(Ordering::Relaxed),
             table_evictions: self.table_evictions.load(Ordering::Relaxed),
+            row_hits: row.row_hits,
+            row_misses: row.row_misses,
+            row_evictions: row.row_evictions,
             block_hits: block.block_hits,
             block_misses: block.block_misses,
             block_evictions: block.block_evictions,
+        }
+    }
+
+    pub(crate) fn row_cache_get(
+        &self,
+        version_seqno: u64,
+        user_key: &[u8],
+    ) -> Option<RowCacheValue> {
+        self.row_cache.get(version_seqno, user_key)
+    }
+
+    pub(crate) fn row_cache_insert(
+        &self,
+        version_seqno: u64,
+        user_key: &[u8],
+        value: RowCacheValue,
+    ) {
+        self.row_cache.insert(version_seqno, user_key, value);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum RowCacheValue {
+    Hit {
+        internal_key: InternalKey,
+        value: Bytes,
+    },
+    Miss,
+}
+
+impl RowCacheValue {
+    fn estimated_bytes(&self) -> usize {
+        match self {
+            RowCacheValue::Hit {
+                internal_key,
+                value,
+            } => internal_key.user_key().len() + std::mem::size_of::<u64>() + value.len(),
+            RowCacheValue::Miss => 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RowCache {
+    capacity_bytes: usize,
+    shards: Vec<RwLock<RowCacheState>>,
+    shard_capacities: Vec<usize>,
+    row_hits: AtomicU64,
+    row_misses: AtomicU64,
+    row_evictions: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct RowCacheState {
+    used_bytes: usize,
+    entries: HashMap<RowCacheKey, RowCacheEntry>,
+    clock_keys: Vec<RowCacheKey>,
+    hand: usize,
+}
+
+impl RowCacheState {
+    fn mark_hit(&self, key: &RowCacheKey) -> Option<RowCacheValue> {
+        let entry = self.entries.get(key)?;
+        entry.referenced.store(true, Ordering::Relaxed);
+        entry.hot.store(true, Ordering::Relaxed);
+        Some(entry.value.clone())
+    }
+
+    fn insert_or_update(&mut self, key: RowCacheKey, value: RowCacheValue, bytes: usize) {
+        if let Some(entry) = self.entries.get_mut(&key) {
+            self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
+            self.used_bytes = self.used_bytes.saturating_add(bytes);
+            entry.value = value;
+            entry.bytes = bytes;
+            entry.referenced.store(true, Ordering::Relaxed);
+            entry.hot.store(true, Ordering::Relaxed);
+            return;
+        }
+
+        self.used_bytes = self.used_bytes.saturating_add(bytes);
+        self.entries.insert(
+            key.clone(),
+            RowCacheEntry {
+                value,
+                bytes,
+                referenced: AtomicBool::new(true),
+                hot: AtomicBool::new(false),
+            },
+        );
+        self.clock_keys.push(key);
+    }
+
+    fn advance_hand(&mut self) {
+        if self.clock_keys.is_empty() {
+            self.hand = 0;
+        } else {
+            self.hand = (self.hand + 1) % self.clock_keys.len();
+        }
+    }
+
+    fn remove_hand_slot(&mut self) {
+        if self.clock_keys.is_empty() {
+            self.hand = 0;
+            return;
+        }
+        self.clock_keys.swap_remove(self.hand);
+        if self.hand >= self.clock_keys.len() && !self.clock_keys.is_empty() {
+            self.hand = 0;
+        }
+    }
+
+    fn evict_one(&mut self) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+
+        let max_scan = self.clock_keys.len().saturating_mul(3).max(1);
+        for _ in 0..max_scan {
+            if self.clock_keys.is_empty() {
+                return false;
+            }
+            if self.hand >= self.clock_keys.len() {
+                self.hand = 0;
+            }
+            let key = self.clock_keys[self.hand].clone();
+            let mut should_evict = false;
+            let mut missing = false;
+
+            match self.entries.get(&key) {
+                Some(entry) => {
+                    if entry.referenced.swap(false, Ordering::Relaxed)
+                        || entry.hot.swap(false, Ordering::Relaxed)
+                    {
+                        self.advance_hand();
+                    } else {
+                        should_evict = true;
+                    }
+                }
+                None => {
+                    missing = true;
+                }
+            }
+
+            if missing {
+                self.remove_hand_slot();
+                continue;
+            }
+
+            if should_evict {
+                if let Some(removed) = self.entries.remove(&key) {
+                    self.used_bytes = self.used_bytes.saturating_sub(removed.bytes);
+                }
+                self.remove_hand_slot();
+                return true;
+            }
+        }
+
+        while !self.clock_keys.is_empty() {
+            if self.hand >= self.clock_keys.len() {
+                self.hand = 0;
+            }
+            let key = self.clock_keys[self.hand].clone();
+            self.remove_hand_slot();
+            if let Some(removed) = self.entries.remove(&key) {
+                self.used_bytes = self.used_bytes.saturating_sub(removed.bytes);
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RowCacheKey {
+    version_seqno: u64,
+    user_key: Vec<u8>,
+}
+
+impl RowCacheKey {
+    fn new(version_seqno: u64, user_key: &[u8]) -> Self {
+        Self {
+            version_seqno,
+            user_key: user_key.to_vec(),
+        }
+    }
+
+    fn shard_hash(&self) -> u64 {
+        // 64-bit FNV-1a mix.
+        let mut hash = 0xcbf2_9ce4_8422_2325u64 ^ self.version_seqno.rotate_left(17);
+        for b in self.user_key.iter().copied() {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+        hash
+    }
+}
+
+#[derive(Debug)]
+struct RowCacheEntry {
+    value: RowCacheValue,
+    bytes: usize,
+    referenced: AtomicBool,
+    hot: AtomicBool,
+}
+
+impl RowCache {
+    fn new(capacity_bytes: usize) -> Self {
+        let shard_count = shard_count_for_bytes(
+            capacity_bytes,
+            MIN_ROW_BYTES_PER_SHARD,
+            ROW_CACHE_MAX_SHARDS,
+        );
+        let shard_capacities = split_capacity(capacity_bytes, shard_count);
+        let shards = (0..shard_count)
+            .map(|_| RwLock::new(RowCacheState::default()))
+            .collect();
+
+        Self {
+            capacity_bytes,
+            shards,
+            shard_capacities,
+            row_hits: AtomicU64::new(0),
+            row_misses: AtomicU64::new(0),
+            row_evictions: AtomicU64::new(0),
+        }
+    }
+
+    fn shard_index(&self, key: &RowCacheKey) -> usize {
+        shard_index_from_u64(key.shard_hash(), self.shards.len())
+    }
+
+    fn get(&self, version_seqno: u64, user_key: &[u8]) -> Option<RowCacheValue> {
+        if self.capacity_bytes == 0 {
+            self.row_misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
+        let cache_key = RowCacheKey::new(version_seqno, user_key);
+        let shard_idx = self.shard_index(&cache_key);
+        if self.shard_capacities[shard_idx] == 0 {
+            self.row_misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
+        let state = self.shards[shard_idx].read().unwrap();
+        if let Some(value) = state.mark_hit(&cache_key) {
+            self.row_hits.fetch_add(1, Ordering::Relaxed);
+            Some(value)
+        } else {
+            self.row_misses.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+
+    fn insert(&self, version_seqno: u64, user_key: &[u8], value: RowCacheValue) {
+        if self.capacity_bytes == 0 {
+            return;
+        }
+
+        let key = RowCacheKey::new(version_seqno, user_key);
+        let bytes = key
+            .user_key
+            .len()
+            .saturating_add(value.estimated_bytes())
+            .saturating_add(std::mem::size_of::<RowCacheEntry>());
+
+        let shard_idx = self.shard_index(&key);
+        let shard_capacity = self.shard_capacities[shard_idx];
+        if shard_capacity == 0 || bytes > shard_capacity {
+            return;
+        }
+
+        let mut state = self.shards[shard_idx].write().unwrap();
+        state.insert_or_update(key, value, bytes);
+        while state.used_bytes > shard_capacity {
+            if !state.evict_one() {
+                break;
+            }
+            self.row_evictions.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn metrics(&self) -> ReadCacheMetrics {
+        ReadCacheMetrics {
+            table_hits: 0,
+            table_misses: 0,
+            table_evictions: 0,
+            row_hits: self.row_hits.load(Ordering::Relaxed),
+            row_misses: self.row_misses.load(Ordering::Relaxed),
+            row_evictions: self.row_evictions.load(Ordering::Relaxed),
+            block_hits: 0,
+            block_misses: 0,
+            block_evictions: 0,
         }
     }
 }
@@ -256,14 +566,14 @@ struct BlockCacheState {
 }
 
 impl BlockCacheState {
-    fn mark_hit(&self, key: &BlockCacheKey) -> Option<Arc<Vec<u8>>> {
+    fn mark_hit(&self, key: &BlockCacheKey) -> Option<Arc<[u8]>> {
         let entry = self.entries.get(key)?;
         entry.referenced.store(true, Ordering::Relaxed);
         entry.hot.store(true, Ordering::Relaxed);
         Some(entry.payload.clone())
     }
 
-    fn insert_or_update(&mut self, key: BlockCacheKey, payload: Arc<Vec<u8>>, bytes: usize) {
+    fn insert_or_update(&mut self, key: BlockCacheKey, payload: Arc<[u8]>, bytes: usize) {
         if let Some(entry) = self.entries.get_mut(&key) {
             self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
             self.used_bytes = self.used_bytes.saturating_add(bytes);
@@ -396,7 +706,7 @@ impl BlockCacheKey {
 
 #[derive(Debug)]
 struct BlockCacheEntry {
-    payload: Arc<Vec<u8>>,
+    payload: Arc<[u8]>,
     bytes: usize,
     referenced: AtomicBool,
     hot: AtomicBool,
@@ -404,7 +714,11 @@ struct BlockCacheEntry {
 
 impl BlockCache {
     fn new(capacity_bytes: usize) -> Self {
-        let block_shard_count = shard_count_for_bytes(capacity_bytes);
+        let block_shard_count = shard_count_for_bytes(
+            capacity_bytes,
+            MIN_BLOCK_BYTES_PER_SHARD,
+            BLOCK_CACHE_MAX_SHARDS,
+        );
         let shard_capacities = split_capacity(capacity_bytes, block_shard_count);
         let shards = (0..block_shard_count)
             .map(|_| RwLock::new(BlockCacheState::default()))
@@ -424,7 +738,7 @@ impl BlockCache {
         shard_index_from_u64(key.shard_hash(), self.shards.len())
     }
 
-    pub(crate) fn get(&self, key: &BlockCacheKey) -> Option<Arc<Vec<u8>>> {
+    pub(crate) fn get(&self, key: &BlockCacheKey) -> Option<Arc<[u8]>> {
         if self.capacity_bytes == 0 {
             self.block_misses.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -446,8 +760,8 @@ impl BlockCache {
         }
     }
 
-    pub(crate) fn insert(&self, key: BlockCacheKey, payload: Vec<u8>) -> Arc<Vec<u8>> {
-        let payload = Arc::new(payload);
+    pub(crate) fn insert(&self, key: BlockCacheKey, payload: Vec<u8>) -> Arc<[u8]> {
+        let payload: Arc<[u8]> = Arc::from(payload.into_boxed_slice());
         let bytes = payload.len();
         if self.capacity_bytes == 0 {
             return payload;
@@ -477,6 +791,9 @@ impl BlockCache {
             table_hits: 0,
             table_misses: 0,
             table_evictions: 0,
+            row_hits: 0,
+            row_misses: 0,
+            row_evictions: 0,
             block_hits: self.block_hits.load(Ordering::Relaxed),
             block_misses: self.block_misses.load(Ordering::Relaxed),
             block_evictions: self.block_evictions.load(Ordering::Relaxed),
@@ -498,12 +815,16 @@ fn split_capacity(total: usize, shards: usize) -> Vec<usize> {
     caps
 }
 
-fn shard_count_for_bytes(total_bytes: usize) -> usize {
+fn shard_count_for_bytes(
+    total_bytes: usize,
+    min_bytes_per_shard: usize,
+    max_shards: usize,
+) -> usize {
     if total_bytes == 0 {
         return 1;
     }
-    let by_size = (total_bytes / MIN_BLOCK_BYTES_PER_SHARD).max(1);
-    by_size.clamp(1, BLOCK_CACHE_MAX_SHARDS)
+    let by_size = (total_bytes / min_bytes_per_shard.max(1)).max(1);
+    by_size.clamp(1, max_shards.max(1))
 }
 
 fn shard_index_from_u64(hash: u64, shard_count: usize) -> usize {
@@ -542,7 +863,7 @@ mod tests {
     fn table_cache_reports_hits_and_evictions() {
         let (_d1, p1) = build_sstable(1);
         let (_d2, p2) = build_sstable(2);
-        let cache = TableCache::new(1, 0);
+        let cache = TableCache::new(1, 0, 0);
 
         let _r1 = cache.get_or_open(1, &p1).unwrap();
         let _r1_again = cache.get_or_open(1, &p1).unwrap();
@@ -557,7 +878,7 @@ mod tests {
     #[test]
     fn block_cache_reports_hit_after_warmup() {
         let (_dir, path) = build_sstable(7);
-        let cache = TableCache::new(2, 8 * 1024 * 1024);
+        let cache = TableCache::new(2, 8 * 1024 * 1024, 0);
         let reader = cache.get_or_open(7, &path).unwrap();
 
         let key = b"k03".to_vec();
@@ -572,7 +893,7 @@ mod tests {
     #[test]
     fn table_cache_can_be_disabled() {
         let (_dir, path) = build_sstable(8);
-        let cache = TableCache::new(0, 0);
+        let cache = TableCache::new(0, 0, 0);
         let _ = cache.get_or_open(8, &path).unwrap();
         let _ = cache.get_or_open(8, &path).unwrap();
         let metrics = cache.metrics();

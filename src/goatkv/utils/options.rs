@@ -102,6 +102,10 @@ pub struct KvEngineOptions {
     /// Default: 64MB
     pub block_cache_capacity_bytes: usize,
 
+    /// Maximum bytes for row cache (point-get result cache).
+    /// Default: 32MB
+    pub row_cache_capacity_bytes: usize,
+
     // ===== VersionSet Options =====
     /// 保留的历史版本数量
     /// Default: 10
@@ -185,6 +189,7 @@ impl Default for KvEngineOptions {
             flush_failure_streak_limit: 3,
             table_cache_capacity: 64,
             block_cache_capacity_bytes: 64 * 1024 * 1024,
+            row_cache_capacity_bytes: 32 * 1024 * 1024,
             // VersionSet defaults
             max_versions: 10,
             manifest_max_size: 32 * 1024 * 1024, // 32MB
@@ -318,6 +323,12 @@ impl KvEngineOptions {
         self
     }
 
+    /// Sets row cache capacity in bytes.
+    pub fn with_row_cache_capacity_bytes(mut self, capacity_bytes: usize) -> Self {
+        self.row_cache_capacity_bytes = capacity_bytes;
+        self
+    }
+
     /// Sets the maximum number of versions to keep in history
     pub fn with_max_versions(mut self, max: usize) -> Self {
         self.max_versions = max;
@@ -442,6 +453,7 @@ impl KvEngineOptions {
             flush_failure_streak_limit: 3,
             table_cache_capacity: 64,
             block_cache_capacity_bytes: 64 * 1024 * 1024,
+            row_cache_capacity_bytes: 32 * 1024 * 1024,
             // VersionSet defaults (use same defaults as production)
             max_versions: 10,
             manifest_max_size: 32 * 1024 * 1024, // 32MB
@@ -532,6 +544,12 @@ mod tests {
     fn test_with_block_cache_capacity_bytes() {
         let options = KvEngineOptions::default().with_block_cache_capacity_bytes(8 * 1024 * 1024);
         assert_eq!(options.block_cache_capacity_bytes, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_with_row_cache_capacity_bytes() {
+        let options = KvEngineOptions::default().with_row_cache_capacity_bytes(4 * 1024 * 1024);
+        assert_eq!(options.row_cache_capacity_bytes, 4 * 1024 * 1024);
     }
 
     #[test]
