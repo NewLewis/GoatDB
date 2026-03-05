@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 
 use crate::goatkv::core::lsm_state::{ImmutableMemTableEntry, LSMState};
@@ -50,10 +50,18 @@ impl KvReader {
     pub fn multi_get(&self, keys: &[Vec<u8>]) -> GoatResult<Vec<Option<Vec<u8>>>> {
         let (mem_table, immutable_mem_tables, version) = self.snapshot_read_state();
         let mut results = Vec::with_capacity(keys.len());
+        let mut memo: HashMap<Vec<u8>, Option<Vec<u8>>> = HashMap::new();
 
         for key in keys {
+            if let Some(cached) = memo.get(key) {
+                results.push(cached.clone());
+                continue;
+            }
+
             if let Some(result) = Self::get_from_memtable(&mem_table, key)? {
-                results.push(result.map(|value| value.to_vec()));
+                let resolved = result.map(|value| value.to_vec());
+                memo.insert(key.clone(), resolved.clone());
+                results.push(resolved);
                 continue;
             }
 
@@ -65,11 +73,14 @@ impl KvReader {
                 }
             }
             if let Some(result) = found {
+                memo.insert(key.clone(), result.clone());
                 results.push(result);
                 continue;
             }
 
-            results.push(Self::get_from_version(&version, key)?.map(|value| value.to_vec()));
+            let resolved = Self::get_from_version(&version, key)?.map(|value| value.to_vec());
+            memo.insert(key.clone(), resolved.clone());
+            results.push(resolved);
         }
 
         Ok(results)

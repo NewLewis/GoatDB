@@ -965,6 +965,37 @@ mod tests {
     }
 
     #[test]
+    fn test_multi_get_reuses_results_for_duplicate_keys() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"dup".to_vec(), b"v_dup".to_vec()).unwrap();
+        engine.put(b"other".to_vec(), b"v_other".to_vec()).unwrap();
+
+        let keys = vec![
+            b"dup".to_vec(),
+            b"dup".to_vec(),
+            b"missing".to_vec(),
+            b"dup".to_vec(),
+            b"other".to_vec(),
+            b"other".to_vec(),
+        ];
+        let results = engine.multi_get(&keys).unwrap();
+        assert_eq!(
+            results,
+            vec![
+                Some(b"v_dup".to_vec()),
+                Some(b"v_dup".to_vec()),
+                None,
+                Some(b"v_dup".to_vec()),
+                Some(b"v_other".to_vec()),
+                Some(b"v_other".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
     fn test_update_existing_key() {
         let rt = test_runtime();
         let _guard = rt.enter();

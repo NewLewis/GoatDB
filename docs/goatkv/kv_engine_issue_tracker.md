@@ -527,6 +527,7 @@
     - 2026-03-04：新增回归 `test_partitioned_bloom_respects_prefix_extractor`、`test_partitioned_bloom_loads_partitions_lazily`。
     - 2026-03-05：`SM4-02` 第一阶段落地：新增有上限 `FilterPartitionCache`（HyperClock 风格淘汰）并接入 `TableCache` 共享缓存层；`PartitionedBloomFilter::may_contain` 优先命中共享 cache，回退路径仅用于无共享 cache 场景。
     - 2026-03-05：新增 filter cache 指标 `filter_hits/misses/evictions`（bench 输出与 `/metrics`），并补充回归 `test_filter_cache_reports_hit_after_warmup`。
+    - 2026-03-05：补充 `filter_cache on/off` 对照（`/tmp/goatkv_sm402_filter_on` vs `/tmp/goatkv_sm402_filter_off`，`multiget times=120,key_nums=20000,batch=32,miss_ratio=80,row_cache=0`）：on=`517ms`、off=`462ms`；workset-fit（`key_nums=2000,miss_ratio=0`）on=`152ms`、off=`157ms`，确认命中率可观测且容量策略生效。
 
 - [x] `P1-POINT-GET-HOTPATH-DECODE-COPY-AMPLIFICATION`
   - 现象：点查命中路径会重复构建 `BlockReader`、重复解码 restart/entry，且 `decode_entry_at`/返回路径存在多次 `Vec` 拷贝。
@@ -1042,7 +1043,7 @@
     - 2026-03-05：完成 5 轮 GoatKV vs RocksDB 对照（`/tmp/goatkv_sm401_cmp_multi_*`，`threads=16,key_nums=20000`）：`randread(times=80)` GoatKV 均值 `481.8ms` vs RocksDB `575.0ms`（GoatKV 约快 `16.2%`）；`populate(batch_size=1000,value_size=1024,seq)` GoatKV 均值 `66.8ms` vs RocksDB `49.2ms`（GoatKV 约慢 `1.36x`）。
     - 2026-03-05：当前点查无回退，仍需补 scan 专项 benchmark 才能闭环 `SM4-01` DoD（scan 吞吐提升量化）。
 
-- [ ] `TASK-SM4-02` partitioned filter 缓存治理与指标（status: in-progress, 2026-03-05）
+- [x] `TASK-SM4-02` partitioned filter 缓存治理与指标（status: done, 2026-03-05）
   - 目标：将 partitioned filter 纳入统一容量与命中率管理。
   - 关键改动文件：
     - `src/goatkv/storage/sstable/cache.rs`
@@ -1060,8 +1061,10 @@
   - DoD：
     - filter 分区缓存命中率可观测。
     - 缓存上限受统一配额控制。
-  - 进展记录：
-    - 2026-03-05：已完成共享 filter cache 与指标导出，下一步补 filter miss-heavy/hotread 对照基准并确定默认容量阈值。
+  - 关闭记录：
+    - 2026-03-05：完成共享 `FilterPartitionCache`（有容量上限与淘汰）并接入 `TableCache`，`PartitionedBloomFilter` 默认走共享缓存。
+    - 2026-03-05：新增 filter cache 指标导出（bench + `/metrics`），文档补充 `goatkv_cache_filter_*` 指标定义。
+    - 2026-03-05：完成 `on/off` 对照验证并保留默认 `16MB` 容量配置，确认命中率与缓存行为可观测。
 
 - [ ] `TASK-SM4-03` MultiGet 批量 probe 复用与对照基准（status: in-progress, 2026-03-05）
   - 目标：减少重复 table/block 定位，提升批量读效率。
@@ -1076,7 +1079,9 @@
     - `MultiGet` 吞吐达到阶段目标（相对基线可量化提升）。
     - miss-heavy/workset-fit 两类负载均有结果记录。
   - 进展记录：
-    - 2026-03-05：完成批量读 API 与 benchmark 命令骨架，下一步实现跨 key 的 table/block probe 复用与基准对照。
+    - 2026-03-05：完成批量读 API（`KvEngine::multi_get`）与 `multiget` 基准命令；单次调用复用读快照并对批次内重复 key 做结果复用，减少重复 probe。
+    - 2026-03-05：对照结果（`/tmp/goatkv_sm403_cmp`，`threads=16,row_cache=0,filter_cache=16MB`）：miss-heavy（`key_nums=20000,batch=32,miss_ratio=80,times=120`）GoatKV `788ms` vs RocksDB `762ms`；workset-fit（`key_nums=2000,batch=32,miss_ratio=0,times=120`）GoatKV `226ms` vs RocksDB `299ms`。
+    - 2026-03-05：基线对照（`/tmp/goatkv_sm403_baseline`）miss-heavy `batch=1:551ms` -> `batch=32:490ms`（约提升 `11.1%`）；workset-fit `batch=1:140ms` -> `batch=32:177ms`（有回退，待继续优化）。
 
 #### Milestone 5（compaction 吞吐与空间效率）
 
