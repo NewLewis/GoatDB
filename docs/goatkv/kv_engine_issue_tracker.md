@@ -1034,6 +1034,8 @@
     - scan 吞吐提升且点查（single get）不回退超阈值。
   - 进展记录：
     - 2026-03-05：迭代器预取代码与单元回归已落地，待补基准对照验证吞吐收益与点查回归门槛。
+    - 2026-03-05：完成 5 轮 GoatKV vs RocksDB 对照（`/tmp/goatkv_sm401_cmp_multi_*`，`threads=16,key_nums=20000`）：`randread(times=80)` GoatKV 均值 `481.8ms` vs RocksDB `575.0ms`（GoatKV 约快 `16.2%`）；`populate(batch_size=1000,value_size=1024,seq)` GoatKV 均值 `66.8ms` vs RocksDB `49.2ms`（GoatKV 约慢 `1.36x`）。
+    - 2026-03-05：当前点查无回退，仍需补 scan 专项 benchmark 才能闭环 `SM4-01` DoD（scan 吞吐提升量化）。
 
 - [ ] `TASK-SM4-02` partitioned filter 缓存治理与指标（status: planned）
   - 目标：将 partitioned filter 纳入统一容量与命中率管理。
