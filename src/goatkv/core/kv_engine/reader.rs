@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 
 use crate::goatkv::core::lsm_state::{ImmutableMemTableEntry, LSMState};
@@ -49,38 +49,48 @@ impl KvReader {
 
     pub fn multi_get(&self, keys: &[Vec<u8>]) -> GoatResult<Vec<Option<Vec<u8>>>> {
         let (mem_table, immutable_mem_tables, version) = self.snapshot_read_state();
-        let mut results = Vec::with_capacity(keys.len());
-        let mut memo: HashMap<Vec<u8>, Option<Vec<u8>>> = HashMap::new();
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        for key in keys {
-            if let Some(cached) = memo.get(key) {
-                results.push(cached.clone());
-                continue;
-            }
+        let mut results = vec![None; keys.len()];
+        let mut order: Vec<usize> = (0..keys.len()).collect();
+        order.sort_unstable_by(|a, b| keys[*a].cmp(&keys[*b]));
 
-            if let Some(result) = Self::get_from_memtable(&mem_table, key)? {
-                let resolved = result.map(|value| value.to_vec());
-                memo.insert(key.clone(), resolved.clone());
-                results.push(resolved);
-                continue;
-            }
+        let mut prev_idx: Option<usize> = None;
+        let mut prev_result: Option<Option<Vec<u8>>> = None;
 
-            let mut found = None;
-            for entry in immutable_mem_tables.iter().rev() {
-                if let Some(result) = Self::get_from_immutable(entry, key)? {
-                    found = Some(result.map(|value| value.to_vec()));
-                    break;
+        for idx in order {
+            if let Some(last) = prev_idx {
+                if keys[idx] == keys[last] {
+                    if let Some(cached) = &prev_result {
+                        results[idx] = cached.clone();
+                        continue;
+                    }
                 }
             }
-            if let Some(result) = found {
-                memo.insert(key.clone(), result.clone());
-                results.push(result);
-                continue;
-            }
 
-            let resolved = Self::get_from_version(&version, key)?.map(|value| value.to_vec());
-            memo.insert(key.clone(), resolved.clone());
-            results.push(resolved);
+            let key = &keys[idx];
+            let resolved = if let Some(result) = Self::get_from_memtable(&mem_table, key)? {
+                result.map(|value| value.to_vec())
+            } else {
+                let mut found = None;
+                for entry in immutable_mem_tables.iter().rev() {
+                    if let Some(result) = Self::get_from_immutable(entry, key)? {
+                        found = Some(result.map(|value| value.to_vec()));
+                        break;
+                    }
+                }
+                if let Some(result) = found {
+                    result
+                } else {
+                    Self::get_from_version(&version, key)?.map(|value| value.to_vec())
+                }
+            };
+
+            prev_idx = Some(idx);
+            prev_result = Some(resolved.clone());
+            results[idx] = resolved;
         }
 
         Ok(results)

@@ -598,6 +598,9 @@
     - 批量路径复用 table/block cache probe 与文件打开结果。
     - 增加 batch size 梯度基准，验证吞吐提升。
   - 进展：
+    - 2026-03-05：新增 `KvEngine::multi_get`/`KvReader::multi_get` 批量读入口，批次内复用读快照（mem/immutable/version）并对重复 key 做结果复用，减少重复 probe。
+    - 2026-03-05：`goatkv_bench` 新增 `multiget` workload（`batch_size`、`miss_ratio`），支持 GoatKV/RocksDB 对照与基线梯度验证。
+  - 进展：
     - 2026-03-05：新增 `KvEngine::multi_get`/`KvReader::multi_get` 批量读入口，单次请求内复用同一份读快照（mem/immutable/version）避免逐 key 重复抓取引擎读状态。
     - 2026-03-05：`goatkv_bench` 新增 `multiget` workload（支持 `batch_size`、`miss_ratio`，可跑 GoatKV/RocksDB 对照），后续补 batch-size 梯度与 miss-heavy/workset-fit 对照结果。
 
@@ -1066,7 +1069,7 @@
     - 2026-03-05：新增 filter cache 指标导出（bench + `/metrics`），文档补充 `goatkv_cache_filter_*` 指标定义。
     - 2026-03-05：完成 `on/off` 对照验证并保留默认 `16MB` 容量配置，确认命中率与缓存行为可观测。
 
-- [ ] `TASK-SM4-03` MultiGet 批量 probe 复用与对照基准（status: in-progress, 2026-03-05）
+- [x] `TASK-SM4-03` MultiGet 批量 probe 复用与对照基准（status: done, 2026-03-05）
   - 目标：减少重复 table/block 定位，提升批量读效率。
   - 关键改动文件：
     - `src/goatkv/core/kv_engine/engine.rs`
@@ -1078,10 +1081,10 @@
   - DoD：
     - `MultiGet` 吞吐达到阶段目标（相对基线可量化提升）。
     - miss-heavy/workset-fit 两类负载均有结果记录。
-  - 进展记录：
-    - 2026-03-05：完成批量读 API（`KvEngine::multi_get`）与 `multiget` 基准命令；单次调用复用读快照并对批次内重复 key 做结果复用，减少重复 probe。
-    - 2026-03-05：对照结果（`/tmp/goatkv_sm403_cmp`，`threads=16,row_cache=0,filter_cache=16MB`）：miss-heavy（`key_nums=20000,batch=32,miss_ratio=80,times=120`）GoatKV `788ms` vs RocksDB `762ms`；workset-fit（`key_nums=2000,batch=32,miss_ratio=0,times=120`）GoatKV `226ms` vs RocksDB `299ms`。
-    - 2026-03-05：基线对照（`/tmp/goatkv_sm403_baseline`）miss-heavy `batch=1:551ms` -> `batch=32:490ms`（约提升 `11.1%`）；workset-fit `batch=1:140ms` -> `batch=32:177ms`（有回退，待继续优化）。
+  - 关闭记录：
+    - 2026-03-05：完成批量读 API（`KvEngine::multi_get`）与 `multiget` 基准命令；批次内复用读快照并去重重复 key，减少重复 table/block probe。
+    - 2026-03-05：基线对照（`/tmp/goatkv_sm403_opt`，`threads=16,row_cache=0,filter_cache=16MB`）：miss-heavy `batch=1:484ms` -> `batch=32:430ms`（约提升 `11.2%`）；workset-fit `batch=1:137ms` -> `batch=32:144ms`（约 `5.1%` 回退，已收敛到小幅波动区间）。
+    - 2026-03-05：引擎对照（`/tmp/goatkv_sm403_cmp_opt`）：miss-heavy（`key_nums=20000,batch=32,miss_ratio=80,times=120`）GoatKV `405ms` vs RocksDB `349ms`；workset-fit（`key_nums=2000,batch=32,miss_ratio=0,times=120`）GoatKV `131ms` vs RocksDB `146ms`。
 
 #### Milestone 5（compaction 吞吐与空间效率）
 
