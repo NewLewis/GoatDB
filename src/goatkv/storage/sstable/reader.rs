@@ -32,6 +32,7 @@ const FOOTER_FORMAT_MARKER: [u8; 4] = *b"GKFV";
 const FOOTER_FORMAT_METADATA_SIZE: usize = 8;
 const SSTABLE_FORMAT_VERSION_LEGACY: u8 = 0;
 const SSTABLE_FORMAT_VERSION_CURRENT: u8 = 1;
+const SCAN_ITERATOR_DEFAULT_READAHEAD_BLOCKS: usize = 2;
 
 /// SSTable 文件的索引条目
 #[derive(Debug, Clone)]
@@ -929,15 +930,22 @@ pub struct SSTableScanIterator {
     reader: SSTableReader,
     block_index: usize,
     pending_entries: VecDeque<(InternalKey, Vec<u8>)>,
+    prefetched_blocks: HashMap<usize, Arc<[u8]>>,
+    readahead_blocks: usize,
 }
 
 impl SSTableScanIterator {
     fn new(reader: SSTableReader) -> Self {
-        Self {
+        let max_upcoming = reader.index_entries.len().saturating_sub(1);
+        let mut iter = Self {
             reader,
             block_index: 0,
             pending_entries: VecDeque::new(),
-        }
+            prefetched_blocks: HashMap::new(),
+            readahead_blocks: SCAN_ITERATOR_DEFAULT_READAHEAD_BLOCKS.min(max_upcoming),
+        };
+        iter.prefetch_upcoming_blocks();
+        iter
     }
 
     pub fn next_entry(&mut self) -> GoatResult<Option<(InternalKey, Vec<u8>)>> {
@@ -950,10 +958,7 @@ impl SSTableScanIterator {
                 return Ok(None);
             }
 
-            let entry = &self.reader.index_entries[self.block_index];
-            let block_payload = self
-                .reader
-                .load_data_block_payload(entry.block_offset, entry.block_size)?;
+            let block_payload = self.load_block_payload(self.block_index)?;
             let block_reader = BlockReader::new(block_payload.as_ref()).map_err(|e| {
                 SSTableReader::corruption(format!("Failed to parse data block during scan: {}", e))
             })?;
@@ -964,7 +969,52 @@ impl SSTableScanIterator {
                     .push_back((SSTableReader::decode_internal_key(&k)?, v));
             }
             self.block_index += 1;
+            self.prefetch_upcoming_blocks();
         }
+    }
+
+    fn load_block_payload(&mut self, block_index: usize) -> GoatResult<Arc<[u8]>> {
+        if let Some(payload) = self.prefetched_blocks.remove(&block_index) {
+            return Ok(payload);
+        }
+        let entry = &self.reader.index_entries[block_index];
+        self.reader
+            .load_data_block_payload(entry.block_offset, entry.block_size)
+    }
+
+    fn prefetch_upcoming_blocks(&mut self) {
+        if self.readahead_blocks == 0 {
+            return;
+        }
+        self.prefetched_blocks
+            .retain(|idx, _| *idx >= self.block_index);
+
+        let start = self.block_index.saturating_add(1);
+        let end = start
+            .saturating_add(self.readahead_blocks)
+            .min(self.reader.index_entries.len());
+        for idx in start..end {
+            if self.prefetched_blocks.contains_key(&idx) {
+                continue;
+            }
+            let entry = &self.reader.index_entries[idx];
+            if let Ok(payload) = self
+                .reader
+                .load_data_block_payload(entry.block_offset, entry.block_size)
+            {
+                self.prefetched_blocks.insert(idx, payload);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn prefetched_block_count_for_test(&self) -> usize {
+        self.prefetched_blocks.len()
+    }
+
+    #[cfg(test)]
+    fn readahead_blocks_for_test(&self) -> usize {
+        self.readahead_blocks
     }
 }
 
@@ -1077,6 +1127,71 @@ mod tests {
 
         // 检查是否读取了所有条目
         assert_eq!(all_entries.len(), test_data.len());
+    }
+
+    #[test]
+    fn test_scan_iterator_prefetches_upcoming_blocks() {
+        let temp_dir = TempDir::new().unwrap();
+        let (_, sstable_paths, _) = KvEngine::init_db_paths(temp_dir.path()).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &sstable_paths, 0).unwrap();
+
+        let total_entries = 240usize;
+        for i in 0..total_entries {
+            let key = format!("scan_readahead_key_{:04}", i);
+            let value = vec![b'x'; 1024];
+            let internal_key = InternalKey::new(key.into_bytes(), i as u64, InternalKeyKind::Put);
+            builder.write(&internal_key.serialize(), &value).unwrap();
+        }
+        builder.finish().unwrap();
+
+        let reader = SSTableReader::open(sstable_paths.sstable_path_by_id(1)).unwrap();
+        assert!(
+            reader.index_entry_count() > 1,
+            "test requires multiple data blocks"
+        );
+        let mut iter = reader.into_scan_iterator();
+        assert!(
+            iter.readahead_blocks_for_test() > 0,
+            "readahead should be enabled for multi-block sstable"
+        );
+        assert!(
+            iter.prefetched_block_count_for_test() > 0,
+            "iterator should prefetch upcoming blocks at startup"
+        );
+
+        let mut seen = 0usize;
+        while let Some((_key, _value)) = iter.next_entry().unwrap() {
+            seen += 1;
+            if seen == 1 {
+                assert!(
+                    iter.prefetched_block_count_for_test() > 0,
+                    "iterator should keep prefetched upcoming blocks while scanning"
+                );
+            }
+        }
+        assert_eq!(seen, total_entries);
+    }
+
+    #[test]
+    fn test_scan_iterator_disables_readahead_for_single_block_sstable() {
+        let temp_dir = TempDir::new().unwrap();
+        let (_, sstable_paths, _) = KvEngine::init_db_paths(temp_dir.path()).unwrap();
+        let mut builder = SSTableBuilder::new_with_manager(1, &sstable_paths, 0).unwrap();
+
+        let key = InternalKey::new(b"single_block_key".to_vec(), 1, InternalKeyKind::Put);
+        builder
+            .write(&key.serialize(), b"single_block_value")
+            .unwrap();
+        builder.finish().unwrap();
+
+        let reader = SSTableReader::open(sstable_paths.sstable_path_by_id(1)).unwrap();
+        assert_eq!(reader.index_entry_count(), 1);
+
+        let mut iter = reader.into_scan_iterator();
+        assert_eq!(iter.readahead_blocks_for_test(), 0);
+        assert_eq!(iter.prefetched_block_count_for_test(), 0);
+        assert!(iter.next_entry().unwrap().is_some());
+        assert!(iter.next_entry().unwrap().is_none());
     }
 
     #[test]

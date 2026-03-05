@@ -578,6 +578,9 @@
     - 引入扫描路径 readahead/prefetch 策略（可配阈值）。
     - 减少顺序扫描中的重复 decode/读取开销。
     - scan benchmark 吞吐提升且点查延迟不回退。
+  - 进展：
+    - 2026-03-05：`SSTableScanIterator` 新增 block 级 readahead/prefetch（默认预取 2 个 upcoming blocks），优先消费预取块并滚动补充后续块。
+    - 2026-03-05：新增回归 `test_scan_iterator_prefetches_upcoming_blocks`、`test_scan_iterator_disables_readahead_for_single_block_sstable`，验证多块预取与单块退化行为。
 
 - [ ] `P1-MULTIGET-BATCH-READ-PATH`
   - 现象：对外接口与内部读路径以单 key 查询为主，缺少 MultiGet 批量探测/复用路径。
@@ -1019,16 +1022,18 @@
 
 #### Milestone 4（读路径剩余优化）
 
-- [ ] `TASK-SM4-01` Iterator readahead/prefetch（status: planned）
+- [ ] `TASK-SM4-01` Iterator readahead/prefetch（status: in-progress, 2026-03-05）
   - 目标：提升长扫描吞吐，降低块读取抖动。
   - 关键改动文件：
-    - `src/goatkv/storage/sstable/iterator.rs`
-    - `src/goatkv/storage/block_cache/`
+    - `src/goatkv/storage/sstable/reader.rs`
+    - `docs/goatkv/kv_engine_issue_tracker.md`
   - 回归命令：
-    - `cargo test --lib --tests`
+    - `cargo test --lib goatkv::storage::sstable::reader::tests`
     - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine goatkv --wal-sync randread`
   - DoD：
     - scan 吞吐提升且点查（single get）不回退超阈值。
+  - 进展记录：
+    - 2026-03-05：迭代器预取代码与单元回归已落地，待补基准对照验证吞吐收益与点查回归门槛。
 
 - [ ] `TASK-SM4-02` partitioned filter 缓存治理与指标（status: planned）
   - 目标：将 partitioned filter 纳入统一容量与命中率管理。
