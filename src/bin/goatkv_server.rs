@@ -1,8 +1,11 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use std::{collections::HashSet, fs};
 
 use clap::{ArgAction, Parser};
 use goat_db::goatkv::core::kv_engine::KvEngine;
+use goat_db::goatkv::server::health::{run_http_health_server, HealthState};
 use goat_db::goatkv::utils::{init_logging, KvEngineOptions};
 use goat_db::goatkv::{Error as GoatError, Result as GoatResult};
 use goatkv::{
@@ -11,7 +14,7 @@ use goatkv::{
     FlushResponse, GetRequest, GetResponse, ReleaseSnapshotRequest, ReleaseSnapshotResponse,
     UpdateRequest, UpdateResponse, WriteRequest, WriteResponse,
 };
-use tokio::signal;
+use tokio::{signal, sync::watch, time::sleep};
 use tonic::{
     transport::{Certificate, Identity, Server, ServerTlsConfig},
     Request, Response, Status,
@@ -236,6 +239,8 @@ struct Args {
     address: String,
     #[arg(short, long, help = "Data directory (default: ./goatdb_data)")]
     data_dir: Option<String>,
+    #[arg(long, help = "HTTP health probe listen address, e.g. 127.0.0.1:18080")]
+    health_address: Option<String>,
     #[arg(
         long,
         default_value_t = 0,
@@ -261,6 +266,8 @@ struct Args {
     )]
     auth_token: Vec<String>,
 }
+
+const HEALTH_DRAIN_WINDOW_MS: u64 = 250;
 
 fn parse_bearer_token(value: &str) -> Option<&str> {
     let (scheme, token) = value.split_once(' ')?;
@@ -379,9 +386,21 @@ async fn main() -> GoatResult<()> {
     // 解析命令行参数
     let args = Args::parse();
 
-    let addr = args.address.parse().map_err(|e| {
+    let addr: SocketAddr = args.address.parse().map_err(|e| {
         GoatError::invalid_argument("address", format!("invalid listen address: {}", e))
     })?;
+    let health_addr = args
+        .health_address
+        .as_ref()
+        .map(|value| {
+            value.parse::<SocketAddr>().map_err(|e| {
+                GoatError::invalid_argument(
+                    "health_address",
+                    format!("invalid health listen address: {}", e),
+                )
+            })
+        })
+        .transpose()?;
 
     // 创建 KvEngine，使用指定的数据目录或默认值
     let mut options = KvEngineOptions::default();
@@ -424,6 +443,30 @@ async fn main() -> GoatResult<()> {
         authorize_request(request, auth_tokens_for_interceptor.as_ref())
     });
 
+    let health_state = Arc::new(HealthState::new());
+    let mut health_shutdown_tx: Option<watch::Sender<bool>> = None;
+    let mut health_server_task = None;
+    if let Some(health_addr) = health_addr {
+        let listener = tokio::net::TcpListener::bind(health_addr)
+            .await
+            .map_err(|e| GoatError::io("health_probe_bind", e))?;
+        let bound_addr = listener
+            .local_addr()
+            .map_err(|e| GoatError::io("health_probe_local_addr", e))?;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let state = Arc::clone(&health_state);
+        health_server_task = Some(tokio::spawn(async move {
+            run_http_health_server(listener, state, shutdown_rx).await
+        }));
+        health_shutdown_tx = Some(shutdown_tx);
+        info!(
+            "Health probe listening on http://{} (/livez, /readyz)",
+            bound_addr
+        );
+    } else {
+        info!("Health probe disabled (no --health-address provided)");
+    }
+
     let mut server_builder = Server::builder();
     if let Some((tls, mtls_enabled)) = tls_config {
         server_builder = server_builder.tls_config(tls).map_err(|e| {
@@ -440,22 +483,38 @@ async fn main() -> GoatResult<()> {
 
     info!("gRPC Server listening on {}", addr);
     info!("Starting server...");
+    health_state.set_ready(true);
+    let health_state_for_shutdown = Arc::clone(&health_state);
 
     let serve_result = server_builder
         .add_service(service)
-        .serve_with_shutdown(addr, async {
+        .serve_with_shutdown(addr, async move {
             match signal::ctrl_c().await {
                 Ok(()) => info!("Received Ctrl+C, initiating graceful shutdown"),
                 Err(e) => warn!("Failed to listen for Ctrl+C signal: {}", e),
             }
+            health_state_for_shutdown.set_ready(false);
+            sleep(Duration::from_millis(HEALTH_DRAIN_WINDOW_MS)).await;
         })
         .await;
 
     info!("gRPC server stopped accepting new requests");
+    health_state.set_ready(false);
     if let Err(e) = engine.shutdown() {
         warn!("Engine graceful shutdown failed: {}", e);
     } else {
         info!("Engine graceful shutdown completed");
+    }
+    health_state.set_live(false);
+    if let Some(shutdown_tx) = health_shutdown_tx {
+        let _ = shutdown_tx.send(true);
+    }
+    if let Some(task) = health_server_task {
+        match task.await {
+            Ok(Ok(())) => info!("Health probe server stopped"),
+            Ok(Err(e)) => warn!("Health probe server stopped with IO error: {}", e),
+            Err(e) => warn!("Health probe task join error: {}", e),
+        }
     }
 
     serve_result.map_err(|e| {
@@ -482,6 +541,7 @@ mod tests {
         Args {
             address: "127.0.0.1:50051".to_string(),
             data_dir: None,
+            health_address: None,
             wal_preallocate_bytes: 0,
             wal_bytes_per_sync: 0,
             tls_cert_path: cert.map(str::to_string),

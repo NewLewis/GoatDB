@@ -78,6 +78,11 @@ path = "tests/e2e/snapshot_test.rs"
 harness = true
 
 [[test]]
+name = "e2e_health"
+path = "tests/e2e/health_test.rs"
+harness = true
+
+[[test]]
 name = "integration_recovery"
 path = "tests/integration/recovery_test.rs"
 harness = true

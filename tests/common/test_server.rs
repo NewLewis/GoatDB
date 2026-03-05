@@ -23,6 +23,7 @@ pub mod goatkv {
 #[derive(Debug)]
 pub struct TestServerOptions {
     pub port: Option<u16>,
+    pub health_port: Option<u16>,
     pub data_dir: Option<PathBuf>,
     pub show_logs: bool,
     pub capture_stderr: bool,
@@ -32,6 +33,7 @@ impl Default for TestServerOptions {
     fn default() -> Self {
         Self {
             port: None,
+            health_port: None,
             data_dir: None,
             show_logs: true, // 临时启用日志以便调试
             capture_stderr: true,
@@ -43,6 +45,7 @@ impl Default for TestServerOptions {
 pub struct TestServer {
     pub process: Child,
     pub address: String,
+    pub health_address: Option<String>,
     #[allow(dead_code)]
     pub data_dir: PathBuf,
     #[allow(dead_code)]
@@ -63,6 +66,7 @@ impl TestServer {
         std::fs::create_dir_all(&data_dir_path).unwrap();
         let options = TestServerOptions {
             port: None,
+            health_port: None,
             data_dir: Some(data_dir_path),
             show_logs: false,
             capture_stderr: true,
@@ -73,10 +77,18 @@ impl TestServer {
 
     /// 使用自定义选项启动测试服务器
     pub async fn start_with_options(opts: TestServerOptions) -> Self {
-        let port = opts.port.unwrap_or_else(find_free_port);
+        let TestServerOptions {
+            port,
+            health_port,
+            data_dir,
+            show_logs,
+            capture_stderr,
+        } = opts;
+        let port = port.unwrap_or_else(find_free_port);
         let address = format!("127.0.0.1:{}", port);
+        let health_bind_addr = health_port.map(|port| format!("127.0.0.1:{}", port));
 
-        let (data_dir_path, temp_dir) = match opts.data_dir {
+        let (data_dir_path, temp_dir) = match data_dir {
             Some(path) => {
                 std::fs::create_dir_all(&path).unwrap();
                 (path, None)
@@ -89,7 +101,7 @@ impl TestServer {
         };
 
         // 构建命令行参数
-        let args = vec![
+        let mut args = vec![
             "run".to_string(),
             "--bin".to_string(),
             "goatkv_server".to_string(),
@@ -99,11 +111,15 @@ impl TestServer {
             "--data-dir".to_string(),
             data_dir_path.to_str().unwrap().to_string(),
         ];
+        if let Some(health_addr) = health_bind_addr.as_ref() {
+            args.push("--health-address".to_string());
+            args.push(health_addr.clone());
+        }
 
         // 决定stderr的处理方式
-        let stderr_handle = if opts.capture_stderr {
+        let stderr_handle = if capture_stderr {
             Stdio::piped()
-        } else if opts.show_logs {
+        } else if show_logs {
             Stdio::inherit()
         } else {
             Stdio::null()
@@ -113,7 +129,7 @@ impl TestServer {
         let mut command = Command::new("cargo");
         command.args(&args);
 
-        if opts.show_logs {
+        if show_logs {
             command.stdout(Stdio::inherit());
         } else {
             command.stdout(Stdio::null());
@@ -124,7 +140,7 @@ impl TestServer {
         let mut process = command.spawn().expect("Failed to start test server");
 
         // 如果是管道模式，获取stderr管道
-        let mut stderr_pipe = if opts.capture_stderr {
+        let mut stderr_pipe = if capture_stderr {
             process.stderr.take()
         } else {
             None
@@ -172,6 +188,7 @@ impl TestServer {
         Self {
             process,
             address: server_url,
+            health_address: health_bind_addr.map(|addr| format!("http://{}", addr)),
             data_dir: data_dir_path,
             temp_dir,
             stderr_output: Some(stderr_output),
@@ -246,6 +263,27 @@ impl TestServer {
         let _ = self.process.kill();
     }
 
+    /// 发送 SIGINT，触发服务端优雅停机流程（Unix）。
+    pub fn send_sigint(&self) {
+        #[cfg(unix)]
+        {
+            let status = Command::new("kill")
+                .arg("-INT")
+                .arg(self.process.id().to_string())
+                .status()
+                .expect("failed to invoke kill -INT");
+            assert!(status.success(), "kill -INT command failed");
+        }
+        #[cfg(not(unix))]
+        {
+            panic!("send_sigint is only supported on unix");
+        }
+    }
+
+    pub fn health_address(&self) -> Option<&str> {
+        self.health_address.as_deref()
+    }
+
     /// 获取服务器进程的标准错误输出
     pub fn stderr_output(&self) -> Option<&[u8]> {
         self.stderr_output.as_deref()
@@ -280,7 +318,7 @@ pub fn should_skip_network_e2e() -> bool {
 }
 
 /// 查找空闲端口
-fn find_free_port() -> u16 {
+pub fn find_free_port() -> u16 {
     // 让 OS 分配临时端口，避免随机碰撞
     TcpListener::bind(("127.0.0.1", 0))
         .and_then(|listener| listener.local_addr().map(|addr| addr.port()))

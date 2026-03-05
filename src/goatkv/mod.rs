@@ -3,6 +3,7 @@ pub mod core;
 pub mod error;
 pub mod format;
 pub mod metadata;
+pub mod server;
 pub mod storage;
 pub mod utils;
 

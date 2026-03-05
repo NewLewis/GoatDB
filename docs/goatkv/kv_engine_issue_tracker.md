@@ -954,16 +954,24 @@
 
 #### Milestone 3（可观测与健康检查）
 
-- [ ] `TASK-SM3-01` liveness/readiness 接口接入（status: planned）
+- [x] `TASK-SM3-01` liveness/readiness 接口接入（status: done, 2026-03-05）
   - 目标：提供标准探活与就绪检查入口。
   - 关键改动文件：
     - `src/bin/goatkv_server.rs`
-    - `src/goatkv/server/`
+    - `src/goatkv/server/health.rs`
+    - `tests/common/test_server.rs`
+    - `tests/e2e/health_test.rs`
+    - `Cargo.toml`
   - 回归命令：
     - `cargo test --test e2e_health`
+    - `cargo test --bin goatkv_server`
   - DoD：
     - 进程可存活但未就绪场景返回不同状态。
     - 支持被部署系统直接探测。
+  - 关闭记录：
+    - 2026-03-05：新增可选 HTTP 健康探针地址 `--health-address`，暴露 `/livez`、`/readyz`。
+    - 2026-03-05：优雅停机时先将 readiness 置为 not-ready，再进入 drain window，liveness 保持存活态直到进程退出。
+    - 2026-03-05：新增 `e2e_health`，验证启动后探针可用及停机阶段 `live=200`、`ready=503` 的状态分离。
 
 - [ ] `TASK-SM3-02` 核心指标导出（QPS/延迟/错误率/backlog/cache）（status: planned）
   - 目标：覆盖定位写阻塞和读退化所需最小指标集。

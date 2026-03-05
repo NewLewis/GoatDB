@@ -154,6 +154,7 @@ async fn test_persistence_across_restart() {
 
     let mut server = TestServer::start_with_options(TestServerOptions {
         port: None,
+        health_port: None,
         data_dir: Some(data_dir.clone()),
         show_logs: false,
         capture_stderr: true,
@@ -178,6 +179,7 @@ async fn test_persistence_across_restart() {
 
     let server = TestServer::start_with_options(TestServerOptions {
         port: None,
+        health_port: None,
         data_dir: Some(data_dir),
         show_logs: false,
         capture_stderr: true,
