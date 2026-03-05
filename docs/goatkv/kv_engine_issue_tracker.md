@@ -584,6 +584,7 @@
   - 进展：
     - 2026-03-05：`SSTableScanIterator` 新增 block 级 readahead/prefetch（默认预取 2 个 upcoming blocks），优先消费预取块并滚动补充后续块。
     - 2026-03-05：新增回归 `test_scan_iterator_prefetches_upcoming_blocks`、`test_scan_iterator_disables_readahead_for_single_block_sstable`，验证多块预取与单块退化行为。
+    - 2026-03-05：新增 `scanread` benchmark（支持 `mode=scan-all|iterator`）并完成对照：`/tmp/goatkv_sm401_scan_opt` 下 GoatKV `scanread_scan_all=533ms`、`scanread_iterator=360ms`（约提升 `32.5%`）。
 
 - [ ] `P1-MULTIGET-BATCH-READ-PATH`
   - 现象：对外接口与内部读路径以单 key 查询为主，缺少 MultiGet 批量探测/复用路径。
@@ -1031,20 +1032,22 @@
 
 #### Milestone 4（读路径剩余优化）
 
-- [ ] `TASK-SM4-01` Iterator readahead/prefetch（status: in-progress, 2026-03-05）
+- [x] `TASK-SM4-01` Iterator readahead/prefetch（status: done, 2026-03-05）
   - 目标：提升长扫描吞吐，降低块读取抖动。
   - 关键改动文件：
     - `src/goatkv/storage/sstable/reader.rs`
     - `docs/goatkv/kv_engine_issue_tracker.md`
   - 回归命令：
     - `cargo test --lib goatkv::storage::sstable::reader::tests`
-    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine goatkv --wal-sync randread`
+    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_sm401_scan_opt --engine both --wal-sync --threads 16 scanread --times 20 --mode scan-all`
+    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_sm401_scan_opt --engine both --wal-sync --threads 16 scanread --times 20 --mode iterator`
+    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_sm401_scan_opt --engine both --wal-sync --threads 16 randread --times 80 --key-nums 20000`
   - DoD：
     - scan 吞吐提升且点查（single get）不回退超阈值。
-  - 进展记录：
-    - 2026-03-05：迭代器预取代码与单元回归已落地，待补基准对照验证吞吐收益与点查回归门槛。
-    - 2026-03-05：完成 5 轮 GoatKV vs RocksDB 对照（`/tmp/goatkv_sm401_cmp_multi_*`，`threads=16,key_nums=20000`）：`randread(times=80)` GoatKV 均值 `481.8ms` vs RocksDB `575.0ms`（GoatKV 约快 `16.2%`）；`populate(batch_size=1000,value_size=1024,seq)` GoatKV 均值 `66.8ms` vs RocksDB `49.2ms`（GoatKV 约慢 `1.36x`）。
-    - 2026-03-05：当前点查无回退，仍需补 scan 专项 benchmark 才能闭环 `SM4-01` DoD（scan 吞吐提升量化）。
+  - 关闭记录：
+    - 2026-03-05：完成迭代器预取代码与单元回归（多块预取、单块退化）。
+    - 2026-03-05：`scanread` 对照（`/tmp/goatkv_sm401_scan_opt`）显示 `scan_all=533ms` -> `scan_iterator=360ms`（约提升 `32.5%`）。
+    - 2026-03-05：点查守护（同目录 `randread`）GoatKV `383ms` vs RocksDB `439ms`，未出现回退。
 
 - [x] `TASK-SM4-02` partitioned filter 缓存治理与指标（status: done, 2026-03-05）
   - 目标：将 partitioned filter 纳入统一容量与命中率管理。

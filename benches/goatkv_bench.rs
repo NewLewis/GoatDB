@@ -1,16 +1,18 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
+use goat_db::goatkv::storage::sstable::SSTableReader;
 use goat_db::goatkv::utils::init_logging;
 use goat_db::goatkv::{KvEngine, KvEngineOptions};
 #[cfg(feature = "rocksdb")]
-use rocksdb::{DBCompressionType, Options, WriteBatch, WriteOptions, DB};
+use rocksdb::{DBCompressionType, IteratorMode, Options, WriteBatch, WriteOptions, DB};
 
 #[derive(Parser)]
 #[command(name = "goatkv_bench")]
@@ -82,6 +84,12 @@ impl EngineKind {
     }
 }
 
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanMode {
+    Iterator,
+    ScanAll,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Build a database with given keys
@@ -149,6 +157,15 @@ enum Commands {
         /// Miss ratio percent [0,100]
         #[arg(long, default_value_t = 0)]
         miss_ratio: u64,
+    },
+    /// Full scan benchmark over all persisted SSTables/entries
+    Scanread {
+        /// Scan rounds
+        #[arg(long, default_value_t = 5)]
+        times: u64,
+        /// GoatKV scan mode (rocksdb ignores this and always uses iterator)
+        #[arg(long, value_enum, default_value_t = ScanMode::Iterator)]
+        mode: ScanMode,
     },
 }
 
@@ -522,6 +539,73 @@ fn multiget_goatkv(
     }
 }
 
+fn collect_sstable_paths(data_dir: &Path) -> Vec<PathBuf> {
+    let mut paths = fs::read_dir(data_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("sst"))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+fn wait_for_goatkv_flush(engine: &KvEngine, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if engine.runtime_metrics().immutable_memtable_backlog == 0 {
+            return;
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn scanread_goatkv(engine: Arc<KvEngine>, times: u64, mode: ScanMode) -> u64 {
+    if times == 0 {
+        return 0;
+    }
+    engine.flush();
+    wait_for_goatkv_flush(&engine, Duration::from_secs(5));
+    let sstable_paths = collect_sstable_paths(engine.sstable_paths().data_dir());
+    if sstable_paths.is_empty() {
+        return 0;
+    }
+
+    let mut scanned = 0u64;
+    for _ in 0..times {
+        for path in &sstable_paths {
+            let reader = SSTableReader::open(path).expect("open sstable for scanread");
+            match mode {
+                ScanMode::Iterator => {
+                    let mut iter = reader.into_scan_iterator();
+                    while iter.next_entry().expect("scan next").is_some() {
+                        scanned += 1;
+                    }
+                }
+                ScanMode::ScanAll => {
+                    scanned = scanned.saturating_add(
+                        reader
+                            .scan_all()
+                            .expect("scan_all")
+                            .len()
+                            .try_into()
+                            .expect("scan count"),
+                    );
+                }
+            }
+        }
+    }
+    scanned
+}
+
 #[cfg(feature = "rocksdb")]
 fn randread_rocksdb(db: Arc<DB>, times: u64, key_nums: u64, threads: usize) {
     if key_nums == 0 || times == 0 || threads == 0 {
@@ -624,6 +708,21 @@ fn multiget_rocksdb(
             let _ = handle.join();
         }
     }
+}
+
+#[cfg(feature = "rocksdb")]
+fn scanread_rocksdb(db: Arc<DB>, times: u64) -> u64 {
+    if times == 0 {
+        return 0;
+    }
+    let mut scanned = 0u64;
+    for _ in 0..times {
+        for entry in db.iterator(IteratorMode::Start) {
+            let _ = entry.expect("iterate rocksdb");
+            scanned += 1;
+        }
+    }
+    scanned
 }
 
 fn ms_per_iter(total_ms: u128, iters: u64) -> f64 {
@@ -993,6 +1092,49 @@ fn main() {
                     EngineKind::Both => {}
                 }
             }
+            Commands::Scanread { times, mode } => match engine_kind {
+                EngineKind::Goatkv => {
+                    let options = goatkv_options_from_cli(&cli, &base_dir);
+                    let engine =
+                        Arc::new(KvEngine::new_with_options(options).expect("open engine"));
+                    let begin = Instant::now();
+                    let scanned = scanread_goatkv(engine, times, mode);
+                    let total_ms = begin.elapsed().as_millis();
+                    let result = BenchResult {
+                        engine: "goatkv",
+                        workload: match mode {
+                            ScanMode::Iterator => "scanread_iterator",
+                            ScanMode::ScanAll => "scanread_scan_all",
+                        },
+                        total_ms,
+                        iters: scanned,
+                        ms_per_iter: ms_per_iter(total_ms, scanned),
+                    };
+                    print_result(&result);
+                }
+                EngineKind::Rocksdb => {
+                    ensure_rocksdb_available();
+                    #[cfg(feature = "rocksdb")]
+                    {
+                        let mut rocks_opts = Options::default();
+                        rocks_opts.create_if_missing(true);
+                        rocks_opts.set_compression_type(DBCompressionType::None);
+                        let db = Arc::new(DB::open(&rocks_opts, &base_dir).expect("open rocksdb"));
+                        let begin = Instant::now();
+                        let scanned = scanread_rocksdb(db, times);
+                        let total_ms = begin.elapsed().as_millis();
+                        let result = BenchResult {
+                            engine: "rocksdb",
+                            workload: "scanread",
+                            total_ms,
+                            iters: scanned,
+                            ms_per_iter: ms_per_iter(total_ms, scanned),
+                        };
+                        print_result(&result);
+                    }
+                }
+                EngineKind::Both => {}
+            },
         }
     }
 }
