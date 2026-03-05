@@ -7,6 +7,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
 const MAX_REQUEST_BYTES: usize = 1024;
+type MetricsRenderer = Arc<dyn Fn() -> String + Send + Sync + 'static>;
 
 #[derive(Debug)]
 pub struct HealthState {
@@ -48,6 +49,7 @@ impl Default for HealthState {
 pub async fn run_http_health_server(
     listener: TcpListener,
     state: Arc<HealthState>,
+    metrics_renderer: Option<MetricsRenderer>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> io::Result<()> {
     loop {
@@ -60,8 +62,9 @@ pub async fn run_http_health_server(
             accept_result = listener.accept() => {
                 let (stream, _) = accept_result?;
                 let state = Arc::clone(&state);
+                let metrics_renderer = metrics_renderer.clone();
                 tokio::spawn(async move {
-                    let _ = handle_connection(stream, state).await;
+                    let _ = handle_connection(stream, state, metrics_renderer).await;
                 });
             }
         }
@@ -69,7 +72,11 @@ pub async fn run_http_health_server(
     Ok(())
 }
 
-async fn handle_connection(mut stream: TcpStream, state: Arc<HealthState>) -> io::Result<()> {
+async fn handle_connection(
+    mut stream: TcpStream,
+    state: Arc<HealthState>,
+    metrics_renderer: Option<MetricsRenderer>,
+) -> io::Result<()> {
     let mut buffer = [0u8; MAX_REQUEST_BYTES];
     let bytes_read = stream.read(&mut buffer).await?;
     if bytes_read == 0 {
@@ -81,19 +88,42 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<HealthState>) -> io
     let response = match path {
         "/livez" | "/healthz" => {
             if state.is_live() {
-                http_response(200, "OK", "alive")
+                http_response(200, "OK", "alive", "text/plain; charset=utf-8")
             } else {
-                http_response(503, "Service Unavailable", "dead")
+                http_response(
+                    503,
+                    "Service Unavailable",
+                    "dead",
+                    "text/plain; charset=utf-8",
+                )
             }
         }
         "/readyz" => {
             if state.is_ready() {
-                http_response(200, "OK", "ready")
+                http_response(200, "OK", "ready", "text/plain; charset=utf-8")
             } else {
-                http_response(503, "Service Unavailable", "not ready")
+                http_response(
+                    503,
+                    "Service Unavailable",
+                    "not ready",
+                    "text/plain; charset=utf-8",
+                )
             }
         }
-        _ => http_response(404, "Not Found", "not found"),
+        "/metrics" => {
+            if let Some(render) = metrics_renderer {
+                let body = render();
+                http_response(200, "OK", &body, "text/plain; version=0.0.4")
+            } else {
+                http_response(
+                    404,
+                    "Not Found",
+                    "metrics disabled",
+                    "text/plain; charset=utf-8",
+                )
+            }
+        }
+        _ => http_response(404, "Not Found", "not found", "text/plain; charset=utf-8"),
     };
 
     stream.write_all(response.as_bytes()).await?;
@@ -109,11 +139,12 @@ fn request_line_path(request: &str) -> &str {
         .unwrap_or("/")
 }
 
-fn http_response(status: u16, reason: &str, body: &str) -> String {
+fn http_response(status: u16, reason: &str, body: &str, content_type: &str) -> String {
     format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         status,
         reason,
+        content_type,
         body.len(),
         body
     )

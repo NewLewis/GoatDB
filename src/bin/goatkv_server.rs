@@ -5,6 +5,7 @@ use std::{collections::HashSet, fs};
 
 use clap::{ArgAction, Parser};
 use goat_db::goatkv::core::kv_engine::KvEngine;
+use goat_db::goatkv::metrics::{RpcMethod, RpcMetricsCollector};
 use goat_db::goatkv::server::health::{run_http_health_server, HealthState};
 use goat_db::goatkv::utils::{init_logging, KvEngineOptions};
 use goat_db::goatkv::{Error as GoatError, Result as GoatResult};
@@ -14,6 +15,7 @@ use goatkv::{
     FlushResponse, GetRequest, GetResponse, ReleaseSnapshotRequest, ReleaseSnapshotResponse,
     UpdateRequest, UpdateResponse, WriteRequest, WriteResponse,
 };
+use std::time::Instant;
 use tokio::{signal, sync::watch, time::sleep};
 use tonic::{
     transport::{Certificate, Identity, Server, ServerTlsConfig},
@@ -29,16 +31,37 @@ pub mod goatkv {
 #[derive(Debug)]
 pub struct GoatKVServiceImpl {
     engine: Arc<KvEngine>,
+    metrics: Arc<RpcMetricsCollector>,
 }
 
 impl GoatKVServiceImpl {
     /// 创建新的服务实例，使用指定的 KvEngine
-    pub fn new(engine: Arc<KvEngine>) -> Self {
-        Self { engine }
+    pub fn new(engine: Arc<KvEngine>, metrics: Arc<RpcMetricsCollector>) -> Self {
+        Self { engine, metrics }
     }
 
     fn map_engine_err(err: GoatError) -> Status {
         err.to_status()
+    }
+
+    fn ok_response<T>(
+        &self,
+        method: RpcMethod,
+        started_at: Instant,
+        response: T,
+    ) -> Result<Response<T>, Status> {
+        self.metrics.observe(method, true, started_at.elapsed());
+        Ok(Response::new(response))
+    }
+
+    fn err_response<T>(
+        &self,
+        method: RpcMethod,
+        started_at: Instant,
+        status: Status,
+    ) -> Result<Response<T>, Status> {
+        self.metrics.observe(method, false, started_at.elapsed());
+        Err(status)
     }
 }
 
@@ -49,6 +72,7 @@ impl GoatKvService for GoatKVServiceImpl {
         &self,
         request: Request<WriteRequest>,
     ) -> Result<Response<WriteResponse>, Status> {
+        let started_at = Instant::now();
         let req = request.into_inner();
 
         debug!(
@@ -59,22 +83,31 @@ impl GoatKvService for GoatKVServiceImpl {
 
         // 验证输入
         if req.key.is_empty() {
-            return Err(Status::invalid_argument("Key cannot be empty"));
+            return self.err_response(
+                RpcMethod::Write,
+                started_at,
+                Status::invalid_argument("Key cannot be empty"),
+            );
         }
 
-        self.engine
+        if let Err(status) = self
+            .engine
             .put(req.key, req.value)
-            .map_err(Self::map_engine_err)?;
+            .map_err(Self::map_engine_err)
+        {
+            return self.err_response(RpcMethod::Write, started_at, status);
+        }
 
         let reply = WriteResponse {
             success: true,
             message: "Written successfully".to_string(),
         };
 
-        Ok(Response::new(reply))
+        self.ok_response(RpcMethod::Write, started_at, reply)
     }
 
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
+        let started_at = Instant::now();
         let req = request.into_inner();
 
         debug!(
@@ -85,15 +118,22 @@ impl GoatKvService for GoatKVServiceImpl {
 
         // 验证输入
         if req.key.is_empty() {
-            return Err(Status::invalid_argument("Key cannot be empty"));
+            return self.err_response(
+                RpcMethod::Get,
+                started_at,
+                Status::invalid_argument("Key cannot be empty"),
+            );
         }
 
         let value = if req.snapshot_id == 0 {
             self.engine.get(&req.key)
         } else {
             self.engine.get_with_snapshot(&req.key, req.snapshot_id)
-        }
-        .map_err(Self::map_engine_err)?;
+        };
+        let value = match value.map_err(Self::map_engine_err) {
+            Ok(value) => value,
+            Err(status) => return self.err_response(RpcMethod::Get, started_at, status),
+        };
 
         match value {
             Some(value) => {
@@ -102,7 +142,7 @@ impl GoatKvService for GoatKVServiceImpl {
                     message: format!("Get successfully - key length: {}", req.key.len()),
                     value,
                 };
-                Ok(Response::new(reply))
+                self.ok_response(RpcMethod::Get, started_at, reply)
             }
             None => {
                 let reply = GetResponse {
@@ -110,7 +150,7 @@ impl GoatKvService for GoatKVServiceImpl {
                     message: "Key not found".to_string(),
                     value: vec![],
                 };
-                Ok(Response::new(reply))
+                self.ok_response(RpcMethod::Get, started_at, reply)
             }
         }
     }
@@ -119,6 +159,7 @@ impl GoatKvService for GoatKVServiceImpl {
         &self,
         request: Request<UpdateRequest>,
     ) -> Result<Response<UpdateResponse>, Status> {
+        let started_at = Instant::now();
         let req = request.into_inner();
 
         debug!(
@@ -129,50 +170,66 @@ impl GoatKvService for GoatKVServiceImpl {
 
         // 验证输入
         if req.key.is_empty() {
-            return Err(Status::invalid_argument("Key cannot be empty"));
+            return self.err_response(
+                RpcMethod::Update,
+                started_at,
+                Status::invalid_argument("Key cannot be empty"),
+            );
         }
 
         // update 采用 upsert 语义：并发下不依赖先读后写。
-        self.engine
+        if let Err(status) = self
+            .engine
             .put(req.key, req.value)
-            .map_err(Self::map_engine_err)?;
+            .map_err(Self::map_engine_err)
+        {
+            return self.err_response(RpcMethod::Update, started_at, status);
+        }
 
         let reply = UpdateResponse {
             success: true,
             message: "Updated successfully (upsert)".to_string(),
         };
 
-        Ok(Response::new(reply))
+        self.ok_response(RpcMethod::Update, started_at, reply)
     }
 
     async fn delete(
         &self,
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
+        let started_at = Instant::now();
         let req = request.into_inner();
 
         debug!("Received delete request - key_len: {}", req.key.len());
 
         // 验证输入
         if req.key.is_empty() {
-            return Err(Status::invalid_argument("Key cannot be empty"));
+            return self.err_response(
+                RpcMethod::Delete,
+                started_at,
+                Status::invalid_argument("Key cannot be empty"),
+            );
         }
 
         // 删除 key (即使不存在也会插入删除标记)
-        self.engine.delete(req.key).map_err(Self::map_engine_err)?;
+        if let Err(status) = self.engine.delete(req.key).map_err(Self::map_engine_err) {
+            return self.err_response(RpcMethod::Delete, started_at, status);
+        }
 
         let reply = DeleteResponse {
             success: true,
             message: "Deleted successfully".to_string(),
         };
 
-        Ok(Response::new(reply))
+        self.ok_response(RpcMethod::Delete, started_at, reply)
     }
 
     async fn flush(
         &self,
         _request: Request<FlushRequest>,
     ) -> Result<Response<FlushResponse>, Status> {
+        let started_at = Instant::now();
         debug!("Received flush request");
 
         // 调用 engine 的 flush 方法
@@ -183,45 +240,51 @@ impl GoatKvService for GoatKVServiceImpl {
             message: "Flush triggered successfully".to_string(),
         };
 
-        Ok(Response::new(reply))
+        self.ok_response(RpcMethod::Flush, started_at, reply)
     }
 
     async fn create_snapshot(
         &self,
         _request: Request<CreateSnapshotRequest>,
     ) -> Result<Response<CreateSnapshotResponse>, Status> {
+        let started_at = Instant::now();
         debug!("Received create_snapshot request");
 
-        let snapshot = self
-            .engine
-            .create_snapshot()
-            .map_err(Self::map_engine_err)?;
+        let snapshot = match self.engine.create_snapshot().map_err(Self::map_engine_err) {
+            Ok(snapshot) => snapshot,
+            Err(status) => return self.err_response(RpcMethod::CreateSnapshot, started_at, status),
+        };
         let reply = CreateSnapshotResponse {
             success: true,
             message: "Snapshot created successfully".to_string(),
             snapshot_id: snapshot.id,
         };
-        Ok(Response::new(reply))
+        self.ok_response(RpcMethod::CreateSnapshot, started_at, reply)
     }
 
     async fn release_snapshot(
         &self,
         request: Request<ReleaseSnapshotRequest>,
     ) -> Result<Response<ReleaseSnapshotResponse>, Status> {
+        let started_at = Instant::now();
         let req = request.into_inner();
         debug!(
             "Received release_snapshot request - snapshot_id: {}",
             req.snapshot_id
         );
 
-        self.engine
+        if let Err(status) = self
+            .engine
             .release_snapshot(req.snapshot_id)
-            .map_err(Self::map_engine_err)?;
+            .map_err(Self::map_engine_err)
+        {
+            return self.err_response(RpcMethod::ReleaseSnapshot, started_at, status);
+        }
         let reply = ReleaseSnapshotResponse {
             success: true,
             message: "Snapshot released successfully".to_string(),
         };
-        Ok(Response::new(reply))
+        self.ok_response(RpcMethod::ReleaseSnapshot, started_at, reply)
     }
 }
 
@@ -229,6 +292,7 @@ impl Default for GoatKVServiceImpl {
     fn default() -> Self {
         Self {
             engine: Arc::new(KvEngine::new()),
+            metrics: Arc::new(RpcMetricsCollector::new()),
         }
     }
 }
@@ -381,6 +445,176 @@ fn load_tls_config(args: &Args) -> GoatResult<Option<(ServerTlsConfig, bool)>> {
     }
 }
 
+fn render_metrics_text(engine: &KvEngine, collector: &RpcMetricsCollector) -> String {
+    collector.render_prometheus(|text| append_engine_metrics(text, engine))
+}
+
+fn append_engine_metrics(text: &mut String, engine: &KvEngine) {
+    let runtime = engine.runtime_metrics();
+    text.push_str(
+        "# HELP goatkv_engine_immutable_memtable_backlog Immutable memtable backlog length\n",
+    );
+    text.push_str("# TYPE goatkv_engine_immutable_memtable_backlog gauge\n");
+    text.push_str(&format!(
+        "goatkv_engine_immutable_memtable_backlog {}\n",
+        runtime.immutable_memtable_backlog
+    ));
+
+    text.push_str("# HELP goatkv_engine_flush_failure_streak Consecutive flush failure count\n");
+    text.push_str("# TYPE goatkv_engine_flush_failure_streak gauge\n");
+    text.push_str(&format!(
+        "goatkv_engine_flush_failure_streak {}\n",
+        runtime.flush_failure_streak
+    ));
+
+    text.push_str("# HELP goatkv_engine_flush_circuit_open Flush circuit breaker status\n");
+    text.push_str("# TYPE goatkv_engine_flush_circuit_open gauge\n");
+    text.push_str(&format!(
+        "goatkv_engine_flush_circuit_open {}\n",
+        if runtime.flush_circuit_open { 1 } else { 0 }
+    ));
+
+    text.push_str("# HELP goatkv_engine_l0_file_count Number of level-0 SST files\n");
+    text.push_str("# TYPE goatkv_engine_l0_file_count gauge\n");
+    text.push_str(&format!(
+        "goatkv_engine_l0_file_count {}\n",
+        runtime.l0_file_count
+    ));
+
+    text.push_str(
+        "# HELP goatkv_engine_pending_compaction_bytes Estimated pending compaction bytes\n",
+    );
+    text.push_str("# TYPE goatkv_engine_pending_compaction_bytes gauge\n");
+    text.push_str(&format!(
+        "goatkv_engine_pending_compaction_bytes {}\n",
+        runtime.pending_compaction_bytes
+    ));
+
+    text.push_str("# HELP goatkv_writer_wal_queue_reqs Pending WAL queue requests\n");
+    text.push_str("# TYPE goatkv_writer_wal_queue_reqs gauge\n");
+    text.push_str(&format!(
+        "goatkv_writer_wal_queue_reqs {}\n",
+        runtime.writer_queue_metrics.wal_queue_reqs
+    ));
+
+    text.push_str("# HELP goatkv_writer_wal_queue_bytes Pending WAL queue bytes\n");
+    text.push_str("# TYPE goatkv_writer_wal_queue_bytes gauge\n");
+    text.push_str(&format!(
+        "goatkv_writer_wal_queue_bytes {}\n",
+        runtime.writer_queue_metrics.wal_queue_bytes
+    ));
+
+    text.push_str("# HELP goatkv_writer_mem_queue_reqs Pending Mem queue requests\n");
+    text.push_str("# TYPE goatkv_writer_mem_queue_reqs gauge\n");
+    text.push_str(&format!(
+        "goatkv_writer_mem_queue_reqs {}\n",
+        runtime.writer_queue_metrics.mem_queue_reqs
+    ));
+
+    text.push_str("# HELP goatkv_writer_mem_queue_bytes Pending Mem queue bytes\n");
+    text.push_str("# TYPE goatkv_writer_mem_queue_bytes gauge\n");
+    text.push_str(&format!(
+        "goatkv_writer_mem_queue_bytes {}\n",
+        runtime.writer_queue_metrics.mem_queue_bytes
+    ));
+
+    text.push_str("# HELP goatkv_writer_wal_inflight_groups WAL inflight group count\n");
+    text.push_str("# TYPE goatkv_writer_wal_inflight_groups gauge\n");
+    text.push_str(&format!(
+        "goatkv_writer_wal_inflight_groups {}\n",
+        runtime.writer_queue_metrics.wal_inflight_groups
+    ));
+
+    text.push_str("# HELP goatkv_writer_mem_inflight_groups Mem inflight group count\n");
+    text.push_str("# TYPE goatkv_writer_mem_inflight_groups gauge\n");
+    text.push_str(&format!(
+        "goatkv_writer_mem_inflight_groups {}\n",
+        runtime.writer_queue_metrics.mem_inflight_groups
+    ));
+
+    text.push_str("# HELP goatkv_writer_flush_blocked Flush barrier active flag\n");
+    text.push_str("# TYPE goatkv_writer_flush_blocked gauge\n");
+    text.push_str(&format!(
+        "goatkv_writer_flush_blocked {}\n",
+        if runtime.writer_queue_metrics.flush_blocked {
+            1
+        } else {
+            0
+        }
+    ));
+
+    text.push_str(
+        "# HELP goatkv_writer_pressure_level Write pressure level (0=normal,1=slowdown,2=stop)\n",
+    );
+    text.push_str("# TYPE goatkv_writer_pressure_level gauge\n");
+    text.push_str(&format!(
+        "goatkv_writer_pressure_level {}\n",
+        runtime.write_pressure_level
+    ));
+
+    if let Some(cache) = runtime.read_cache_metrics {
+        text.push_str("# HELP goatkv_cache_table_hits_total Table cache hits\n");
+        text.push_str("# TYPE goatkv_cache_table_hits_total counter\n");
+        text.push_str(&format!(
+            "goatkv_cache_table_hits_total {}\n",
+            cache.table_hits
+        ));
+
+        text.push_str("# HELP goatkv_cache_table_misses_total Table cache misses\n");
+        text.push_str("# TYPE goatkv_cache_table_misses_total counter\n");
+        text.push_str(&format!(
+            "goatkv_cache_table_misses_total {}\n",
+            cache.table_misses
+        ));
+
+        text.push_str("# HELP goatkv_cache_table_evictions_total Table cache evictions\n");
+        text.push_str("# TYPE goatkv_cache_table_evictions_total counter\n");
+        text.push_str(&format!(
+            "goatkv_cache_table_evictions_total {}\n",
+            cache.table_evictions
+        ));
+
+        text.push_str("# HELP goatkv_cache_row_hits_total Row cache hits\n");
+        text.push_str("# TYPE goatkv_cache_row_hits_total counter\n");
+        text.push_str(&format!("goatkv_cache_row_hits_total {}\n", cache.row_hits));
+
+        text.push_str("# HELP goatkv_cache_row_misses_total Row cache misses\n");
+        text.push_str("# TYPE goatkv_cache_row_misses_total counter\n");
+        text.push_str(&format!(
+            "goatkv_cache_row_misses_total {}\n",
+            cache.row_misses
+        ));
+
+        text.push_str("# HELP goatkv_cache_row_evictions_total Row cache evictions\n");
+        text.push_str("# TYPE goatkv_cache_row_evictions_total counter\n");
+        text.push_str(&format!(
+            "goatkv_cache_row_evictions_total {}\n",
+            cache.row_evictions
+        ));
+
+        text.push_str("# HELP goatkv_cache_block_hits_total Block cache hits\n");
+        text.push_str("# TYPE goatkv_cache_block_hits_total counter\n");
+        text.push_str(&format!(
+            "goatkv_cache_block_hits_total {}\n",
+            cache.block_hits
+        ));
+
+        text.push_str("# HELP goatkv_cache_block_misses_total Block cache misses\n");
+        text.push_str("# TYPE goatkv_cache_block_misses_total counter\n");
+        text.push_str(&format!(
+            "goatkv_cache_block_misses_total {}\n",
+            cache.block_misses
+        ));
+
+        text.push_str("# HELP goatkv_cache_block_evictions_total Block cache evictions\n");
+        text.push_str("# TYPE goatkv_cache_block_evictions_total counter\n");
+        text.push_str(&format!(
+            "goatkv_cache_block_evictions_total {}\n",
+            cache.block_evictions
+        ));
+    }
+}
+
 #[tokio::main]
 async fn main() -> GoatResult<()> {
     // 解析命令行参数
@@ -436,8 +670,9 @@ async fn main() -> GoatResult<()> {
     let engine = Arc::new(KvEngine::new_with_options(options).map_err(|e| {
         GoatError::internal_with_source("server_init_engine", "failed to create kv engine", e)
     })?);
+    let rpc_metrics = Arc::new(RpcMetricsCollector::new());
 
-    let service = GoatKVServiceImpl::new(engine.clone());
+    let service = GoatKVServiceImpl::new(engine.clone(), rpc_metrics.clone());
     let auth_tokens_for_interceptor = Arc::clone(&auth_tokens);
     let service = GoatKvServiceServer::with_interceptor(service, move |request: Request<()>| {
         authorize_request(request, auth_tokens_for_interceptor.as_ref())
@@ -455,12 +690,17 @@ async fn main() -> GoatResult<()> {
             .map_err(|e| GoatError::io("health_probe_local_addr", e))?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let state = Arc::clone(&health_state);
+        let metrics_engine = Arc::clone(&engine);
+        let metrics_collector = Arc::clone(&rpc_metrics);
+        let metrics_renderer = Arc::new(move || {
+            render_metrics_text(metrics_engine.as_ref(), metrics_collector.as_ref())
+        });
         health_server_task = Some(tokio::spawn(async move {
-            run_http_health_server(listener, state, shutdown_rx).await
+            run_http_health_server(listener, state, Some(metrics_renderer), shutdown_rx).await
         }));
         health_shutdown_tx = Some(shutdown_tx);
         info!(
-            "Health probe listening on http://{} (/livez, /readyz)",
+            "Health probe listening on http://{} (/livez, /readyz, /metrics)",
             bound_addr
         );
     } else {

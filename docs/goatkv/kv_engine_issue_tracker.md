@@ -973,17 +973,28 @@
     - 2026-03-05：优雅停机时先将 readiness 置为 not-ready，再进入 drain window，liveness 保持存活态直到进程退出。
     - 2026-03-05：新增 `e2e_health`，验证启动后探针可用及停机阶段 `live=200`、`ready=503` 的状态分离。
 
-- [ ] `TASK-SM3-02` 核心指标导出（QPS/延迟/错误率/backlog/cache）（status: planned）
+- [x] `TASK-SM3-02` 核心指标导出（QPS/延迟/错误率/backlog/cache）（status: done, 2026-03-05）
   - 目标：覆盖定位写阻塞和读退化所需最小指标集。
   - 关键改动文件：
-    - `src/goatkv/metrics/`
-    - `src/goatkv/engine.rs`
-    - `src/goatkv/storage/`
+    - `src/goatkv/metrics/mod.rs`
+    - `src/goatkv/core/kv_engine/engine.rs`
+    - `src/goatkv/core/kv_engine/writer.rs`
+    - `src/bin/goatkv_server.rs`
+    - `src/goatkv/server/health.rs`
+    - `tests/e2e/health_test.rs`
   - 回归命令：
-    - `cargo test --lib --tests`
+    - `cargo test --bin goatkv_server`
+    - `cargo test --lib goatkv::metrics::tests`
+    - `cargo test --test e2e_health`
+    - `cargo test --tests --no-run`
   - DoD：
     - 指标命名、标签、单位有文档定义。
     - 关键路径埋点不引入显著性能回退。
+  - 关闭记录：
+    - 2026-03-05：新增 `RpcMetricsCollector`，导出 RPC `requests/qps/error_rate/latency(histogram+p95+p99+avg+max)`。
+    - 2026-03-05：`goatkv_server` 读写路径接入观测埋点，按 RPC method 输出请求与错误计数。
+    - 2026-03-05：`/metrics` 接入健康探针 HTTP 服务，导出引擎 backlog 与队列水位（immutable backlog、pending compaction bytes、wal/mem queue、write pressure）及 cache hit/miss/evictions。
+    - 2026-03-05：新增 `e2e_health::test_metrics_endpoint_exposes_core_metrics` 验证指标端点可用与关键指标存在。
 
 - [ ] `TASK-SM3-03` 告警阈值建议与运维手册（status: planned）
   - 目标：给出可执行的排障基线，缩短故障定位时间。

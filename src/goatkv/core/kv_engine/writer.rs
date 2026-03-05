@@ -228,6 +228,17 @@ pub struct FlushBarrierGuard<'a> {
     writer: &'a KvWriter,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WriterQueueMetrics {
+    pub wal_queue_reqs: usize,
+    pub wal_queue_bytes: usize,
+    pub mem_queue_reqs: usize,
+    pub mem_queue_bytes: usize,
+    pub wal_inflight_groups: usize,
+    pub mem_inflight_groups: usize,
+    pub flush_blocked: bool,
+}
+
 impl Drop for FlushBarrierGuard<'_> {
     fn drop(&mut self) {
         self.writer.end_flush_barrier();
@@ -259,6 +270,23 @@ impl KvWriter {
 
     pub fn last_published_sequence(&self) -> u64 {
         self.last_published_seq.load(Ordering::Acquire)
+    }
+
+    pub fn queue_metrics(&self) -> WriterQueueMetrics {
+        let state = self.state.lock().unwrap();
+        WriterQueueMetrics {
+            wal_queue_reqs: state.wal_queue_reqs,
+            wal_queue_bytes: state.wal_queue_bytes,
+            mem_queue_reqs: state.mem_queue_reqs,
+            mem_queue_bytes: state.mem_queue_bytes,
+            wal_inflight_groups: state.wal_inflight_groups,
+            mem_inflight_groups: state.mem_inflight_groups,
+            flush_blocked: state.flush_blocked,
+        }
+    }
+
+    pub fn write_pressure_level_code(&self) -> u8 {
+        self.write_pressure_level.load(Ordering::Acquire)
     }
 
     pub(crate) fn submit_write<F>(&self, ops: Vec<WriteOp>, flush_fn: F) -> GoatResult<()>

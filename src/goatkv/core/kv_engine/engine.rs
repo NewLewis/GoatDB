@@ -10,7 +10,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{error, warn};
 
 use super::reader::KvReader;
-use super::writer::{KvWriter, WriteOp};
+use super::writer::{KvWriter, WriteOp, WriterQueueMetrics};
 use crate::goatkv::core::cleanup_worker::CleanupWorker;
 use crate::goatkv::core::flush_worker::{CompactionConfig, FlushTask, FlushWorker};
 use crate::goatkv::core::lsm_state::{ImmutableMemTableEntry, LSMState};
@@ -32,6 +32,18 @@ use crate::goatkv::utils::paths::{ManifestPaths, SstablePaths};
 type DbPaths = (Arc<WalPaths>, Arc<SstablePaths>, Arc<ManifestPaths>);
 const SHUTDOWN_FLUSH_WAIT_TIMEOUT_MS: u64 = 30_000;
 const SHUTDOWN_FLUSH_WAIT_INTERVAL_MS: u64 = 10;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EngineRuntimeMetrics {
+    pub immutable_memtable_backlog: usize,
+    pub flush_failure_streak: usize,
+    pub flush_circuit_open: bool,
+    pub l0_file_count: usize,
+    pub pending_compaction_bytes: u64,
+    pub writer_queue_metrics: WriterQueueMetrics,
+    pub write_pressure_level: u8,
+    pub read_cache_metrics: Option<ReadCacheMetrics>,
+}
 
 struct BuildEngineInput {
     wal_writer: WalWriter,
@@ -233,6 +245,29 @@ impl KvEngine {
     pub fn read_cache_metrics(&self) -> Option<ReadCacheMetrics> {
         let lsm_state = self.lsm_state.read().unwrap();
         lsm_state.version.read_cache_metrics()
+    }
+
+    pub fn runtime_metrics(&self) -> EngineRuntimeMetrics {
+        let (immutable_memtable_backlog, flush_failure_streak, flush_circuit_open, l0_file_count) = {
+            let lsm_state = self.lsm_state.read().unwrap();
+            (
+                lsm_state.immutable_mem_tables.len(),
+                lsm_state.flush_failure_streak,
+                lsm_state.flush_circuit_open,
+                lsm_state.version.get_files(0).len(),
+            )
+        };
+        let pending_compaction_bytes = self.estimated_pending_compaction_bytes();
+        EngineRuntimeMetrics {
+            immutable_memtable_backlog,
+            flush_failure_streak,
+            flush_circuit_open,
+            l0_file_count,
+            pending_compaction_bytes,
+            writer_queue_metrics: self.writer.queue_metrics(),
+            write_pressure_level: self.writer.write_pressure_level_code(),
+            read_cache_metrics: self.read_cache_metrics(),
+        }
     }
 
     pub fn put(&self, key: Vec<u8>, value: Vec<u8>) -> GoatResult<()> {
@@ -584,6 +619,36 @@ impl KvEngine {
 impl KvEngine {
     fn submit_write(&self, ops: Vec<WriteOp>) -> GoatResult<()> {
         self.writer.submit_write(ops, || self.flush())
+    }
+
+    fn estimated_pending_compaction_bytes(&self) -> u64 {
+        let lsm_state = self.lsm_state.read().unwrap();
+        let version = &lsm_state.version;
+        let num_levels = version.num_levels();
+        if num_levels <= 1 {
+            return 0;
+        }
+
+        let base = self.options.compaction_max_bytes_for_level_base.max(1);
+        let multiplier = self
+            .options
+            .compaction_max_bytes_for_level_multiplier
+            .max(2);
+        let mut level_target = base;
+        let mut pending = 0u64;
+        for level in 1..num_levels {
+            let level_size = version.get_level_size(level);
+            if level_size > level_target {
+                pending = pending.saturating_add(level_size - level_target);
+            }
+            level_target = level_target.saturating_mul(multiplier);
+        }
+
+        if version.get_files(0).len() > self.options.l0_compaction_file_trigger.max(1) {
+            pending = pending.saturating_add(version.get_level_size(0));
+        }
+
+        pending
     }
 }
 
