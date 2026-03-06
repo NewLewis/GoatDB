@@ -3,7 +3,7 @@ mod common;
 
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::test_server::goatkv::{
     CompareAndSetRequest, DeleteRequest, FlushRequest, GetRequest, UpdateRequest, WriteRequest,
@@ -25,6 +25,20 @@ fn total_wal_bytes(data_dir: &Path) -> u64 {
                     fs::metadata(path).ok().map(|meta| meta.len())
                 })
                 .sum::<u64>()
+        })
+        .unwrap_or(0)
+}
+
+fn count_sstable_files(data_dir: &Path) -> usize {
+    let sst_dir = data_dir.join("data");
+    fs::read_dir(sst_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| {
+                    entry.path().extension().and_then(|ext| ext.to_str()) == Some("sst")
+                })
+                .count()
         })
         .unwrap_or(0)
 }
@@ -414,6 +428,81 @@ async fn test_flush_then_immediate_read_consistency() {
         .into_inner();
     assert!(resp.success);
     assert_eq!(resp.value, b"flush_value".to_vec());
+}
+
+#[tokio::test]
+async fn test_flush_reports_trigger_semantics_and_preserves_logical_state() {
+    if should_skip_network_e2e() {
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = temp_dir.path().to_path_buf();
+    let server = TestServer::start_with_options(TestServerOptions {
+        port: None,
+        health_port: None,
+        data_dir: Some(data_dir.clone()),
+        show_logs: false,
+        capture_stderr: true,
+    })
+    .await;
+    let mut client = server.client().await;
+
+    client
+        .write(WriteRequest {
+            key: b"flush:order:1".to_vec(),
+            value: b"created".to_vec(),
+        })
+        .await
+        .unwrap();
+    client
+        .write(WriteRequest {
+            key: b"flush:stock:1".to_vec(),
+            value: b"reserved".to_vec(),
+        })
+        .await
+        .unwrap();
+
+    let sst_before = count_sstable_files(&data_dir);
+    let wal_before = total_wal_bytes(&data_dir);
+
+    let flush = client.flush(FlushRequest {}).await.unwrap().into_inner();
+    assert!(flush.success);
+    assert_eq!(flush.message, "Flush triggered successfully");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while count_sstable_files(&data_dir) == sst_before {
+        assert!(
+            Instant::now() < deadline,
+            "timeout waiting for flush side effect"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    for (key, expected) in [
+        (b"flush:order:1".as_slice(), b"created".as_slice()),
+        (b"flush:stock:1".as_slice(), b"reserved".as_slice()),
+    ] {
+        let resp = client
+            .get(GetRequest {
+                key: key.to_vec(),
+                snapshot_id: 0,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success);
+        assert_eq!(resp.value, expected);
+    }
+
+    assert!(
+        count_sstable_files(&data_dir) > sst_before,
+        "flush should eventually materialize an SSTable"
+    );
+    assert!(
+        total_wal_bytes(&data_dir) != wal_before || count_sstable_files(&data_dir) > sst_before,
+        "flush should either rotate WAL or create an SSTable"
+    );
 }
 
 #[tokio::test]

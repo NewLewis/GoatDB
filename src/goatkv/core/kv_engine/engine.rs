@@ -1111,7 +1111,7 @@ impl KvEngine {
 #[cfg(test)]
 mod tests {
     use super::{BatchWriteOp, KvEngine, ScanOptions};
-    use crate::goatkv::error::ErrorKind;
+    use crate::goatkv::error::{Error as GoatError, ErrorKind};
     use crate::goatkv::metadata::current;
     use crate::goatkv::storage::sstable::{SSTableReader, SstableBlockCompression};
     use crate::goatkv::utils::options::KvEngineOptions;
@@ -1194,6 +1194,12 @@ mod tests {
                     .count()
             })
             .unwrap_or(0)
+    }
+
+    fn reopenable_test_options(data_dir: &Path) -> KvEngineOptions {
+        KvEngineOptions::for_test()
+            .with_data_dir(data_dir)
+            .with_recover_from_wal(true)
     }
 
     #[test]
@@ -2178,6 +2184,374 @@ mod tests {
     }
 
     #[test]
+    fn test_with_transaction_staged_writes_are_overlay_only_until_commit() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = reopenable_test_options(temp_dir.path());
+        let engine = KvEngine::new_with_options(options.clone()).expect("open engine");
+
+        engine.put(b"txn:base".to_vec(), b"v1".to_vec()).unwrap();
+        engine.put(b"txn:gone".to_vec(), b"v2".to_vec()).unwrap();
+        let wal_before = total_wal_bytes(engine.wal_paths().wal_dir());
+        let rows_before = engine
+            .scan(ScanOptions {
+                prefix: Some(b"txn:".to_vec()),
+                ..ScanOptions::default()
+            })
+            .unwrap();
+
+        engine
+            .with_transaction(|txn| {
+                txn.put(b"txn:base".to_vec(), b"v1-new".to_vec())?;
+                txn.delete(b"txn:gone".to_vec())?;
+                txn.put(b"txn:new".to_vec(), b"v3".to_vec())?;
+
+                assert_eq!(txn.get(b"txn:base")?, Some(b"v1-new".to_vec()));
+                assert_eq!(txn.get(b"txn:gone")?, None);
+                assert_eq!(txn.get(b"txn:new")?, Some(b"v3".to_vec()));
+                assert_eq!(
+                    txn.scan(ScanOptions {
+                        prefix: Some(b"txn:".to_vec()),
+                        ..ScanOptions::default()
+                    })?,
+                    vec![
+                        (b"txn:base".to_vec(), b"v1-new".to_vec()),
+                        (b"txn:new".to_vec(), b"v3".to_vec()),
+                    ]
+                );
+
+                assert_eq!(engine.get(b"txn:base")?, Some(b"v1".to_vec()));
+                assert_eq!(engine.get(b"txn:gone")?, Some(b"v2".to_vec()));
+                assert_eq!(engine.get(b"txn:new")?, None);
+                assert_eq!(
+                    engine.scan(ScanOptions {
+                        prefix: Some(b"txn:".to_vec()),
+                        ..ScanOptions::default()
+                    })?,
+                    rows_before
+                );
+                assert_eq!(total_wal_bytes(engine.wal_paths().wal_dir()), wal_before);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            engine
+                .scan(ScanOptions {
+                    prefix: Some(b"txn:".to_vec()),
+                    ..ScanOptions::default()
+                })
+                .unwrap(),
+            rows_before
+        );
+        assert_eq!(total_wal_bytes(engine.wal_paths().wal_dir()), wal_before);
+        drop(engine);
+
+        let reopen = KvEngine::new_with_options(options).expect("reopen engine");
+        assert_eq!(
+            reopen
+                .scan(ScanOptions {
+                    prefix: Some(b"txn:".to_vec()),
+                    ..ScanOptions::default()
+                })
+                .unwrap(),
+            rows_before
+        );
+    }
+
+    #[test]
+    fn test_with_transaction_commit_updates_record_and_index_together() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine
+            .put(b"row:order:1".to_vec(), b"status=open".to_vec())
+            .unwrap();
+        engine
+            .put(
+                b"idx:customer:7:open:order:1".to_vec(),
+                b"row:order:1".to_vec(),
+            )
+            .unwrap();
+
+        engine
+            .with_transaction(|txn| {
+                txn.put(b"row:order:1".to_vec(), b"status=paid".to_vec())?;
+                txn.delete(b"idx:customer:7:open:order:1".to_vec())?;
+                txn.put(
+                    b"idx:customer:7:paid:order:1".to_vec(),
+                    b"row:order:1".to_vec(),
+                )?;
+
+                assert_eq!(
+                    txn.scan(ScanOptions {
+                        prefix: Some(b"idx:customer:7:".to_vec()),
+                        ..ScanOptions::default()
+                    })?,
+                    vec![(
+                        b"idx:customer:7:paid:order:1".to_vec(),
+                        b"row:order:1".to_vec(),
+                    )]
+                );
+                assert_eq!(
+                    engine.get(b"row:order:1")?,
+                    Some(b"status=open".to_vec()),
+                    "base view must not observe half-applied record update before commit"
+                );
+                assert_eq!(
+                    engine.get(b"idx:customer:7:open:order:1")?,
+                    Some(b"row:order:1".to_vec()),
+                    "base view must not observe half-applied index delete before commit"
+                );
+                assert_eq!(engine.get(b"idx:customer:7:paid:order:1")?, None);
+                txn.commit()
+            })
+            .unwrap();
+
+        assert_eq!(
+            engine.get(b"row:order:1").unwrap(),
+            Some(b"status=paid".to_vec())
+        );
+        assert_eq!(engine.get(b"idx:customer:7:open:order:1").unwrap(), None);
+        assert_eq!(
+            engine.get(b"idx:customer:7:paid:order:1").unwrap(),
+            Some(b"row:order:1".to_vec())
+        );
+        assert_eq!(
+            engine
+                .scan(ScanOptions {
+                    prefix: Some(b"idx:customer:7:".to_vec()),
+                    ..ScanOptions::default()
+                })
+                .unwrap(),
+            vec![(
+                b"idx:customer:7:paid:order:1".to_vec(),
+                b"row:order:1".to_vec(),
+            )]
+        );
+    }
+
+    #[test]
+    fn test_with_transaction_rollback_keeps_rows_and_wal_unchanged() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = reopenable_test_options(temp_dir.path());
+        let engine = KvEngine::new_with_options(options.clone()).expect("open engine");
+
+        engine.put(b"txn:keep".to_vec(), b"v1".to_vec()).unwrap();
+        engine.put(b"txn:stay".to_vec(), b"v2".to_vec()).unwrap();
+        let wal_before = total_wal_bytes(engine.wal_paths().wal_dir());
+        let rows_before = engine
+            .scan(ScanOptions {
+                prefix: Some(b"txn:".to_vec()),
+                ..ScanOptions::default()
+            })
+            .unwrap();
+
+        engine
+            .with_transaction(|txn| {
+                txn.put(b"txn:keep".to_vec(), b"v1-new".to_vec())?;
+                txn.delete(b"txn:stay".to_vec())?;
+                txn.put(b"txn:new".to_vec(), b"v3".to_vec())?;
+                txn.rollback()
+            })
+            .unwrap();
+
+        assert_eq!(
+            engine
+                .scan(ScanOptions {
+                    prefix: Some(b"txn:".to_vec()),
+                    ..ScanOptions::default()
+                })
+                .unwrap(),
+            rows_before
+        );
+        assert_eq!(total_wal_bytes(engine.wal_paths().wal_dir()), wal_before);
+        drop(engine);
+
+        let reopen = KvEngine::new_with_options(options).expect("reopen engine");
+        assert_eq!(
+            reopen
+                .scan(ScanOptions {
+                    prefix: Some(b"txn:".to_vec()),
+                    ..ScanOptions::default()
+                })
+                .unwrap(),
+            rows_before
+        );
+    }
+
+    #[test]
+    fn test_with_transaction_compare_and_set_uses_overlay_and_defers_wal_until_commit() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"txn:cas".to_vec(), b"v1".to_vec()).unwrap();
+        let wal_before = total_wal_bytes(engine.wal_paths().wal_dir());
+
+        engine
+            .with_transaction(|txn| {
+                txn.compare_and_set(
+                    b"txn:cas".to_vec(),
+                    Some(b"v1".to_vec()),
+                    Some(b"v2".to_vec()),
+                )?;
+                txn.compare_and_set(b"txn:new".to_vec(), None, Some(b"v3".to_vec()))?;
+
+                assert_eq!(txn.get(b"txn:cas")?, Some(b"v2".to_vec()));
+                assert_eq!(txn.get(b"txn:new")?, Some(b"v3".to_vec()));
+                assert_eq!(engine.get(b"txn:cas")?, Some(b"v1".to_vec()));
+                assert_eq!(engine.get(b"txn:new")?, None);
+
+                let err = txn
+                    .compare_and_set(
+                        b"txn:cas".to_vec(),
+                        Some(b"v1".to_vec()),
+                        Some(b"v4".to_vec()),
+                    )
+                    .expect_err("overlay value should participate in CAS compare");
+                assert_eq!(err.kind(), ErrorKind::Conflict);
+
+                let err = txn
+                    .compare_and_set(b"txn:new".to_vec(), None, Some(b"v5".to_vec()))
+                    .expect_err("new overlay entry should no longer match expected absent");
+                assert_eq!(err.kind(), ErrorKind::Conflict);
+
+                assert_eq!(total_wal_bytes(engine.wal_paths().wal_dir()), wal_before);
+                txn.commit()
+            })
+            .unwrap();
+
+        assert!(
+            total_wal_bytes(engine.wal_paths().wal_dir()) > wal_before,
+            "transaction commit should append once staged CAS operations are published"
+        );
+        assert_eq!(engine.get(b"txn:cas").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(engine.get(b"txn:new").unwrap(), Some(b"v3".to_vec()));
+    }
+
+    #[test]
+    fn test_transaction_post_commit_and_post_rollback_guards_are_explicit() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine
+            .with_transaction(|txn| {
+                txn.put(b"txn:guard".to_vec(), b"v1".to_vec())?;
+                txn.commit()?;
+
+                assert_eq!(txn.get(b"txn:guard")?, Some(b"v1".to_vec()));
+                assert_eq!(
+                    txn.scan(ScanOptions {
+                        prefix: Some(b"txn:guard".to_vec()),
+                        ..ScanOptions::default()
+                    })?,
+                    vec![(b"txn:guard".to_vec(), b"v1".to_vec())]
+                );
+
+                for err in [
+                    txn.put(b"txn:guard".to_vec(), b"v2".to_vec()).unwrap_err(),
+                    txn.delete(b"txn:guard".to_vec()).unwrap_err(),
+                    txn.compare_and_set(
+                        b"txn:guard".to_vec(),
+                        Some(b"v1".to_vec()),
+                        Some(b"v2".to_vec()),
+                    )
+                    .unwrap_err(),
+                    txn.rollback().unwrap_err(),
+                    txn.commit().unwrap_err(),
+                ] {
+                    assert_eq!(err.kind(), ErrorKind::Conflict);
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        let wal_before = total_wal_bytes(engine.wal_paths().wal_dir());
+        engine
+            .with_transaction(|txn| {
+                txn.put(b"txn:rolled".to_vec(), b"temp".to_vec())?;
+                txn.rollback()?;
+                assert_eq!(txn.get(b"txn:rolled")?, None);
+                assert!(txn
+                    .scan(ScanOptions {
+                        prefix: Some(b"txn:rolled".to_vec()),
+                        ..ScanOptions::default()
+                    })?
+                    .is_empty());
+                txn.rollback()?;
+                txn.commit()
+            })
+            .unwrap();
+        assert_eq!(engine.get(b"txn:rolled").unwrap(), None);
+        assert_eq!(total_wal_bytes(engine.wal_paths().wal_dir()), wal_before);
+    }
+
+    #[test]
+    fn test_with_transaction_closure_error_before_commit_does_not_publish_staged_changes() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = reopenable_test_options(temp_dir.path());
+        let engine = KvEngine::new_with_options(options.clone()).expect("open engine");
+
+        engine.put(b"txn:keep".to_vec(), b"v1".to_vec()).unwrap();
+        let wal_before = total_wal_bytes(engine.wal_paths().wal_dir());
+        let rows_before = engine.scan(ScanOptions::default()).unwrap();
+
+        let err = engine
+            .with_transaction(|txn| {
+                txn.put(b"txn:keep".to_vec(), b"v2".to_vec())?;
+                txn.put(b"txn:new".to_vec(), b"v3".to_vec())?;
+                txn.delete(b"txn:missing".to_vec())?;
+                Err::<(), _>(GoatError::internal("txn_test", "boom before commit"))
+            })
+            .expect_err("closure error before commit should be returned");
+        assert_eq!(err.kind(), ErrorKind::Internal);
+
+        assert_eq!(engine.scan(ScanOptions::default()).unwrap(), rows_before);
+        assert_eq!(total_wal_bytes(engine.wal_paths().wal_dir()), wal_before);
+        drop(engine);
+
+        let reopen = KvEngine::new_with_options(options).expect("reopen engine");
+        assert_eq!(reopen.scan(ScanOptions::default()).unwrap(), rows_before);
+    }
+
+    #[test]
+    fn test_with_transaction_error_after_explicit_commit_keeps_committed_writes() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = reopenable_test_options(temp_dir.path());
+        let engine = KvEngine::new_with_options(options.clone()).expect("open engine");
+
+        engine.put(b"txn:base".to_vec(), b"v1".to_vec()).unwrap();
+
+        let err = engine
+            .with_transaction(|txn| {
+                txn.put(b"txn:base".to_vec(), b"v2".to_vec())?;
+                txn.put(b"txn:new".to_vec(), b"v3".to_vec())?;
+                txn.commit()?;
+                Err::<(), _>(GoatError::internal("txn_test", "boom after commit"))
+            })
+            .expect_err("closure should still surface error after explicit commit");
+        assert_eq!(err.kind(), ErrorKind::Internal);
+
+        assert_eq!(engine.get(b"txn:base").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(engine.get(b"txn:new").unwrap(), Some(b"v3".to_vec()));
+        drop(engine);
+
+        let reopen = KvEngine::new_with_options(options).expect("reopen engine");
+        assert_eq!(reopen.get(b"txn:base").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(reopen.get(b"txn:new").unwrap(), Some(b"v3".to_vec()));
+    }
+
+    #[test]
     fn test_multi_get_empty_keys() {
         let rt = test_runtime();
         let _guard = rt.enter();
@@ -2586,7 +2960,12 @@ mod tests {
     fn test_empty_flush_is_noop() {
         let rt = test_runtime();
         let _guard = rt.enter();
-        let engine = KvEngine::new_for_test();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = KvEngineOptions::for_test().with_data_dir(temp_dir.path());
+        let engine = KvEngine::new_with_options(options).expect("open engine");
+        let sst_before = count_sstable_files(engine.sstable_paths().data_dir());
+        let wal_before = total_wal_bytes(engine.wal_paths().wal_dir());
+        let rows_before = engine.scan(ScanOptions::default()).unwrap();
 
         engine.flush();
 
@@ -2597,6 +2976,167 @@ mod tests {
 
         let version = engine.version_set.read().unwrap().current();
         assert!(version.get_files(0).is_empty());
+        assert_eq!(
+            count_sstable_files(engine.sstable_paths().data_dir()),
+            sst_before
+        );
+        assert_eq!(total_wal_bytes(engine.wal_paths().wal_dir()), wal_before);
+        assert_eq!(engine.scan(ScanOptions::default()).unwrap(), rows_before);
+    }
+
+    #[test]
+    fn test_flush_moves_mutable_state_to_sstable_without_changing_logical_results() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = KvEngineOptions::for_test().with_data_dir(temp_dir.path());
+        let engine = KvEngine::new_with_options(options).expect("open engine");
+
+        engine.put(b"flush:a".to_vec(), b"va".to_vec()).unwrap();
+        engine.put(b"flush:b".to_vec(), b"vb".to_vec()).unwrap();
+        engine.put(b"flush:c".to_vec(), b"vc".to_vec()).unwrap();
+        let rows_before = engine
+            .scan(ScanOptions {
+                prefix: Some(b"flush:".to_vec()),
+                ..ScanOptions::default()
+            })
+            .unwrap();
+        let sst_before = count_sstable_files(engine.sstable_paths().data_dir());
+
+        engine.flush();
+        engine
+            .wait_for_immutable_memtables(Duration::from_secs(3))
+            .expect("wait flush");
+
+        assert_eq!(
+            engine
+                .scan(ScanOptions {
+                    prefix: Some(b"flush:".to_vec()),
+                    ..ScanOptions::default()
+                })
+                .unwrap(),
+            rows_before
+        );
+        assert_eq!(engine.get(b"flush:a").unwrap(), Some(b"va".to_vec()));
+        assert_eq!(engine.get(b"flush:b").unwrap(), Some(b"vb".to_vec()));
+        assert_eq!(engine.runtime_metrics().immutable_memtable_backlog, 0);
+        assert!(
+            count_sstable_files(engine.sstable_paths().data_dir()) > sst_before,
+            "flush should materialize at least one SSTable"
+        );
+    }
+
+    #[test]
+    fn test_runtime_metrics_reflect_write_and_flush_lifecycle() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = KvEngineOptions::for_test().with_data_dir(temp_dir.path());
+        let engine = KvEngine::new_with_options(options).expect("open engine");
+
+        let initial = engine.runtime_metrics();
+        assert_eq!(initial.immutable_memtable_backlog, 0);
+        assert_eq!(initial.l0_file_count, 0);
+        assert_eq!(initial.flush_failure_streak, 0);
+        assert!(!initial.flush_circuit_open);
+
+        engine.put(b"metric:a".to_vec(), b"va".to_vec()).unwrap();
+        engine.put(b"metric:b".to_vec(), b"vb".to_vec()).unwrap();
+        let after_write = engine.runtime_metrics();
+        assert_eq!(after_write.l0_file_count, 0);
+        assert_eq!(after_write.flush_failure_streak, 0);
+        assert!(!after_write.flush_circuit_open);
+
+        engine.flush();
+        engine
+            .wait_for_immutable_memtables(Duration::from_secs(3))
+            .expect("wait flush");
+
+        let after_flush = engine.runtime_metrics();
+        assert_eq!(after_flush.immutable_memtable_backlog, 0);
+        assert!(after_flush.l0_file_count >= 1);
+        assert_eq!(after_flush.flush_failure_streak, 0);
+        assert!(!after_flush.flush_circuit_open);
+        assert!(after_flush.read_cache_metrics.is_some());
+    }
+
+    #[test]
+    fn test_read_cache_metrics_change_on_repeated_reads_without_mutating_storage() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = KvEngineOptions::for_test().with_data_dir(temp_dir.path());
+        let engine = KvEngine::new_with_options(options).expect("open engine");
+
+        engine
+            .put(b"cache:key".to_vec(), b"value".to_vec())
+            .unwrap();
+        engine.flush();
+        engine
+            .wait_for_immutable_memtables(Duration::from_secs(3))
+            .expect("wait flush");
+
+        let wal_before = total_wal_bytes(engine.wal_paths().wal_dir());
+        let sst_before = count_sstable_files(engine.sstable_paths().data_dir());
+        let rows_before = engine.scan(ScanOptions::default()).unwrap();
+        let cache_before = engine
+            .read_cache_metrics()
+            .expect("read cache metrics enabled");
+
+        assert_eq!(engine.get(b"cache:key").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(engine.get(b"cache:key").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(engine.get(b"cache:key").unwrap(), Some(b"value".to_vec()));
+
+        let cache_after = engine
+            .read_cache_metrics()
+            .expect("read cache metrics enabled");
+        assert!(
+            cache_after.row_misses > cache_before.row_misses,
+            "first SSTable read should populate row cache"
+        );
+        assert!(
+            cache_after.row_hits > cache_before.row_hits,
+            "repeated SSTable reads should hit row cache"
+        );
+        assert_eq!(total_wal_bytes(engine.wal_paths().wal_dir()), wal_before);
+        assert_eq!(
+            count_sstable_files(engine.sstable_paths().data_dir()),
+            sst_before
+        );
+        assert_eq!(engine.scan(ScanOptions::default()).unwrap(), rows_before);
+    }
+
+    #[test]
+    fn test_metric_reads_are_storage_side_effect_free() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = KvEngineOptions::for_test().with_data_dir(temp_dir.path());
+        let engine = KvEngine::new_with_options(options).expect("open engine");
+
+        engine
+            .put(b"metrics:key".to_vec(), b"value".to_vec())
+            .unwrap();
+        engine.flush();
+        engine
+            .wait_for_immutable_memtables(Duration::from_secs(3))
+            .expect("wait flush");
+
+        let wal_before = total_wal_bytes(engine.wal_paths().wal_dir());
+        let sst_before = count_sstable_files(engine.sstable_paths().data_dir());
+        let rows_before = engine.scan(ScanOptions::default()).unwrap();
+
+        for _ in 0..32 {
+            let _ = engine.runtime_metrics();
+            let _ = engine.read_cache_metrics();
+        }
+
+        assert_eq!(total_wal_bytes(engine.wal_paths().wal_dir()), wal_before);
+        assert_eq!(
+            count_sstable_files(engine.sstable_paths().data_dir()),
+            sst_before
+        );
+        assert_eq!(engine.scan(ScanOptions::default()).unwrap(), rows_before);
     }
 
     #[test]
@@ -2618,17 +3158,81 @@ mod tests {
             err.to_string(),
             "unavailable write_coordinator: write coordinator closed"
         );
+
+        let err = engine
+            .delete(b"key_before_shutdown".to_vec())
+            .expect_err("delete after shutdown should be rejected");
+        assert_eq!(err.kind(), ErrorKind::Unavailable);
+
+        let err = engine
+            .compare_and_set(
+                b"key_before_shutdown".to_vec(),
+                Some(b"value".to_vec()),
+                Some(b"new-value".to_vec()),
+            )
+            .expect_err("compare_and_set after shutdown should be rejected");
+        assert_eq!(err.kind(), ErrorKind::Unavailable);
+
+        assert_eq!(
+            engine.get(b"key_before_shutdown").unwrap(),
+            Some(b"value".to_vec())
+        );
     }
 
     #[test]
     fn test_shutdown_is_idempotent() {
         let rt = test_runtime();
         let _guard = rt.enter();
-        let engine = KvEngine::new_for_test();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = reopenable_test_options(temp_dir.path());
+        let engine = KvEngine::new_with_options(options.clone()).expect("open engine");
         engine.put(b"k".to_vec(), b"v".to_vec()).unwrap();
 
         engine.shutdown().unwrap();
         engine.shutdown().unwrap();
+
+        assert_eq!(engine.get(b"k").unwrap(), Some(b"v".to_vec()));
+        drop(engine);
+
+        let reopen = KvEngine::new_with_options(options).expect("reopen engine");
+        assert_eq!(reopen.get(b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn test_shutdown_drains_pending_flush_work_before_returning() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = reopenable_test_options(temp_dir.path());
+        let engine = KvEngine::new_with_options(options.clone()).expect("open engine");
+
+        let expected_rows = (0..2u32)
+            .map(|i| {
+                let key = format!("s{:02}", i).into_bytes();
+                let value = format!("value:{:02}", i).into_bytes();
+                engine.put(key.clone(), value.clone()).unwrap();
+                (key, value)
+            })
+            .collect::<Vec<_>>();
+
+        engine.flush();
+        engine
+            .wait_for_immutable_memtables(Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(engine.get(b"s00").unwrap(), Some(b"value:00".to_vec()));
+        engine.shutdown().unwrap();
+
+        assert_eq!(engine.runtime_metrics().immutable_memtable_backlog, 0);
+        assert!(
+            count_sstable_files(temp_dir.path().join("data").as_path()) >= 1,
+            "shutdown should flush mutable data to at least one SSTable"
+        );
+        assert_eq!(engine.get(b"s00").unwrap(), Some(b"value:00".to_vec()));
+        drop(engine);
+
+        let reopen = KvEngine::new_with_options(options).expect("reopen engine");
+        assert_eq!(reopen.get(b"s00").unwrap(), Some(b"value:00".to_vec()));
+        assert_eq!(reopen.scan(ScanOptions::default()).unwrap(), expected_rows);
     }
 
     #[test]

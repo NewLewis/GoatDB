@@ -244,6 +244,118 @@ fn reopen_recovers_data_from_existing_wal_and_advances_log_number() {
 }
 
 #[test]
+fn flush_rotates_wal_and_keeps_data_recoverable() {
+    let rt = test_runtime();
+    let _guard = rt.enter();
+    let tmp = temp_dir();
+
+    let engine = KvEngine::new_with_options(engine_options(tmp.path())).expect("open engine");
+    engine.put(b"flush:key:1".to_vec(), b"v1".to_vec()).unwrap();
+    engine.put(b"flush:key:2".to_vec(), b"v2".to_vec()).unwrap();
+    let wal_numbers_before = list_wal_numbers(engine.wal_paths().wal_dir());
+    assert!(
+        !wal_numbers_before.is_empty(),
+        "writer should have created a WAL before flush"
+    );
+
+    engine.flush();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while count_sstable_files(tmp.path().join("data").as_path()) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "timeout waiting for flush to create SSTable"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let wal_numbers_after = list_wal_numbers(engine.wal_paths().wal_dir());
+    assert!(
+        wal_numbers_after
+            .last()
+            .zip(wal_numbers_before.last())
+            .map(|(after, before)| after > before)
+            .unwrap_or(false),
+        "flush should rotate to a newer WAL id"
+    );
+    assert!(
+        count_sstable_files(tmp.path().join("data").as_path()) >= 1,
+        "flush should create at least one SSTable"
+    );
+    drop(engine);
+
+    let reopen = KvEngine::new_with_options(engine_options(tmp.path())).expect("reopen engine");
+    assert_eq!(reopen.get(b"flush:key:1").unwrap(), Some(b"v1".to_vec()));
+    assert_eq!(reopen.get(b"flush:key:2").unwrap(), Some(b"v2".to_vec()));
+    assert_eq!(
+        reopen
+            .scan(ScanOptions {
+                prefix: Some(b"flush:key:".to_vec()),
+                ..ScanOptions::default()
+            })
+            .unwrap(),
+        vec![
+            (b"flush:key:1".to_vec(), b"v1".to_vec()),
+            (b"flush:key:2".to_vec(), b"v2".to_vec()),
+        ]
+    );
+}
+
+#[test]
+fn transaction_commit_survives_recovery_as_one_atomic_unit() {
+    let rt = test_runtime();
+    let _guard = rt.enter();
+    let tmp = temp_dir();
+
+    {
+        let engine = KvEngine::new_with_options(engine_options(tmp.path())).expect("open engine");
+        engine
+            .put(b"row:order:1".to_vec(), b"status=open".to_vec())
+            .unwrap();
+        engine
+            .put(
+                b"idx:customer:7:open:order:1".to_vec(),
+                b"row:order:1".to_vec(),
+            )
+            .unwrap();
+
+        engine
+            .with_transaction(|txn| {
+                txn.put(b"row:order:1".to_vec(), b"status=paid".to_vec())?;
+                txn.delete(b"idx:customer:7:open:order:1".to_vec())?;
+                txn.put(
+                    b"idx:customer:7:paid:order:1".to_vec(),
+                    b"row:order:1".to_vec(),
+                )?;
+                txn.commit()
+            })
+            .unwrap();
+    }
+
+    let reopen = KvEngine::new_with_options(engine_options(tmp.path())).expect("reopen engine");
+    assert_eq!(
+        reopen.get(b"row:order:1").unwrap(),
+        Some(b"status=paid".to_vec())
+    );
+    assert_eq!(reopen.get(b"idx:customer:7:open:order:1").unwrap(), None);
+    assert_eq!(
+        reopen.get(b"idx:customer:7:paid:order:1").unwrap(),
+        Some(b"row:order:1".to_vec())
+    );
+    assert_eq!(
+        reopen
+            .scan(ScanOptions {
+                prefix: Some(b"idx:customer:7:".to_vec()),
+                ..ScanOptions::default()
+            })
+            .unwrap(),
+        vec![(
+            b"idx:customer:7:paid:order:1".to_vec(),
+            b"row:order:1".to_vec(),
+        )]
+    );
+}
+
+#[test]
 fn recovery_replays_wal_across_prealloc_and_bytes_per_sync_profiles() {
     let rt = test_runtime();
     let _guard = rt.enter();

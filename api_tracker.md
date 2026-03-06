@@ -681,7 +681,7 @@
 
 测试项：
 
-- [ ] `FLUSH-UT-001` Flush moves mutable state to SSTable without changing logical results
+- [x] `FLUSH-UT-001` Flush moves mutable state to SSTable without changing logical results
   - 前置：写入多条数据，记录调用前 `get/scan` 结果。
   - 操作：调用 `flush`.
   - 接口断言：
@@ -691,7 +691,7 @@
     - `.sst` 文件数量增加。
     - `immutable_memtable_backlog` 最终归零。
 
-- [ ] `FLUSH-UT-002` Empty flush is a no-op
+- [x] `FLUSH-UT-002` Empty flush is a no-op
   - 前置：空库或刚 flush 完毕。
   - 操作：再次 `flush`.
   - 接口断言：
@@ -700,7 +700,7 @@
     - 不新增 `.sst`.
     - 数据集不变。
 
-- [ ] `FLUSH-IT-003` Flush after write rotates WAL and keeps data recoverable
+- [x] `FLUSH-IT-003` Flush after write rotates WAL and keeps data recoverable
   - 前置：写入数据，记录旧 WAL 文件集合。
   - 操作：`flush`，等待后台 flush 完成，再重启。
   - 接口断言：
@@ -709,7 +709,7 @@
     - 新 WAL 已创建。
     - 被 SSTable 覆盖的旧 WAL 最终可被清理。
 
-- [ ] `FLUSH-E2E-004` gRPC flush acknowledges trigger and preserves logical state
+- [x] `FLUSH-E2E-004` gRPC flush acknowledges trigger and preserves logical state
   - 前置：写入多条数据并记录调用前 `get/scan` 结果。
   - 操作：gRPC `Flush`，随后轮询直到 `immutable_memtable_backlog == 0` 或 `.sst` 增加。
   - 接口断言：
@@ -733,7 +733,7 @@
 
 测试项：
 
-- [ ] `TXN-UT-001` Staged writes are invisible before commit but visible inside transaction overlay
+- [x] `TXN-UT-001` Staged writes are invisible before commit but visible inside transaction overlay
   - 前置：写入 `k1=v1`.
   - 操作：进入 `with_transaction`，执行 `put/delete`，在事务内调用 `txn.get` 和 `txn.scan`，事务外并发调用普通 `get/scan`.
   - 接口断言：
@@ -743,7 +743,7 @@
     - commit 前 WAL 大小不变。
     - commit 前重启不应看到 staged changes.
 
-- [ ] `TXN-UT-002` Commit applies all staged operations atomically
+- [x] `TXN-UT-002` Commit applies all staged operations atomically
   - 前置：初始数据集包含主记录与“模拟索引项”。
   - 操作：事务内同时更新主记录和索引项，然后 `commit`.
   - 接口断言：
@@ -753,7 +753,7 @@
     - 任一普通读不应看到半更新状态。
     - 重启后保持一致。
 
-- [ ] `TXN-UT-003` Rollback leaves database unchanged
+- [x] `TXN-UT-003` Rollback leaves database unchanged
   - 前置：记录调用前 `get/scan/WAL size`.
   - 操作：事务内 staged 多个写入，然后 `rollback`.
   - 接口断言：
@@ -762,7 +762,7 @@
     - 最新数据集不变。
     - WAL 不增长。
 
-- [ ] `TXN-UT-004` Transaction CAS uses overlay + base view and returns conflict correctly
+- [x] `TXN-UT-004` Transaction CAS uses overlay + base view and returns conflict correctly
   - 前置：事务开始前 `k1=v1`.
   - 操作：事务内 `txn.compare_and_set(k1, expected=v1, new=v2)` 与 mismatch case.
   - 接口断言：
@@ -771,7 +771,7 @@
     - mismatch 不写 WAL。
     - match 只有在 commit 后才持久可见。
 
-- [ ] `TXN-UT-005` Post-commit and post-rollback method guards are explicit
+- [x] `TXN-UT-005` Post-commit and post-rollback method guards are explicit
   - 前置：创建事务。
   - 操作：
     - commit 后再次 `put/get/delete/compare_and_set/rollback`.
@@ -781,7 +781,7 @@
   - 数据库状态断言：
     - 禁止“已提交事务再次写入”污染数据库。
 
-- [ ] `TXN-UT-006` Conflicting concurrent transactions are serialized without lost update
+- [x] `TXN-UT-006` Conflicting concurrent transactions are serialized without lost update
   - 前置：`counter=0`.
   - 操作：两个线程同时用 `with_transaction` 读取、加一、提交。
   - 接口断言：
@@ -790,7 +790,7 @@
     - 最终 `counter=2`.
     - 不能出现 `counter=1`.
 
-- [ ] `TXN-IT-007` Commit survives crash-recovery as one atomic unit
+- [x] `TXN-IT-007` Commit survives crash-recovery as one atomic unit
   - 前置：手工构造“事务 commit 之后、flush 之前”的持久化状态。
   - 操作：重启恢复。
   - 接口断言：
@@ -798,7 +798,7 @@
   - 数据库状态断言：
     - 不出现主记录已恢复、索引项未恢复的半提交状态。
 
-- [ ] `TXN-UT-008` Closure error before commit aborts staged changes by drop, not by hidden partial commit
+- [x] `TXN-UT-008` Closure error before commit aborts staged changes by drop, not by hidden partial commit
   - 前置：记录事务开始前的数据集和 WAL 大小。
   - 操作：`with_transaction` 中执行 `txn.put/txn.delete` 后直接返回 `Err`，不调用 `commit`。
   - 接口断言：
@@ -808,7 +808,7 @@
     - WAL 不增长。
     - 重启后也不存在这些变更。
 
-- [ ] `TXN-UT-009` Error returned after explicit commit does not roll back committed writes
+- [x] `TXN-UT-009` Error returned after explicit commit does not roll back committed writes
   - 前置：写入基线数据集。
   - 操作：`with_transaction` 中先 `txn.put`、`txn.commit()`，随后 closure 再返回 `Err`。
   - 接口断言：
@@ -827,7 +827,7 @@
 
 测试项：
 
-- [ ] `METRIC-UT-001` Runtime metrics reflect write and flush lifecycle
+- [x] `METRIC-UT-001` Runtime metrics reflect write and flush lifecycle
   - 前置：空库。
   - 操作：采集一次 metrics，执行写入、flush、等待后台完成，再采集。
   - 接口断言：
@@ -835,7 +835,7 @@
   - 数据库状态断言：
     - `immutable_memtable_backlog`、`l0_file_count`、`pending_compaction_bytes` 与实际过程匹配。
 
-- [ ] `METRIC-UT-002` Read cache metrics change on repeated reads but do not change data state
+- [x] `METRIC-UT-002` Read cache metrics change on repeated reads but do not change data state
   - 前置：写入数据后多次 `get` / `get_with_snapshot`.
   - 操作：读取前后对比 `read_cache_metrics`.
   - 接口断言：
@@ -843,7 +843,7 @@
   - 数据库状态断言：
     - WAL、SST、scan 结果不变。
 
-- [ ] `METRIC-UT-003` Metric reads are side-effect free on storage plane
+- [x] `METRIC-UT-003` Metric reads are side-effect free on storage plane
   - 前置：记录 WAL 大小、SST 数量、数据集。
   - 操作：反复调用 `runtime_metrics` / `read_cache_metrics`.
   - 接口断言：
@@ -859,7 +859,7 @@
 
 测试项：
 
-- [ ] `SHUT-UT-001` Shutdown rejects new writes after close
+- [x] `SHUT-UT-001` Shutdown rejects new writes after close
   - 前置：写入若干 key.
   - 操作：调用 `shutdown`，随后再次 `put/delete/compare_and_set`.
   - 接口断言：
@@ -869,7 +869,7 @@
     - 已有数据仍可读取。
     - 不得接受新写入。
 
-- [ ] `SHUT-UT-002` Shutdown drains pending flush work before returning
+- [x] `SHUT-UT-002` Shutdown drains pending flush work before returning
   - 前置：构造有 pending immutable memtable 的场景。
   - 操作：调用 `shutdown`.
   - 接口断言：
@@ -878,7 +878,7 @@
     - 重启后数据完整。
     - 不应因为 shutdown 丢失刚刚提交的数据。
 
-- [ ] `SHUT-UT-003` Shutdown is idempotent
+- [x] `SHUT-UT-003` Shutdown is idempotent
   - 前置：任意库状态。
   - 操作：调用两次 `shutdown`.
   - 接口断言：
