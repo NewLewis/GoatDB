@@ -1167,6 +1167,23 @@ mod tests {
             .unwrap_or(0)
     }
 
+    fn total_wal_bytes(wal_dir: &Path) -> u64 {
+        fs::read_dir(wal_dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|entry| {
+                        let path = entry.path();
+                        if path.extension().and_then(|ext| ext.to_str()) != Some("wal") {
+                            return None;
+                        }
+                        fs::metadata(path).ok().map(|meta| meta.len())
+                    })
+                    .sum::<u64>()
+            })
+            .unwrap_or(0)
+    }
+
     fn count_sstable_files(data_dir: &Path) -> usize {
         fs::read_dir(data_dir)
             .map(|entries| {
@@ -1193,7 +1210,9 @@ mod tests {
         assert!(sstable_paths.tmp_dir().exists());
         assert!(temp_dir.path().join("log").exists());
 
-        let options = KvEngineOptions::for_test().with_data_dir(temp_dir.path());
+        let options = KvEngineOptions::for_test()
+            .with_data_dir(temp_dir.path())
+            .with_recover_from_wal(true);
         let engine = KvEngine::new_with_options(options).expect("open engine");
 
         assert!(
@@ -1291,9 +1310,12 @@ mod tests {
             (wal_dir, data_dir, tmp_dir, base_dir)
         };
 
-        let reopen =
-            KvEngine::new_with_options(KvEngineOptions::for_test().with_data_dir(temp_dir.path()))
-                .expect("reopen engine");
+        let reopen = KvEngine::new_with_options(
+            KvEngineOptions::for_test()
+                .with_data_dir(temp_dir.path())
+                .with_recover_from_wal(true),
+        )
+        .expect("reopen engine");
         assert_eq!(reopen.wal_paths().wal_dir(), wal_dir_before.as_path());
         assert_eq!(reopen.sstable_paths().data_dir(), data_dir_before.as_path());
         assert_eq!(reopen.sstable_paths().tmp_dir(), tmp_dir_before.as_path());
@@ -1408,6 +1430,117 @@ mod tests {
     }
 
     #[test]
+    fn test_put_new_key_grows_wal_is_scan_visible_and_survives_reopen() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = KvEngineOptions::for_test()
+            .with_data_dir(temp_dir.path())
+            .with_recover_from_wal(true);
+
+        let wal_bytes_before = {
+            let engine = KvEngine::new_with_options(options.clone()).expect("open engine");
+            let wal_bytes_before = total_wal_bytes(engine.wal_paths().wal_dir());
+
+            engine.put(b"k1".to_vec(), b"v1".to_vec()).expect("put");
+            assert_eq!(engine.get(b"k1").expect("get"), Some(b"v1".to_vec()));
+            assert_eq!(
+                engine
+                    .scan(ScanOptions {
+                        prefix: Some(b"k".to_vec()),
+                        ..ScanOptions::default()
+                    })
+                    .expect("scan"),
+                vec![(b"k1".to_vec(), b"v1".to_vec())]
+            );
+            assert!(
+                total_wal_bytes(engine.wal_paths().wal_dir()) > wal_bytes_before,
+                "put should append to WAL"
+            );
+            total_wal_bytes(engine.wal_paths().wal_dir())
+        };
+
+        let reopen = KvEngine::new_with_options(
+            KvEngineOptions::for_test()
+                .with_data_dir(temp_dir.path())
+                .with_recover_from_wal(true),
+        )
+        .expect("reopen engine");
+        assert_eq!(
+            reopen.get(b"k1").expect("get after reopen"),
+            Some(b"v1".to_vec())
+        );
+        assert!(
+            total_wal_bytes(reopen.wal_paths().wal_dir()) >= wal_bytes_before,
+            "reopen should preserve or extend WAL state after recovery"
+        );
+    }
+
+    #[test]
+    fn test_put_overwrite_keeps_old_snapshot_visible_after_flush() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"k1".to_vec(), b"v1".to_vec()).unwrap();
+        let snapshot = engine.create_snapshot().unwrap();
+
+        engine.put(b"k1".to_vec(), b"v2".to_vec()).unwrap();
+        engine.flush();
+        engine
+            .wait_for_immutable_memtables(Duration::from_secs(3))
+            .expect("wait flush");
+
+        assert_eq!(engine.get(b"k1").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(
+            engine.get_with_snapshot(b"k1", snapshot.id).unwrap(),
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(
+            engine
+                .scan(ScanOptions::default())
+                .expect("scan latest overwrite"),
+            vec![(b"k1".to_vec(), b"v2".to_vec())]
+        );
+        assert_eq!(
+            engine
+                .scan_with_snapshot(ScanOptions::default(), snapshot.id)
+                .expect("scan snapshot overwrite"),
+            vec![(b"k1".to_vec(), b"v1".to_vec())]
+        );
+        engine.release_snapshot(snapshot.id).unwrap();
+    }
+
+    #[test]
+    fn test_engine_put_currently_accepts_empty_key() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(Vec::new(), b"empty-key".to_vec()).unwrap();
+        assert_eq!(engine.get(b"").unwrap(), Some(b"empty-key".to_vec()));
+    }
+
+    #[test]
+    fn test_put_zero_length_value_is_not_treated_as_delete() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"empty-value".to_vec(), Vec::new()).unwrap();
+        assert_eq!(engine.get(b"empty-value").unwrap(), Some(Vec::new()));
+        assert_eq!(
+            engine
+                .scan(ScanOptions {
+                    prefix: Some(b"empty".to_vec()),
+                    ..ScanOptions::default()
+                })
+                .unwrap(),
+            vec![(b"empty-value".to_vec(), Vec::new())]
+        );
+    }
+
+    #[test]
     fn test_commit_batch_mixes_put_and_delete_atomically() {
         let rt = test_runtime();
         let _guard = rt.enter();
@@ -1427,6 +1560,82 @@ mod tests {
         assert_eq!(engine.get(b"k1").unwrap(), Some(b"new1".to_vec()));
         assert_eq!(engine.get(b"k2").unwrap(), None);
         assert_eq!(engine.get(b"k3").unwrap(), Some(b"new3".to_vec()));
+    }
+
+    #[test]
+    fn test_commit_batch_atomic_result_survives_reopen() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = KvEngineOptions::for_test()
+            .with_data_dir(temp_dir.path())
+            .with_recover_from_wal(true);
+
+        {
+            let engine = KvEngine::new_with_options(options.clone()).expect("open engine");
+            engine.put(b"k1".to_vec(), b"old1".to_vec()).unwrap();
+            engine.put(b"k2".to_vec(), b"old2".to_vec()).unwrap();
+            engine
+                .commit_batch(vec![
+                    BatchWriteOp::Put(b"k1".to_vec(), b"new1".to_vec()),
+                    BatchWriteOp::Delete(b"k2".to_vec()),
+                    BatchWriteOp::Put(b"k3".to_vec(), b"new3".to_vec()),
+                ])
+                .unwrap();
+        }
+
+        let reopen = KvEngine::new_with_options(
+            KvEngineOptions::for_test()
+                .with_data_dir(temp_dir.path())
+                .with_recover_from_wal(true),
+        )
+        .expect("reopen engine");
+        assert_eq!(reopen.get(b"k1").unwrap(), Some(b"new1".to_vec()));
+        assert_eq!(reopen.get(b"k2").unwrap(), None);
+        assert_eq!(reopen.get(b"k3").unwrap(), Some(b"new3".to_vec()));
+    }
+
+    #[test]
+    fn test_put_batch_duplicate_keys_last_write_wins() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+        let snapshot = engine.create_snapshot().unwrap();
+
+        engine
+            .put_batch(vec![
+                (b"k1".to_vec(), b"v1".to_vec()),
+                (b"k1".to_vec(), b"v2".to_vec()),
+            ])
+            .unwrap();
+
+        assert_eq!(engine.get(b"k1").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(engine.get_with_snapshot(b"k1", snapshot.id).unwrap(), None);
+        engine.release_snapshot(snapshot.id).unwrap();
+    }
+
+    #[test]
+    fn test_empty_batch_is_noop_for_wal_and_visible_state() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = KvEngineOptions::for_test()
+            .with_data_dir(temp_dir.path())
+            .with_recover_from_wal(true);
+        let engine = KvEngine::new_with_options(options).expect("open engine");
+        engine.put(b"anchor".to_vec(), b"value".to_vec()).unwrap();
+
+        let wal_bytes_before = total_wal_bytes(engine.wal_paths().wal_dir());
+        let rows_before = engine.scan(ScanOptions::default()).unwrap();
+
+        engine.commit_batch(Vec::new()).unwrap();
+        engine.put_batch(Vec::new()).unwrap();
+
+        assert_eq!(engine.scan(ScanOptions::default()).unwrap(), rows_before);
+        assert_eq!(
+            total_wal_bytes(engine.wal_paths().wal_dir()),
+            wal_bytes_before
+        );
     }
 
     #[test]
@@ -1559,12 +1768,44 @@ mod tests {
     }
 
     #[test]
+    fn test_compare_and_set_update_survives_reopen_and_grows_wal() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = KvEngineOptions::for_test()
+            .with_data_dir(temp_dir.path())
+            .with_recover_from_wal(true);
+
+        {
+            let engine = KvEngine::new_with_options(options.clone()).expect("open engine");
+            engine.put(b"cas".to_vec(), b"v1".to_vec()).unwrap();
+            let wal_before = total_wal_bytes(engine.wal_paths().wal_dir());
+            engine
+                .compare_and_set(b"cas".to_vec(), Some(b"v1".to_vec()), Some(b"v2".to_vec()))
+                .unwrap();
+            assert!(
+                total_wal_bytes(engine.wal_paths().wal_dir()) > wal_before,
+                "successful CAS should append to WAL"
+            );
+        }
+
+        let reopen = KvEngine::new_with_options(
+            KvEngineOptions::for_test()
+                .with_data_dir(temp_dir.path())
+                .with_recover_from_wal(true),
+        )
+        .expect("reopen engine");
+        assert_eq!(reopen.get(b"cas").unwrap(), Some(b"v2".to_vec()));
+    }
+
+    #[test]
     fn test_compare_and_set_returns_conflict_on_mismatch() {
         let rt = test_runtime();
         let _guard = rt.enter();
         let engine = KvEngine::new_for_test();
 
         engine.put(b"cas".to_vec(), b"v1".to_vec()).unwrap();
+        let wal_before = total_wal_bytes(engine.wal_paths().wal_dir());
         let err = engine
             .compare_and_set(
                 b"cas".to_vec(),
@@ -1574,6 +1815,7 @@ mod tests {
             .expect_err("cas mismatch should fail");
         assert_eq!(err.kind(), ErrorKind::Conflict);
         assert_eq!(engine.get(b"cas").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(total_wal_bytes(engine.wal_paths().wal_dir()), wal_before);
     }
 
     #[test]
@@ -1591,6 +1833,66 @@ mod tests {
             .compare_and_set(b"cas_new".to_vec(), Some(b"v1".to_vec()), None)
             .unwrap();
         assert_eq!(engine.get(b"cas_new").unwrap(), None);
+    }
+
+    #[test]
+    fn test_compare_and_set_insert_and_delete_survive_reopen() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = KvEngineOptions::for_test()
+            .with_data_dir(temp_dir.path())
+            .with_recover_from_wal(true);
+
+        {
+            let engine = KvEngine::new_with_options(options.clone()).expect("open engine");
+            engine
+                .compare_and_set(b"cas_new".to_vec(), None, Some(b"v1".to_vec()))
+                .unwrap();
+            engine
+                .compare_and_set(b"cas_del".to_vec(), None, Some(b"v1".to_vec()))
+                .unwrap();
+            engine
+                .compare_and_set(b"cas_del".to_vec(), Some(b"v1".to_vec()), None)
+                .unwrap();
+        }
+
+        let reopen = KvEngine::new_with_options(
+            KvEngineOptions::for_test()
+                .with_data_dir(temp_dir.path())
+                .with_recover_from_wal(true),
+        )
+        .expect("reopen engine");
+        assert_eq!(reopen.get(b"cas_new").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(reopen.get(b"cas_del").unwrap(), None);
+    }
+
+    #[test]
+    fn test_compare_and_set_absent_present_mismatch_does_not_create_phantom_write() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"k_present".to_vec(), b"v1".to_vec()).unwrap();
+        let wal_before = total_wal_bytes(engine.wal_paths().wal_dir());
+
+        let err_present = engine
+            .compare_and_set(b"k_present".to_vec(), None, Some(b"v2".to_vec()))
+            .expect_err("present key should conflict when expected absent");
+        assert_eq!(err_present.kind(), ErrorKind::Conflict);
+
+        let err_absent = engine
+            .compare_and_set(
+                b"k_absent".to_vec(),
+                Some(b"v1".to_vec()),
+                Some(b"v2".to_vec()),
+            )
+            .expect_err("absent key should conflict when expected present");
+        assert_eq!(err_absent.kind(), ErrorKind::Conflict);
+
+        assert_eq!(engine.get(b"k_present").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(engine.get(b"k_absent").unwrap(), None);
+        assert_eq!(total_wal_bytes(engine.wal_paths().wal_dir()), wal_before);
     }
 
     #[test]
@@ -1770,6 +2072,72 @@ mod tests {
 
         engine.delete(b"nonexistent".to_vec()).unwrap();
         assert_eq!(engine.get(b"nonexistent").unwrap(), None);
+    }
+
+    #[test]
+    fn test_delete_existing_key_hides_latest_view_grows_wal_and_survives_reopen() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = KvEngineOptions::for_test()
+            .with_data_dir(temp_dir.path())
+            .with_recover_from_wal(true);
+
+        {
+            let engine = KvEngine::new_with_options(options.clone()).expect("open engine");
+            engine.put(b"k1".to_vec(), b"v1".to_vec()).unwrap();
+            let wal_before = total_wal_bytes(engine.wal_paths().wal_dir());
+
+            engine.delete(b"k1".to_vec()).unwrap();
+
+            assert_eq!(engine.get(b"k1").unwrap(), None);
+            assert!(
+                engine.scan(ScanOptions::default()).unwrap().is_empty(),
+                "deleted key must disappear from latest scan view"
+            );
+            assert!(
+                total_wal_bytes(engine.wal_paths().wal_dir()) > wal_before,
+                "delete should append a tombstone to WAL"
+            );
+        }
+
+        let reopen = KvEngine::new_with_options(
+            KvEngineOptions::for_test()
+                .with_data_dir(temp_dir.path())
+                .with_recover_from_wal(true),
+        )
+        .expect("reopen engine");
+        assert_eq!(reopen.get(b"k1").unwrap(), None);
+    }
+
+    #[test]
+    fn test_delete_preserves_snapshot_visibility_after_flush() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"k1".to_vec(), b"v1".to_vec()).unwrap();
+        let snapshot = engine.create_snapshot().unwrap();
+
+        engine.delete(b"k1".to_vec()).unwrap();
+        engine.flush();
+        engine
+            .wait_for_immutable_memtables(Duration::from_secs(3))
+            .expect("wait flush");
+
+        assert_eq!(engine.get(b"k1").unwrap(), None);
+        assert_eq!(
+            engine.get_with_snapshot(b"k1", snapshot.id).unwrap(),
+            Some(b"v1".to_vec())
+        );
+        assert!(engine.scan(ScanOptions::default()).unwrap().is_empty());
+        assert_eq!(
+            engine
+                .scan_with_snapshot(ScanOptions::default(), snapshot.id)
+                .unwrap(),
+            vec![(b"k1".to_vec(), b"v1".to_vec())]
+        );
+        engine.release_snapshot(snapshot.id).unwrap();
     }
 
     #[test]

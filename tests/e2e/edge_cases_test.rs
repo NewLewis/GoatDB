@@ -1,13 +1,33 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+use std::fs;
+use std::path::Path;
 use std::time::Duration;
 
 use common::test_server::goatkv::{
-    DeleteRequest, FlushRequest, GetRequest, UpdateRequest, WriteRequest,
+    CompareAndSetRequest, DeleteRequest, FlushRequest, GetRequest, UpdateRequest, WriteRequest,
 };
 use common::test_server::{should_skip_network_e2e, TestServer, TestServerOptions};
 use tonic::Code;
+
+fn total_wal_bytes(data_dir: &Path) -> u64 {
+    let wal_dir = data_dir.join("wal");
+    fs::read_dir(wal_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    if path.extension().and_then(|ext| ext.to_str()) != Some("wal") {
+                        return None;
+                    }
+                    fs::metadata(path).ok().map(|meta| meta.len())
+                })
+                .sum::<u64>()
+        })
+        .unwrap_or(0)
+}
 
 #[tokio::test]
 async fn test_rejects_empty_key_requests() {
@@ -17,6 +37,7 @@ async fn test_rejects_empty_key_requests() {
 
     let server = TestServer::start().await;
     let mut client = server.client().await;
+    let wal_before = total_wal_bytes(&server.data_dir);
 
     let status = client
         .write(WriteRequest {
@@ -51,6 +72,24 @@ async fn test_rejects_empty_key_requests() {
         .unwrap_err();
     assert_eq!(status.code(), Code::InvalidArgument);
 
+    let status = client
+        .compare_and_set(CompareAndSetRequest {
+            key: vec![],
+            expect_exists: false,
+            expected_value: Vec::new(),
+            new_value: b"value".to_vec(),
+            delete_on_match: false,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument);
+
+    assert_eq!(
+        total_wal_bytes(&server.data_dir),
+        wal_before,
+        "invalid empty-key requests must not append WAL"
+    );
+
     // 服务器应仍可正常处理请求
     let ok = client
         .write(WriteRequest {
@@ -80,6 +119,7 @@ async fn test_update_nonexistent_key_is_upsert() {
         .unwrap()
         .into_inner();
     assert!(resp.success);
+    assert_eq!(resp.message, "Updated successfully (upsert)");
 
     let get_resp = client
         .get(GetRequest {
@@ -91,6 +131,58 @@ async fn test_update_nonexistent_key_is_upsert() {
         .into_inner();
     assert!(get_resp.success);
     assert_eq!(get_resp.value, b"value".to_vec());
+}
+
+#[tokio::test]
+async fn test_empty_value_roundtrip_for_write_and_update() {
+    if should_skip_network_e2e() {
+        return;
+    }
+
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    let write = client
+        .write(WriteRequest {
+            key: b"empty_value".to_vec(),
+            value: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(write.success);
+
+    let get = client
+        .get(GetRequest {
+            key: b"empty_value".to_vec(),
+            snapshot_id: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(get.success);
+    assert_eq!(get.value, Vec::new());
+
+    let update = client
+        .update(UpdateRequest {
+            key: b"empty_value".to_vec(),
+            value: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(update.success);
+
+    let get = client
+        .get(GetRequest {
+            key: b"empty_value".to_vec(),
+            snapshot_id: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(get.success);
+    assert_eq!(get.value, Vec::new());
 }
 
 #[tokio::test]
@@ -204,8 +296,25 @@ async fn test_delete_nonexistent_key_is_idempotent() {
         return;
     }
 
-    let server = TestServer::start().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = temp_dir.path().to_path_buf();
+    let mut server = TestServer::start_with_options(TestServerOptions {
+        port: None,
+        health_port: None,
+        data_dir: Some(data_dir.clone()),
+        show_logs: false,
+        capture_stderr: true,
+    })
+    .await;
     let mut client = server.client().await;
+
+    client
+        .write(WriteRequest {
+            key: b"stable_key".to_vec(),
+            value: b"stable_value".to_vec(),
+        })
+        .await
+        .unwrap();
 
     for _ in 0..3 {
         let resp = client
@@ -227,6 +336,52 @@ async fn test_delete_nonexistent_key_is_idempotent() {
         .unwrap()
         .into_inner();
     assert!(!get_resp.success);
+
+    let stable = client
+        .get(GetRequest {
+            key: b"stable_key".to_vec(),
+            snapshot_id: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(stable.success);
+    assert_eq!(stable.value, b"stable_value".to_vec());
+
+    server.kill();
+    drop(server);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let server = TestServer::start_with_options(TestServerOptions {
+        port: None,
+        health_port: None,
+        data_dir: Some(data_dir),
+        show_logs: false,
+        capture_stderr: true,
+    })
+    .await;
+    let mut client = server.client().await;
+
+    let get_resp = client
+        .get(GetRequest {
+            key: b"missing_key".to_vec(),
+            snapshot_id: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!get_resp.success);
+
+    let stable = client
+        .get(GetRequest {
+            key: b"stable_key".to_vec(),
+            snapshot_id: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(stable.success);
+    assert_eq!(stable.value, b"stable_value".to_vec());
 }
 
 #[tokio::test]

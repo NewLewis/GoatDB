@@ -60,8 +60,10 @@ async fn test_update_existing_key() {
             value: b"value2".to_vec(),
         })
         .await
-        .unwrap();
-    assert!(response.into_inner().success);
+        .unwrap()
+        .into_inner();
+    assert!(response.success);
+    assert_eq!(response.message, "Updated successfully (upsert)");
 
     // 3. 验证更新成功
     let get_resp = client

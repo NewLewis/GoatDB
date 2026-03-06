@@ -224,7 +224,7 @@
 
 测试项：
 
-- [ ] `PUT-UT-001` Put on new key writes latest value and survives reopen
+- [x] `PUT-UT-001` Put on new key writes latest value and survives reopen
   - 前置：空库。
   - 操作：`put("k1","v1")` 或 gRPC `Write`.
   - 接口断言：
@@ -235,7 +235,7 @@
     - 未 flush 前 `scan(prefix="k")` 已可见。
     - 重启后仍可见。
 
-- [ ] `PUT-UT-002` Overwrite updates latest view but old snapshot still sees previous version
+- [x] `PUT-UT-002` Overwrite updates latest view but old snapshot still sees previous version
   - 前置：先写入 `"k1"="v1"` 并创建快照。
   - 操作：再次 `put("k1","v2")`.
   - 接口断言：
@@ -246,7 +246,7 @@
     - `scan(snapshot)` 返回旧值。
     - flush + compaction 后快照语义仍成立，直到释放快照。
 
-- [ ] `PUT-E2E-003` Transport validation differs from engine contract
+- [x] `PUT-E2E-003` Transport validation differs from engine contract
   - 前置：空库。
   - 操作：gRPC `Write` 和 `Update` 传空 key；engine 层直接 `put(vec![], value)`.
   - 接口断言：
@@ -256,7 +256,7 @@
     - 被拒绝的 gRPC 请求不能产生 WAL 追加。
     - 数据库可见集不变。
 
-- [ ] `UPDATE-E2E-004` Update behaves as upsert, not compare-and-update
+- [x] `UPDATE-E2E-004` Update behaves as upsert, not compare-and-update
   - 前置：分别准备“key 存在”和“key 不存在”两种场景。
   - 操作：gRPC `Update`.
   - 接口断言：
@@ -267,7 +267,7 @@
     - 存在时覆盖旧值。
     - 重启后结果保持。
 
-- [ ] `PUT-E2E-005` Empty value is stored as a zero-length value, not treated as delete
+- [x] `PUT-E2E-005` Empty value is stored as a zero-length value, not treated as delete
   - 前置：空库。
   - 操作：分别通过 gRPC `Write` 和 `Update` 写入 `key="k_empty", value=""`。
   - 接口断言：
@@ -286,7 +286,7 @@
 
 测试项：
 
-- [ ] `DEL-UT-001` Delete existing key hides it from latest reads and scans
+- [x] `DEL-UT-001` Delete existing key hides it from latest reads and scans
   - 前置：写入 `"k1"="v1"`.
   - 操作：`delete("k1")`.
   - 接口断言：
@@ -297,7 +297,7 @@
     - WAL 增长。
     - 重启后仍不可见。
 
-- [ ] `DEL-UT-002` Delete preserves historical snapshot
+- [x] `DEL-UT-002` Delete preserves historical snapshot
   - 前置：写入 `"k1"="v1"` 后创建快照。
   - 操作：`delete("k1")`.
   - 接口断言：
@@ -306,7 +306,7 @@
   - 数据库状态断言：
     - flush/compaction 后，未释放快照前仍能读到旧值。
 
-- [ ] `DEL-E2E-003` Delete missing key is idempotent success but still tests database invariants
+- [x] `DEL-E2E-003` Delete missing key is idempotent success but still tests database invariants
   - 前置：不存在的 key。
   - 操作：gRPC `Delete`.
   - 接口断言：
@@ -316,7 +316,7 @@
     - 若实现写 tombstone，则 WAL 可能增长；无论是否增长，重启后都不得出现伪造值。
     - 不得影响其他 key.
 
-- [ ] `DEL-E2E-004` Empty key is rejected before reaching storage engine
+- [x] `DEL-E2E-004` Empty key is rejected before reaching storage engine
   - 前置：记录调用前 WAL 文件大小和若干现有 key 的读结果。
   - 操作：gRPC `Delete(key="")`.
   - 接口断言：
@@ -334,7 +334,7 @@
 
 测试项：
 
-- [ ] `BATCH-UT-001` Mixed batch is atomically visible
+- [x] `BATCH-UT-001` Mixed batch is atomically visible
   - 前置：写入 `k1=old1`, `k2=old2`.
   - 操作：`commit_batch([Put(k1,new1), Delete(k2), Put(k3,new3)])`.
   - 接口断言：
@@ -344,7 +344,7 @@
     - 不允许出现中间态。
     - 重启后保持一致。
 
-- [ ] `BATCH-IT-002` Incomplete tail batch is rolled back during recovery
+- [x] `BATCH-IT-002` Incomplete tail batch is rolled back during recovery
   - 前置：人工构造批量 WAL，仅写入 marker + 前半段 payload.
   - 操作：重开引擎恢复。
   - 接口断言：
@@ -353,7 +353,7 @@
     - 整批数据全部不可见。
     - WAL 被回滚到 batch 起点，而不是保留半批。
 
-- [ ] `BATCH-UT-003` Duplicate keys inside batch obey sequence order
+- [x] `BATCH-UT-003` Duplicate keys inside batch obey sequence order
   - 前置：空库。
   - 操作：`put_batch([("k1","v1"), ("k1","v2")])` 或 `commit_batch([Put(k1,v1), Put(k1,v2)])`.
   - 接口断言：
@@ -362,7 +362,7 @@
     - 最新 `get("k1") == "v2"`.
     - 快照若创建在 batch 前，应看不到 batch 结果。
 
-- [ ] `BATCH-UT-004` Empty batch is a no-op
+- [x] `BATCH-UT-004` Empty batch is a no-op
   - 前置：记录调用前 WAL 文件大小和 `scan` 结果。
   - 操作：`commit_batch([])` / `put_batch([])`.
   - 接口断言：
@@ -545,7 +545,7 @@
 
 测试项：
 
-- [ ] `CAS-UT-001` Match update changes exactly one key and survives restart
+- [x] `CAS-UT-001` Match update changes exactly one key and survives restart
   - 前置：写入 `k1=v1`.
   - 操作：`compare_and_set(k1, expected=v1, new=v2)`.
   - 接口断言：
@@ -555,7 +555,7 @@
     - WAL 增长。
     - 重启后仍为 `v2`.
 
-- [ ] `CAS-UT-002` Mismatch returns conflict and leaves database untouched
+- [x] `CAS-UT-002` Mismatch returns conflict and leaves database untouched
   - 前置：写入 `k1=v1`，记录调用前 WAL 大小。
   - 操作：`compare_and_set(k1, expected=wrong, new=v2)`.
   - 接口断言：
@@ -565,7 +565,7 @@
     - `scan` 结果不变。
     - WAL 大小不变。
 
-- [ ] `CAS-UT-003` Supports insert-on-absent and delete-on-match
+- [x] `CAS-UT-003` Supports insert-on-absent and delete-on-match
   - 前置：空 key `k_new`；已有 key `k_del=v1`.
   - 操作：
     - `compare_and_set(k_new, expected=None, new=v1)`
@@ -577,7 +577,7 @@
     - 删除后不可见。
     - 重启后状态保持。
 
-- [ ] `CAS-E2E-004` Transport field precedence is explicit
+- [x] `CAS-E2E-004` Transport field precedence is explicit
   - 前置：写入 `k1=v1`.
   - 操作：gRPC `CompareAndSet(delete_on_match=true, new_value=nonempty)`.
   - 接口断言：
@@ -586,7 +586,7 @@
     - `k1` 被删除。
     - 不产生意外新值。
 
-- [ ] `CAS-UT-005` Absent-vs-present expectation mismatch never creates phantom writes
+- [x] `CAS-UT-005` Absent-vs-present expectation mismatch never creates phantom writes
   - 前置：准备 `k_present=v1`，并保证 `k_absent` 不存在。
   - 操作：
     - 对 `k_present` 执行 `expected=None, new=v2`
@@ -598,7 +598,7 @@
     - `k_absent` 仍不存在。
     - WAL 不增长。
 
-- [ ] `CAS-E2E-006` Empty key is rejected before compare-and-set reaches engine
+- [x] `CAS-E2E-006` Empty key is rejected before compare-and-set reaches engine
   - 前置：记录调用前 WAL 大小和样本 key 的读结果。
   - 操作：gRPC `CompareAndSet(key="")`.
   - 接口断言：
