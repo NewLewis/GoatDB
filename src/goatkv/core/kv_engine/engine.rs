@@ -1112,8 +1112,12 @@ impl KvEngine {
 mod tests {
     use super::{BatchWriteOp, KvEngine, ScanOptions};
     use crate::goatkv::error::ErrorKind;
+    use crate::goatkv::metadata::current;
     use crate::goatkv::storage::sstable::{SSTableReader, SstableBlockCompression};
     use crate::goatkv::utils::options::KvEngineOptions;
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -1149,6 +1153,243 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    fn count_wal_files(wal_dir: &Path) -> usize {
+        fs::read_dir(wal_dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("wal"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    fn count_sstable_files(data_dir: &Path) -> usize {
+        fs::read_dir(data_dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sst"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn test_init_db_paths_creates_complete_layout_and_empty_scan() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+
+        let (wal_paths, sstable_paths, manifest_paths) =
+            KvEngine::init_db_paths(temp_dir.path()).expect("init db paths");
+        assert!(manifest_paths.base_dir().exists());
+        assert!(manifest_paths.data_dir().exists());
+        assert!(wal_paths.wal_dir().exists());
+        assert!(sstable_paths.tmp_dir().exists());
+        assert!(temp_dir.path().join("log").exists());
+
+        let options = KvEngineOptions::for_test().with_data_dir(temp_dir.path());
+        let engine = KvEngine::new_with_options(options).expect("open engine");
+
+        assert!(
+            count_wal_files(engine.wal_paths().wal_dir()) >= 1,
+            "opening the engine should create an active WAL file"
+        );
+        assert_eq!(
+            engine.scan(ScanOptions::default()).expect("scan"),
+            Vec::<(Vec<u8>, Vec<u8>)>::new()
+        );
+    }
+
+    #[test]
+    fn test_new_with_options_isolates_storage_between_directories() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let dir_a = temp_dir.path().join("db_a");
+        let dir_b = temp_dir.path().join("db_b");
+
+        let engine_a =
+            KvEngine::new_with_options(KvEngineOptions::for_test().with_data_dir(&dir_a))
+                .expect("open engine_a");
+        engine_a
+            .put(b"shared-key".to_vec(), b"value-a".to_vec())
+            .expect("put into engine_a");
+        assert_eq!(
+            engine_a.get(b"shared-key").expect("get engine_a"),
+            Some(b"value-a".to_vec())
+        );
+
+        let engine_b =
+            KvEngine::new_with_options(KvEngineOptions::for_test().with_data_dir(&dir_b))
+                .expect("open engine_b");
+        assert_eq!(engine_b.get(b"shared-key").expect("get engine_b"), None);
+        assert_eq!(
+            engine_b
+                .scan(ScanOptions::default())
+                .expect("scan engine_b"),
+            Vec::<(Vec<u8>, Vec<u8>)>::new()
+        );
+
+        for dir in [&dir_a, &dir_b] {
+            assert!(dir.join("wal").exists(), "{dir:?} missing wal/");
+            assert!(dir.join("data").exists(), "{dir:?} missing data/");
+            assert!(dir.join("tmp").exists(), "{dir:?} missing tmp/");
+            assert!(dir.join("log").exists(), "{dir:?} missing log/");
+        }
+
+        assert!(
+            count_wal_files(engine_a.wal_paths().wal_dir()) >= 1,
+            "engine_a should have at least one WAL file"
+        );
+        assert!(
+            count_wal_files(engine_b.wal_paths().wal_dir()) >= 1,
+            "engine_b should have at least one WAL file"
+        );
+    }
+
+    #[test]
+    fn test_path_accessors_point_to_live_artifacts_across_reopen() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = KvEngineOptions::for_test().with_data_dir(temp_dir.path());
+
+        let (wal_dir_before, data_dir_before, tmp_dir_before, base_dir_before) = {
+            let engine = KvEngine::new_with_options(options).expect("open engine");
+            engine.put(b"persist".to_vec(), b"value".to_vec()).unwrap();
+            engine.flush();
+            engine
+                .wait_for_immutable_memtables(Duration::from_secs(3))
+                .expect("wait for flush");
+
+            let wal_dir = engine.wal_paths().wal_dir().to_path_buf();
+            let data_dir = engine.sstable_paths().data_dir().to_path_buf();
+            let tmp_dir = engine.sstable_paths().tmp_dir().to_path_buf();
+            let base_dir = engine.manifest_paths().base_dir().to_path_buf();
+            let current_name = current::read_current(engine.manifest_paths())
+                .expect("read CURRENT")
+                .expect("CURRENT should exist");
+            let manifest_path = engine.manifest_paths().data_dir().join(current_name);
+
+            assert!(base_dir.join(current::CURRENT_FILE_NAME).exists());
+            assert!(manifest_path.exists(), "manifest file should exist");
+            assert!(
+                count_sstable_files(&data_dir) >= 1,
+                "flush should materialize at least one SSTable"
+            );
+            assert!(
+                count_wal_files(&wal_dir) >= 1,
+                "engine should keep an active WAL after flush"
+            );
+
+            (wal_dir, data_dir, tmp_dir, base_dir)
+        };
+
+        let reopen =
+            KvEngine::new_with_options(KvEngineOptions::for_test().with_data_dir(temp_dir.path()))
+                .expect("reopen engine");
+        assert_eq!(reopen.wal_paths().wal_dir(), wal_dir_before.as_path());
+        assert_eq!(reopen.sstable_paths().data_dir(), data_dir_before.as_path());
+        assert_eq!(reopen.sstable_paths().tmp_dir(), tmp_dir_before.as_path());
+        assert_eq!(
+            reopen.manifest_paths().base_dir(),
+            base_dir_before.as_path()
+        );
+        assert_eq!(
+            reopen.get(b"persist").expect("get after reopen"),
+            Some(b"value".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_new_uses_default_goatdb_data_in_current_dir() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let current_exe = std::env::current_exe().expect("resolve current test binary");
+        let output = Command::new(current_exe)
+            .current_dir(temp_dir.path())
+            .env(
+                "GOATKV_BOOT_HELPER_DIR",
+                temp_dir.path().to_str().expect("utf8 temp dir"),
+            )
+            .arg("--ignored")
+            .arg("goatkv_boot_default_path_helper")
+            .output()
+            .expect("run isolated helper");
+
+        assert!(
+            output.status.success(),
+            "helper failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let root = temp_dir.path().join("goatdb_data");
+        assert!(
+            root.exists(),
+            "default constructor should create goatdb_data/"
+        );
+        assert!(root.join("wal").exists());
+        assert!(root.join("data").exists());
+        assert!(root.join("tmp").exists());
+        assert!(root.join("log").exists());
+
+        let entries = fs::read_dir(temp_dir.path())
+            .expect("list temp dir")
+            .map(|entry| entry.expect("dir entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries.len(),
+            1,
+            "default constructor should not create unrelated siblings in the cwd"
+        );
+        assert_eq!(entries[0].to_string_lossy(), "goatdb_data");
+    }
+
+    #[test]
+    #[ignore]
+    fn goatkv_boot_default_path_helper() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let helper_dir =
+            std::env::var("GOATKV_BOOT_HELPER_DIR").expect("GOATKV_BOOT_HELPER_DIR must be set");
+        let helper_dir = std::path::PathBuf::from(helper_dir);
+        let expected_root = helper_dir.join("goatdb_data");
+
+        assert_eq!(
+            std::env::current_dir().expect("current dir"),
+            helper_dir,
+            "helper must run inside the temp cwd"
+        );
+
+        let engine = KvEngine::new();
+        assert_eq!(engine.manifest_paths().base_dir(), expected_root.as_path());
+        assert_eq!(
+            engine.manifest_paths().data_dir(),
+            expected_root.join("data").as_path()
+        );
+        assert_eq!(
+            engine.wal_paths().wal_dir(),
+            expected_root.join("wal").as_path()
+        );
+        assert_eq!(
+            engine.sstable_paths().data_dir(),
+            expected_root.join("data").as_path()
+        );
+        assert_eq!(
+            engine.sstable_paths().tmp_dir(),
+            expected_root.join("tmp").as_path()
+        );
+        assert_eq!(
+            engine.scan(ScanOptions::default()).expect("scan"),
+            Vec::<(Vec<u8>, Vec<u8>)>::new()
+        );
+        engine.shutdown().expect("shutdown default engine");
     }
 
     #[test]

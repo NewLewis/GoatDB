@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use goat_db::goatkv::core::kv_engine::KvEngine;
+use goat_db::goatkv::core::kv_engine::{KvEngine, ScanOptions};
 use goat_db::goatkv::error::ErrorKind;
 use goat_db::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
 use goat_db::goatkv::metadata::current;
@@ -34,6 +34,35 @@ fn count_sstable_files(data_dir: &std::path::Path) -> usize {
                 .count()
         })
         .unwrap_or(0)
+}
+
+fn list_wal_numbers(wal_dir: &std::path::Path) -> Vec<u64> {
+    let mut numbers = fs::read_dir(wal_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    if path.extension().and_then(|ext| ext.to_str()) != Some("wal") {
+                        return None;
+                    }
+                    path.file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .and_then(|stem| stem.parse::<u64>().ok())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    numbers.sort_unstable();
+    numbers
+}
+
+fn engine_options(data_dir: &std::path::Path) -> KvEngineOptions {
+    KvEngineOptions::default()
+        .with_data_dir(data_dir)
+        .with_mem_table_size(64 * 1024)
+        .with_wal_sync(false)
+        .with_recover_from_wal(true)
 }
 
 fn test_runtime() -> tokio::runtime::Runtime {
@@ -153,6 +182,65 @@ fn recovery_discards_incomplete_atomic_batch_instead_of_partial_replay() {
         "recovery should roll back the incomplete batch from WAL"
     );
     drop(engine);
+}
+
+#[test]
+fn reopen_recovers_data_from_existing_wal_and_advances_log_number() {
+    let rt = test_runtime();
+    let _guard = rt.enter();
+    let tmp = temp_dir();
+
+    let wal_numbers_before = {
+        let engine = KvEngine::new_with_options(engine_options(tmp.path())).expect("open engine");
+        engine
+            .put(b"order:1".to_vec(), b"created".to_vec())
+            .unwrap();
+        engine
+            .put(b"stock:1".to_vec(), b"reserved".to_vec())
+            .unwrap();
+        assert_eq!(
+            engine.scan(ScanOptions::default()).unwrap(),
+            vec![
+                (b"order:1".to_vec(), b"created".to_vec()),
+                (b"stock:1".to_vec(), b"reserved".to_vec()),
+            ]
+        );
+        let wal_numbers = list_wal_numbers(engine.wal_paths().wal_dir());
+        assert!(
+            !wal_numbers.is_empty(),
+            "writer should have created at least one WAL file before reopen"
+        );
+        wal_numbers
+    };
+
+    let engine = KvEngine::new_with_options(engine_options(tmp.path())).expect("reopen engine");
+    assert_eq!(
+        engine.get(b"order:1").unwrap(),
+        Some(b"created".to_vec()),
+        "reopen should replay order row from WAL"
+    );
+    assert_eq!(
+        engine.get(b"stock:1").unwrap(),
+        Some(b"reserved".to_vec()),
+        "reopen should replay stock row from WAL"
+    );
+    assert_eq!(
+        engine.scan(ScanOptions::default()).unwrap(),
+        vec![
+            (b"order:1".to_vec(), b"created".to_vec()),
+            (b"stock:1".to_vec(), b"reserved".to_vec()),
+        ]
+    );
+
+    let wal_numbers_after = list_wal_numbers(engine.wal_paths().wal_dir());
+    assert!(
+        wal_numbers_after
+            .last()
+            .zip(wal_numbers_before.last())
+            .map(|(after, before)| after > before)
+            .unwrap_or(false),
+        "reopen should advance log number instead of reusing the previous WAL id"
+    );
 }
 
 #[test]

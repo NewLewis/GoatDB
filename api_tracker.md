@@ -155,7 +155,7 @@
 
 测试项：
 
-- [ ] `BOOT-UT-001` Fresh bootstrap creates complete directory layout
+- [x] `BOOT-UT-001` Fresh bootstrap creates complete directory layout
   - 前置：空临时目录。
   - 操作：调用 `KvEngine::init_db_paths`，随后 `KvEngine::new_with_options`。
   - 接口断言：
@@ -166,7 +166,7 @@
     - 当前 WAL 文件已创建。
     - 尚无用户数据时，`scan(default)` 返回空。
 
-- [ ] `BOOT-IT-002` Reopen recovers data from existing WAL and manifest
+- [x] `BOOT-IT-002` Reopen recovers data from existing WAL and manifest
   - 前置：同一 `data_dir` 下先写入若干 key，但不主动 flush。
   - 操作：销毁引擎，再用相同 `data_dir` 调用 `new_with_options`。
   - 接口断言：
@@ -176,7 +176,7 @@
     - WAL 恢复后数据可见。
     - 新引擎打开后 WAL 编号向前推进，不覆盖旧日志。
 
-- [ ] `BOOT-IT-003` Invalid storage state fails fast without silent partial open
+- [x] `BOOT-IT-003` Invalid storage state fails fast without silent partial open
   - 前置：构造损坏 manifest 或损坏 WAL。
   - 操作：调用 `new_with_options`。
   - 接口断言：
@@ -185,7 +185,7 @@
     - 不能出现“部分 key 可读、部分 key 消失但启动成功”的 silent corruption。
     - 对尾部截断类损坏，只允许按恢复规则截断后成功启动。
 
-- [ ] `BOOT-UT-004` Default constructor uses `./goatdb_data` and does not touch unrelated directories
+- [x] `BOOT-UT-004` Default constructor uses `./goatdb_data` and does not touch unrelated directories
   - 前置：切换到临时工作目录，保证目录下不存在 `goatdb_data/`。
   - 操作：调用 `KvEngine::new`。
   - 接口断言：
@@ -195,7 +195,7 @@
     - 当前工作目录生成 `goatdb_data/{wal,data,log,tmp}`。
     - 未指定的其他目录没有被创建或写入。
 
-- [ ] `BOOT-UT-005` Custom options isolate storage into requested `data_dir`
+- [x] `BOOT-UT-005` Custom options isolate storage into requested `data_dir`
   - 前置：准备 `dir_a`、`dir_b` 两个独立临时目录。
   - 操作：用 `dir_a` 构造引擎并写入数据，再用 `dir_b` 构造第二个空引擎。
   - 接口断言：
@@ -205,7 +205,7 @@
     - `dir_a` 与 `dir_b` 各自生成独立 `wal/data/log/tmp`。
     - `dir_a` 的 WAL/SST/manifest 变化不会污染 `dir_b`。
 
-- [ ] `BOOT-UT-006` Path accessors stay stable and point to real artifacts across reopen
+- [x] `BOOT-UT-006` Path accessors stay stable and point to real artifacts across reopen
   - 前置：写入若干 key，触发一次 `flush`。
   - 操作：记录 `wal_paths/sstable_paths/manifest_paths` 指向的目录和关键文件，再重开引擎。
   - 接口断言：
