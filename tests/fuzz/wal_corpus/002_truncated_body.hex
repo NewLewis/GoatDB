@@ -1,0 +1,5 @@
+# checksum=0, key_len=4, but body is truncated before key trailer/value_len
+00 00 00 00
+04 00 00 00
+6b 65
+

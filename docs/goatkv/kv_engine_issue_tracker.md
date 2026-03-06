@@ -1213,18 +1213,26 @@
     - 2026-03-06：为 `skip_list`/`arena` 中所有 `unsafe` 读写与指针转换补充 `Safety:` 注释，覆盖指针来源、生命周期、别名约束与 head-node 特例。
     - 2026-03-06：新增 `docs/goatkv/unsafe_audit_checklist.md`，建立“unsafe 点位 -> 不变量 -> review 检查项 -> 回归命令”的审计模板。
 
-- [ ] `TASK-SM6-02` Miri/Loom/Fuzz harness 建设（status: planned）
+- [x] `TASK-SM6-02` Miri/Loom/Fuzz harness 建设（status: done, 2026-03-06）
   - 目标：覆盖并发交错与内存安全高风险路径。
   - 关键改动文件：
-    - `tests/`
-    - `scripts/`
+    - `src/goatkv/core/sequence_number.rs`
+    - `src/goatkv/storage/wal/mod.rs`
+    - `tests/fuzz/wal_corpus/`
+    - `scripts/verify-ci.sh`
+    - `scripts/verify-ci.ps1`
     - `Cargo.toml`
+    - `docs/goatkv/kv_engine_issue_tracker.md`
   - 回归命令：
     - `cargo test -- --ignored`
     - `cargo test --features loom`
   - DoD：
     - 至少 1 条 Loom 场景、1 组 fuzz 输入集可重复执行。
     - 在 CI 或周期任务中可自动触发。
+  - 关闭记录：
+    - 2026-03-06：新增 Loom 并发模型用例 `loom_try_allocate_range_non_overlapping`（`sequence_number`），验证并发 range 分配不重叠。
+    - 2026-03-06：新增可复现 WAL fuzz corpus（`tests/fuzz/wal_corpus/*.hex`）与 ignored 回放用例 `test_wal_fuzz_corpus_replay_is_total`。
+    - 2026-03-06：`scripts/verify-ci.sh` / `scripts/verify-ci.ps1` 接入 Loom 与 fuzz corpus 回放步骤，形成自动触发路径。
 
 - [ ] `TASK-SM6-03` 长稳压测（soak）作业与失败归档（status: planned）
   - 目标：验证长时间运行下内存/句柄/延迟稳定性。

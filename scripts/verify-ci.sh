@@ -71,7 +71,27 @@ echo ""
 echo "📋 运行集成测试..."
 cargo test --test '*' --verbose || true
 
-# 8. E2E 测试
+# 8. Loom 并发模型测试
+echo ""
+echo "📋 运行 Loom 并发模型测试..."
+if cargo test --lib --features loom loom_try_allocate_range_non_overlapping --verbose; then
+    echo "✅ Loom 并发模型测试通过"
+else
+    echo "❌ Loom 并发模型测试失败！"
+    exit 1
+fi
+
+# 9. Fuzz corpus 回放测试（ignored）
+echo ""
+echo "📋 运行 Fuzz corpus 回放测试..."
+if cargo test --lib test_wal_fuzz_corpus_replay_is_total -- --ignored --nocapture; then
+    echo "✅ Fuzz corpus 回放测试通过"
+else
+    echo "❌ Fuzz corpus 回放测试失败！"
+    exit 1
+fi
+
+# 10. E2E 测试
 echo ""
 echo "📋 运行 E2E 测试..."
 export RUST_LOG=info
@@ -82,7 +102,7 @@ else
     exit 1
 fi
 
-# 9. 最终结果
+# 11. 最终结果
 echo ""
 echo "=================================================="
 echo "🎉 所有检查通过！可以安全推送到 GitHub"

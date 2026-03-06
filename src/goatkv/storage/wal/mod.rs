@@ -22,6 +22,7 @@ mod tests {
     use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
     use crate::goatkv::ErrorKind;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -282,5 +283,71 @@ mod tests {
             fs::metadata(&path).expect("metadata after replay").len(),
             good_len
         );
+    }
+
+    fn decode_hex_corpus(text: &str) -> Vec<u8> {
+        let mut compact = String::new();
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("");
+            for ch in line.chars() {
+                if !ch.is_ascii_whitespace() {
+                    compact.push(ch);
+                }
+            }
+        }
+        if compact.is_empty() {
+            return Vec::new();
+        }
+        assert!(
+            compact.len().is_multiple_of(2),
+            "hex corpus must have even number of nibbles"
+        );
+        let mut out = Vec::with_capacity(compact.len() / 2);
+        let bytes = compact.as_bytes();
+        for idx in (0..bytes.len()).step_by(2) {
+            let hi = bytes[idx] as char;
+            let lo = bytes[idx + 1] as char;
+            let pair = [hi, lo].iter().collect::<String>();
+            let value = u8::from_str_radix(&pair, 16).expect("valid hex byte");
+            out.push(value);
+        }
+        out
+    }
+
+    #[test]
+    #[ignore = "corpus-based fuzz replay, run with --ignored"]
+    fn test_wal_fuzz_corpus_replay_is_total() {
+        let corpus_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fuzz/wal_corpus");
+        let mut corpus_files = fs::read_dir(&corpus_dir)
+            .expect("read wal corpus dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("hex"))
+            .collect::<Vec<_>>();
+        corpus_files.sort();
+        assert!(!corpus_files.is_empty(), "wal corpus set must not be empty");
+
+        let mut saw_error = false;
+        for path in corpus_files {
+            let content = fs::read_to_string(&path).expect("read corpus file");
+            let bytes = decode_hex_corpus(&content);
+            let temp_file = NamedTempFile::new().expect("create temp wal file");
+            fs::write(temp_file.path(), &bytes).expect("write corpus bytes");
+            let wal_path = temp_file.path().to_path_buf();
+
+            let mut reader = WalReader::new(&wal_path).expect("open wal reader");
+            while let Some(result) = reader.next() {
+                if result.is_err() {
+                    saw_error = true;
+                    break;
+                }
+            }
+
+            if replay_wal_file(&wal_path, |_key, _value| {}).is_err() {
+                saw_error = true;
+            }
+        }
+
+        assert!(saw_error, "corpus should hit at least one error path");
     }
 }

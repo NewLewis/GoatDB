@@ -24,6 +24,7 @@ tracing-appender = "0.2"
 [features]
 default = []
 rocksdb = ["dep:rocksdb"]
+loom = []
 
 [dev-dependencies]
 tempfile = "3.10"
@@ -33,6 +34,7 @@ assert_cmd = "2.0"
 predicates = "3.1"
 ntest = "0.9"
 rand = "0.8"
+loom = "0.7"
 
 # ===========================================================================
 # Integration Tests Configuration

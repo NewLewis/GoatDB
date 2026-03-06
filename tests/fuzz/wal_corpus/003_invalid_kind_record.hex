@@ -1,0 +1,8 @@
+# record-like payload with an invalid internal key kind trailer
+11 22 33 44
+08 00 00 00
+6b 65 79 5f 74 65 73 74
+ff ff ff ff ff ff ff ff
+04 00 00 00
+de ad be ef
+

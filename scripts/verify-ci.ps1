@@ -71,7 +71,27 @@ if ($LASTEXITCODE -ne 0) {
     # 允许失败继续
 }
 
-# 8. E2E 测试
+# 8. Loom 并发模型测试
+Write-Host ""
+Write-Host "📋 运行 Loom 并发模型测试..." -ForegroundColor Yellow
+cargo test --lib --features loom loom_try_allocate_range_non_overlapping --verbose
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "   ❌ Loom 并发模型测试失败！" -ForegroundColor Red
+    exit 1
+}
+Write-Host "   ✅ Loom 并发模型测试通过" -ForegroundColor Green
+
+# 9. Fuzz corpus 回放测试（ignored）
+Write-Host ""
+Write-Host "📋 运行 Fuzz corpus 回放测试..." -ForegroundColor Yellow
+cargo test --lib test_wal_fuzz_corpus_replay_is_total -- --ignored --nocapture
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "   ❌ Fuzz corpus 回放测试失败！" -ForegroundColor Red
+    exit 1
+}
+Write-Host "   ✅ Fuzz corpus 回放测试通过" -ForegroundColor Green
+
+# 10. E2E 测试
 Write-Host ""
 Write-Host "📋 运行 E2E 测试..." -ForegroundColor Yellow
 $env:RUST_LOG = "info"
@@ -82,7 +102,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "   ✅ E2E 测试通过" -ForegroundColor Green
 
-# 9. 最终结果
+# 11. 最终结果
 Write-Host ""
 Write-Host "=" * 50
 Write-Host "🎉 所有检查通过！可以安全推送到 GitHub" -ForegroundColor Green
