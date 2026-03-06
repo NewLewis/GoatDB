@@ -2,7 +2,7 @@
 mod common;
 
 use common::test_server::goatkv::{MultiGetRequest, WriteRequest};
-use common::test_server::{should_skip_network_e2e, TestServer};
+use common::test_server::{should_skip_network_e2e, total_wal_bytes, TestServer};
 use tonic::Code;
 
 #[tokio::test]
@@ -66,6 +66,7 @@ async fn test_multiget_rejects_empty_keys() {
 
     let server = TestServer::start().await;
     let mut client = server.client().await;
+    let wal_before = total_wal_bytes(&server.data_dir);
 
     let err = client
         .multi_get(MultiGetRequest {
@@ -76,6 +77,16 @@ async fn test_multiget_rejects_empty_keys() {
         .unwrap_err();
 
     assert_eq!(err.code(), Code::InvalidArgument);
+
+    let err = client
+        .multi_get(MultiGetRequest {
+            keys: vec![Vec::new()],
+            snapshot_id: 0,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert_eq!(total_wal_bytes(&server.data_dir), wal_before);
 }
 
 #[tokio::test]
@@ -86,6 +97,7 @@ async fn test_multiget_rejects_nonzero_snapshot_id() {
 
     let server = TestServer::start().await;
     let mut client = server.client().await;
+    let wal_before = total_wal_bytes(&server.data_dir);
 
     let err = client
         .multi_get(MultiGetRequest {
@@ -96,4 +108,45 @@ async fn test_multiget_rejects_nonzero_snapshot_id() {
         .unwrap_err();
 
     assert_eq!(err.code(), Code::InvalidArgument);
+    assert_eq!(total_wal_bytes(&server.data_dir), wal_before);
+}
+
+#[tokio::test]
+async fn test_multiget_preserves_duplicate_entries_and_found_flags() {
+    if should_skip_network_e2e() {
+        return;
+    }
+
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    client
+        .write(WriteRequest {
+            key: b"dup_key".to_vec(),
+            value: b"dup_value".to_vec(),
+        })
+        .await
+        .unwrap();
+
+    let response = client
+        .multi_get(MultiGetRequest {
+            keys: vec![
+                b"dup_key".to_vec(),
+                b"missing_key".to_vec(),
+                b"dup_key".to_vec(),
+            ],
+            snapshot_id: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(response.success);
+    assert_eq!(response.entries.len(), 3);
+    assert!(response.entries[0].found);
+    assert_eq!(response.entries[0].value, b"dup_value".to_vec());
+    assert!(!response.entries[1].found);
+    assert_eq!(response.entries[1].message, "Key not found");
+    assert!(response.entries[2].found);
+    assert_eq!(response.entries[2].value, b"dup_value".to_vec());
 }

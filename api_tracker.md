@@ -381,7 +381,7 @@
 
 测试项：
 
-- [ ] `GET-UT-001` Hit and miss semantics are stable
+- [x] `GET-UT-001` Hit and miss semantics are stable
   - 前置：写入 `k1=v1`.
   - 操作：读取 `k1` 与不存在的 `k2`.
   - 接口断言：
@@ -391,7 +391,7 @@
     - WAL、SST 数量、`immutable_memtable_backlog` 不变。
     - 只读路径不产生数据面副作用。
 
-- [ ] `GET-UT-002` Snapshot read is frozen at create time
+- [x] `GET-UT-002` Snapshot read is frozen at create time
   - 前置：写入 `k1=v1`，创建快照，再覆盖为 `v2`.
   - 操作：最新读和快照读同时进行。
   - 接口断言：
@@ -401,7 +401,7 @@
     - 快照读不改变任何持久化状态。
     - `read_cache_metrics` 可变化，但数据集不变。
 
-- [ ] `GET-E2E-003` Invalid or released snapshot returns NotFound and does not mutate database
+- [x] `GET-E2E-003` Invalid or released snapshot returns NotFound and does not mutate database
   - 前置：创建并释放 snapshot，或使用不存在的 snapshot_id.
   - 操作：gRPC `Get(snapshot_id != 0)`.
   - 接口断言：
@@ -409,7 +409,7 @@
   - 数据库状态断言：
     - WAL、SST、可见数据集不变。
 
-- [ ] `GET-E2E-004` Empty key is rejected and does not produce a read-side mutation
+- [x] `GET-E2E-004` Empty key is rejected and does not produce a read-side mutation
   - 前置：记录调用前 WAL、SST、`read_cache_metrics`。
   - 操作：gRPC `Get(key="")`.
   - 接口断言：
@@ -427,7 +427,7 @@
 
 测试项：
 
-- [ ] `MGET-UT-001` Mixed hits and misses preserve request order
+- [x] `MGET-UT-001` Mixed hits and misses preserve request order
   - 前置：写入 `k1=v1`, `k3=v3`.
   - 操作：按 `[k1, missing, k3]` 调用 `multi_get`.
   - 接口断言：
@@ -436,7 +436,7 @@
   - 数据库状态断言：
     - 只读，无 WAL 变化。
 
-- [ ] `MGET-UT-002` Duplicate keys reuse result but do not change state
+- [x] `MGET-UT-002` Duplicate keys reuse result but do not change state
   - 前置：写入 `dup=v`.
   - 操作：请求 `[dup, dup, dup]`.
   - 接口断言：
@@ -445,7 +445,7 @@
     - 可选检查 `read_cache_metrics` 的 hit/miss 行为。
     - 数据集不变。
 
-- [ ] `MGET-E2E-003` Current transport contract rejects nonzero snapshot_id
+- [x] `MGET-E2E-003` Current transport contract rejects nonzero snapshot_id
   - 前置：任意库状态。
   - 操作：gRPC `MultiGet(snapshot_id=1)`.
   - 接口断言：
@@ -453,7 +453,7 @@
   - 数据库状态断言：
     - 数据集和 WAL 均不变。
 
-- [ ] `MGET-E2E-004` Empty request and empty key are both rejected
+- [x] `MGET-E2E-004` Empty request and empty key are both rejected
   - 前置：任意库状态。
   - 操作：空 `keys`，以及 `keys` 中包含空 key.
   - 接口断言：
@@ -461,7 +461,7 @@
   - 数据库状态断言：
     - 数据集不变。
 
-- [ ] `MGET-E2E-005` Response entries preserve duplicates and found flags one by one
+- [x] `MGET-E2E-005` Response entries preserve duplicates and found flags one by one
   - 前置：写入 `k1=v1`，保留一个不存在 key `k_missing`。
   - 操作：gRPC `MultiGet([k1, k_missing, k1])`.
   - 接口断言：
@@ -482,7 +482,7 @@
 
 测试项：
 
-- [ ] `SCAN-UT-001` Forward scan respects start/end/prefix/limit
+- [x] `SCAN-UT-001` Forward scan respects start/end/prefix/limit
   - 前置：写入多组有序 key，如 `a1 a2 a3 b1`.
   - 操作：组合 `start_key`、`end_key`、`prefix`、`limit`.
   - 接口断言：
@@ -492,7 +492,7 @@
   - 数据库状态断言：
     - 只读，不写 WAL。
 
-- [ ] `SCAN-UT-002` Reverse scan returns reversed visible order and still hides tombstones
+- [x] `SCAN-UT-002` Reverse scan returns reversed visible order and still hides tombstones
   - 前置：写入 `k1 k2 k3`，删除 `k2`.
   - 操作：`scan(reverse=true)`.
   - 接口断言：
@@ -501,7 +501,7 @@
   - 数据库状态断言：
     - 删除记录只影响可见性，不应在 scan 结果中泄漏 tombstone。
 
-- [ ] `SCAN-UT-003` Snapshot scan keeps historical visible set
+- [x] `SCAN-UT-003` Snapshot scan keeps historical visible set
   - 前置：写入一组前缀 key，创建快照，再执行覆盖与删除。
   - 操作：`scan(latest)` 与 `scan_with_snapshot(snapshot)`.
   - 接口断言：
@@ -510,7 +510,7 @@
   - 数据库状态断言：
     - flush/compaction 后 snapshot scan 仍稳定。
 
-- [ ] `SCAN-E2E-004` Invalid snapshot on gRPC scan returns NotFound without state mutation
+- [x] `SCAN-E2E-004` Invalid snapshot on gRPC scan returns NotFound without state mutation
   - 前置：释放 snapshot 或使用未知 snapshot_id.
   - 操作：gRPC `Scan(snapshot_id=unknown)`.
   - 接口断言：
@@ -518,7 +518,7 @@
   - 数据库状态断言：
     - 数据、WAL、SST 均不变化。
 
-- [ ] `SCAN-UT-005` Empty intersection returns empty set instead of leaking out-of-range rows
+- [x] `SCAN-UT-005` Empty intersection returns empty set instead of leaking out-of-range rows
   - 前置：写入 `a1 a2 b1 b2`.
   - 操作：构造 `prefix="a"` 且 `start_key="b"`，以及 `start_key > end_key` 两组 scan。
   - 接口断言：
@@ -527,7 +527,7 @@
     - 不得返回任何超出交集的 key。
     - 只读路径不改变 WAL/SST。
 
-- [ ] `SCAN-E2E-006` Zero limit means unbounded full result under current transport contract
+- [x] `SCAN-E2E-006` Zero limit means unbounded full result under current transport contract
   - 前置：写入超过 3 条可扫描记录。
   - 操作：gRPC `Scan(limit=0)` 与 `Scan(limit=2)` 对比。
   - 接口断言：
@@ -617,7 +617,7 @@
 
 测试项：
 
-- [ ] `SNAP-UT-001` Snapshot id is usable for both point reads and scans
+- [x] `SNAP-UT-001` Snapshot id is usable for both point reads and scans
   - 前置：写入一组 key.
   - 操作：创建 snapshot，之后覆盖和删除部分 key.
   - 接口断言：
@@ -626,7 +626,7 @@
   - 数据库状态断言：
     - snapshot 期间旧版本保留。
 
-- [ ] `SNAP-UT-002` Release invalidates snapshot immediately
+- [x] `SNAP-UT-002` Release invalidates snapshot immediately
   - 前置：创建 snapshot.
   - 操作：`release_snapshot(snapshot_id)`, 再尝试 snapshot read.
   - 接口断言：
@@ -636,7 +636,7 @@
   - 数据库状态断言：
     - release 不应改变最新数据集。
 
-- [ ] `SNAP-IT-003` Snapshot survives flush and compaction until release
+- [x] `SNAP-IT-003` Snapshot survives flush and compaction until release
   - 前置：创建 snapshot，随后执行大量写入并触发 flush/compaction.
   - 操作：读取 snapshot.
   - 接口断言：
@@ -644,7 +644,7 @@
   - 数据库状态断言：
     - release 后旧 stripe 才允许在后续 compaction 中回收。
 
-- [ ] `SNAP-UT-004` Creating snapshot is read-side only and does not mutate storage layout
+- [x] `SNAP-UT-004` Creating snapshot is read-side only and does not mutate storage layout
   - 前置：记录调用前 WAL 文件大小、`.sst` 数量、当前可见数据集。
   - 操作：连续调用两次 `create_snapshot`。
   - 接口断言：
@@ -653,7 +653,7 @@
     - WAL 与 `.sst` 数量不变。
     - 最新可见数据集不变。
 
-- [ ] `SNAP-E2E-005` gRPC create-release round trip is usable by `Get` and `Scan`
+- [x] `SNAP-E2E-005` gRPC create-release round trip is usable by `Get` and `Scan`
   - 前置：写入一组 key，调用 gRPC `CreateSnapshot`，随后执行覆盖和删除。
   - 操作：使用该 `snapshot_id` 调用 gRPC `Get/Scan`，最后调用 gRPC `ReleaseSnapshot`。
   - 接口断言：
@@ -664,7 +664,7 @@
     - `CreateSnapshot/ReleaseSnapshot` 本身不改动最新数据集。
     - release 前旧视图可读，release 后该 id 不再可用。
 
-- [ ] `SNAP-E2E-006` Releasing unknown snapshot returns NotFound without data mutation
+- [x] `SNAP-E2E-006` Releasing unknown snapshot returns NotFound without data mutation
   - 前置：记录调用前 WAL、SST、样本 key 结果。
   - 操作：gRPC `ReleaseSnapshot(snapshot_id=0)` 与 `ReleaseSnapshot(snapshot_id=unknown)`.
   - 接口断言：

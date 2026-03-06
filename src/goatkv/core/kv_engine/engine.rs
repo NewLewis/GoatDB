@@ -1652,6 +1652,7 @@ mod tests {
         engine
             .wait_for_immutable_memtables(Duration::from_secs(3))
             .unwrap();
+        let wal_before = total_wal_bytes(engine.wal_paths().wal_dir());
 
         let keys = vec![
             b"k1".to_vec(),
@@ -1664,6 +1665,84 @@ mod tests {
             results,
             vec![Some(b"v1".to_vec()), None, None, Some(b"v3".to_vec())]
         );
+        assert_eq!(total_wal_bytes(engine.wal_paths().wal_dir()), wal_before);
+    }
+
+    #[test]
+    fn test_get_hit_and_miss_are_storage_side_effect_free() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = KvEngineOptions::for_test().with_data_dir(temp_dir.path());
+        let engine = KvEngine::new_with_options(options).expect("open engine");
+
+        engine.put(b"k1".to_vec(), b"v1".to_vec()).unwrap();
+        engine.flush();
+        engine
+            .wait_for_immutable_memtables(Duration::from_secs(3))
+            .expect("wait flush");
+
+        let wal_before = total_wal_bytes(engine.wal_paths().wal_dir());
+        let sst_before = count_sstable_files(engine.sstable_paths().data_dir());
+        let backlog_before = engine.runtime_metrics().immutable_memtable_backlog;
+
+        assert_eq!(engine.get(b"k1").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(engine.get(b"k_missing").unwrap(), None);
+
+        assert_eq!(total_wal_bytes(engine.wal_paths().wal_dir()), wal_before);
+        assert_eq!(
+            count_sstable_files(engine.sstable_paths().data_dir()),
+            sst_before
+        );
+        assert_eq!(
+            engine.runtime_metrics().immutable_memtable_backlog,
+            backlog_before
+        );
+    }
+
+    #[test]
+    fn test_get_with_snapshot_is_frozen_and_storage_side_effect_free() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = KvEngineOptions::for_test().with_data_dir(temp_dir.path());
+        let engine = KvEngine::new_with_options(options).expect("open engine");
+
+        engine.put(b"k1".to_vec(), b"v1".to_vec()).unwrap();
+        engine.flush();
+        engine
+            .wait_for_immutable_memtables(Duration::from_secs(3))
+            .expect("wait flush");
+        let snapshot = engine.create_snapshot().unwrap();
+
+        engine.put(b"k1".to_vec(), b"v2".to_vec()).unwrap();
+        engine.flush();
+        engine
+            .wait_for_immutable_memtables(Duration::from_secs(3))
+            .expect("wait flush");
+
+        let wal_before = total_wal_bytes(engine.wal_paths().wal_dir());
+        let sst_before = count_sstable_files(engine.sstable_paths().data_dir());
+        let cache_before = engine.read_cache_metrics();
+
+        assert_eq!(engine.get(b"k1").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(
+            engine.get_with_snapshot(b"k1", snapshot.id).unwrap(),
+            Some(b"v1".to_vec())
+        );
+
+        assert_eq!(total_wal_bytes(engine.wal_paths().wal_dir()), wal_before);
+        assert_eq!(
+            count_sstable_files(engine.sstable_paths().data_dir()),
+            sst_before
+        );
+        if let (Some(before), Some(after)) = (cache_before, engine.read_cache_metrics()) {
+            assert!(
+                after.row_hits + after.row_misses >= before.row_hits + before.row_misses,
+                "snapshot reads should only affect cache counters, not storage state"
+            );
+        }
+        engine.release_snapshot(snapshot.id).unwrap();
     }
 
     #[test]
@@ -1752,6 +1831,101 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows, vec![(b"k3".to_vec(), b"k3".to_vec())]);
+    }
+
+    #[test]
+    fn test_scan_forward_respects_prefix_bounds_and_zero_limit() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        for (key, value) in [
+            (b"a1".to_vec(), b"va1".to_vec()),
+            (b"a2".to_vec(), b"va2".to_vec()),
+            (b"a3".to_vec(), b"va3".to_vec()),
+            (b"b1".to_vec(), b"vb1".to_vec()),
+        ] {
+            engine.put(key, value).unwrap();
+        }
+
+        let rows = engine
+            .scan(ScanOptions {
+                start_key: Some(b"a2".to_vec()),
+                end_key: Some(b"b1".to_vec()),
+                prefix: Some(b"a".to_vec()),
+                limit: 0,
+                reverse: false,
+            })
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (b"a2".to_vec(), b"va2".to_vec()),
+                (b"a3".to_vec(), b"va3".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_reverse_scan_hides_tombstones() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"k1".to_vec(), b"v1".to_vec()).unwrap();
+        engine.put(b"k2".to_vec(), b"v2".to_vec()).unwrap();
+        engine.put(b"k3".to_vec(), b"v3".to_vec()).unwrap();
+        engine.delete(b"k2".to_vec()).unwrap();
+
+        let rows = engine
+            .scan(ScanOptions {
+                reverse: true,
+                ..ScanOptions::default()
+            })
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (b"k3".to_vec(), b"v3".to_vec()),
+                (b"k1".to_vec(), b"v1".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_scan_empty_intersection_is_empty_and_side_effect_free() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        for (key, value) in [
+            (b"a1".to_vec(), b"va1".to_vec()),
+            (b"a2".to_vec(), b"va2".to_vec()),
+            (b"b1".to_vec(), b"vb1".to_vec()),
+            (b"b2".to_vec(), b"vb2".to_vec()),
+        ] {
+            engine.put(key, value).unwrap();
+        }
+
+        let wal_before = total_wal_bytes(engine.wal_paths().wal_dir());
+        let no_intersection = engine
+            .scan(ScanOptions {
+                start_key: Some(b"b".to_vec()),
+                prefix: Some(b"a".to_vec()),
+                ..ScanOptions::default()
+            })
+            .unwrap();
+        let inverted_bounds = engine
+            .scan(ScanOptions {
+                start_key: Some(b"b2".to_vec()),
+                end_key: Some(b"a1".to_vec()),
+                ..ScanOptions::default()
+            })
+            .unwrap();
+
+        assert!(no_intersection.is_empty());
+        assert!(inverted_bounds.is_empty());
+        assert_eq!(total_wal_bytes(engine.wal_paths().wal_dir()), wal_before);
     }
 
     #[test]
@@ -2022,6 +2196,8 @@ mod tests {
 
         engine.put(b"dup".to_vec(), b"v_dup".to_vec()).unwrap();
         engine.put(b"other".to_vec(), b"v_other".to_vec()).unwrap();
+        let wal_before = total_wal_bytes(engine.wal_paths().wal_dir());
+        let cache_before = engine.read_cache_metrics();
 
         let keys = vec![
             b"dup".to_vec(),
@@ -2043,6 +2219,13 @@ mod tests {
                 Some(b"v_other".to_vec()),
             ]
         );
+        assert_eq!(total_wal_bytes(engine.wal_paths().wal_dir()), wal_before);
+        if let (Some(before), Some(after)) = (cache_before, engine.read_cache_metrics()) {
+            assert!(
+                after.row_hits + after.row_misses >= before.row_hits + before.row_misses,
+                "duplicate multi_get should only change cache counters"
+            );
+        }
     }
 
     #[test]
@@ -2300,6 +2483,103 @@ mod tests {
             .release_snapshot(42)
             .expect_err("release unknown snapshot should fail");
         assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_release_snapshot_invalidates_reads_and_second_release_fails() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"snap_key".to_vec(), b"v1".to_vec()).unwrap();
+        let snapshot = engine.create_snapshot().unwrap();
+
+        engine.release_snapshot(snapshot.id).unwrap();
+
+        let err = engine
+            .get_with_snapshot(b"snap_key", snapshot.id)
+            .expect_err("released snapshot should not be readable");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+
+        let err = engine
+            .release_snapshot(snapshot.id)
+            .expect_err("second release should fail");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert_eq!(engine.get(b"snap_key").unwrap(), Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn test_create_snapshot_is_read_only_and_ids_increase_monotonically() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = KvEngineOptions::for_test().with_data_dir(temp_dir.path());
+        let engine = KvEngine::new_with_options(options).expect("open engine");
+
+        engine.put(b"snap".to_vec(), b"v1".to_vec()).unwrap();
+        engine.flush();
+        engine
+            .wait_for_immutable_memtables(Duration::from_secs(3))
+            .expect("wait flush");
+
+        let wal_before = total_wal_bytes(engine.wal_paths().wal_dir());
+        let sst_before = count_sstable_files(engine.sstable_paths().data_dir());
+        let rows_before = engine.scan(ScanOptions::default()).unwrap();
+
+        let s1 = engine.create_snapshot().unwrap();
+        let s2 = engine.create_snapshot().unwrap();
+
+        assert!(s1.id > 0);
+        assert!(s2.id > s1.id);
+        assert_eq!(total_wal_bytes(engine.wal_paths().wal_dir()), wal_before);
+        assert_eq!(
+            count_sstable_files(engine.sstable_paths().data_dir()),
+            sst_before
+        );
+        assert_eq!(engine.scan(ScanOptions::default()).unwrap(), rows_before);
+
+        engine.release_snapshot(s1.id).unwrap();
+        engine.release_snapshot(s2.id).unwrap();
+    }
+
+    #[test]
+    fn test_snapshot_id_is_usable_for_point_reads_and_scans() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"district:1".to_vec(), b"v1".to_vec()).unwrap();
+        engine.put(b"district:2".to_vec(), b"v2".to_vec()).unwrap();
+        let snapshot = engine.create_snapshot().unwrap();
+
+        engine
+            .put(b"district:1".to_vec(), b"v1-new".to_vec())
+            .unwrap();
+        engine.delete(b"district:2".to_vec()).unwrap();
+
+        assert!(snapshot.id > 0);
+        assert_eq!(
+            engine
+                .get_with_snapshot(b"district:1", snapshot.id)
+                .unwrap(),
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(
+            engine
+                .scan_with_snapshot(
+                    ScanOptions {
+                        prefix: Some(b"district:".to_vec()),
+                        ..ScanOptions::default()
+                    },
+                    snapshot.id,
+                )
+                .unwrap(),
+            vec![
+                (b"district:1".to_vec(), b"v1".to_vec()),
+                (b"district:2".to_vec(), b"v2".to_vec()),
+            ]
+        );
+        engine.release_snapshot(snapshot.id).unwrap();
     }
 
     #[test]

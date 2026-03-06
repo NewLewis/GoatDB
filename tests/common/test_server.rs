@@ -1,5 +1,7 @@
+use std::fs;
 use std::io::Read;
 use std::net::TcpListener;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
@@ -323,4 +325,22 @@ pub fn find_free_port() -> u16 {
     TcpListener::bind(("127.0.0.1", 0))
         .and_then(|listener| listener.local_addr().map(|addr| addr.port()))
         .expect("Failed to allocate an ephemeral port")
+}
+
+pub fn total_wal_bytes(data_dir: &Path) -> u64 {
+    let wal_dir = data_dir.join("wal");
+    fs::read_dir(wal_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    if path.extension().and_then(|ext| ext.to_str()) != Some("wal") {
+                        return None;
+                    }
+                    fs::metadata(path).ok().map(|meta| meta.len())
+                })
+                .sum::<u64>()
+        })
+        .unwrap_or(0)
 }
