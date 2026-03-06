@@ -13,6 +13,7 @@ use crate::goatkv::metadata::version::Version;
 use crate::goatkv::metadata::version_edit::{NewFile, VersionEdit};
 use crate::goatkv::metadata::version_set::VersionSet;
 use crate::goatkv::storage::compaction::picker::build_subcompaction_ranges;
+use crate::goatkv::storage::compaction::plan::SubcompactionRange;
 use crate::goatkv::storage::sstable::{SSTableBuilder, SSTableReader, SSTableScanIterator};
 use crate::goatkv::utils::paths::SstablePaths;
 use tracing::{error, warn};
@@ -23,6 +24,7 @@ pub struct CompactionConfig {
     pub max_bytes_for_level_base: u64,
     pub max_bytes_for_level_multiplier: u64,
     pub max_grandparent_overlap_bytes_factor: u64,
+    pub max_subcompactions: usize,
 }
 
 impl Default for CompactionConfig {
@@ -32,11 +34,10 @@ impl Default for CompactionConfig {
             max_bytes_for_level_base: 64 * 1024,
             max_bytes_for_level_multiplier: 10,
             max_grandparent_overlap_bytes_factor: 10,
+            max_subcompactions: 1,
         }
     }
 }
-
-const SUBCOMPACTION_RANGE_SPLIT_TARGET: usize = 4;
 
 impl CompactionConfig {
     fn normalized(mut self) -> Self {
@@ -45,6 +46,7 @@ impl CompactionConfig {
         self.max_bytes_for_level_multiplier = self.max_bytes_for_level_multiplier.max(2);
         self.max_grandparent_overlap_bytes_factor =
             self.max_grandparent_overlap_bytes_factor.max(1);
+        self.max_subcompactions = self.max_subcompactions.max(1);
         self
     }
 }
@@ -75,6 +77,12 @@ struct CompactionPlan {
     source_files: Vec<Arc<FileMetadata>>,
     target_files: Vec<Arc<FileMetadata>>,
     grandparent_files: Vec<Arc<FileMetadata>>,
+    grandparent_overlap_bytes_limit: u64,
+}
+
+#[derive(Clone, Copy)]
+struct OverlapBudget<'a> {
+    grandparent_files: &'a [Arc<FileMetadata>],
     grandparent_overlap_bytes_limit: u64,
 }
 
@@ -497,6 +505,7 @@ impl FlushWorker {
                 sstable_paths,
                 &snapshot_seqs,
                 plan,
+                compaction_config.max_subcompactions,
                 bloom_prefix_extractor_len,
             ) {
                 break;
@@ -740,13 +749,17 @@ impl FlushWorker {
         sstable_paths: &Arc<SstablePaths>,
         snapshot_seqs: &[u64],
         plan: CompactionPlan,
+        max_subcompactions: usize,
         bloom_prefix_extractor_len: usize,
     ) -> bool {
-        let _planned_sub_ranges = build_subcompaction_ranges(
-            &plan.source_files,
-            &plan.target_files,
-            SUBCOMPACTION_RANGE_SPLIT_TARGET,
-        );
+        let mut planned_sub_ranges = if plan.source_level == 0 {
+            vec![SubcompactionRange::full()]
+        } else {
+            build_subcompaction_ranges(&plan.source_files, &plan.target_files, max_subcompactions)
+        };
+        if planned_sub_ranges.is_empty() {
+            planned_sub_ranges.push(SubcompactionRange::full());
+        }
         let mut version_edit = VersionEdit::new();
         for file in &plan.source_files {
             version_edit.delete_file(plan.source_level, file.file_id);
@@ -790,37 +803,59 @@ impl FlushWorker {
             return true;
         }
 
-        let mut stream = match CompactionStream::from_files(
-            sstable_paths,
-            &plan.source_files,
-            &plan.target_files,
-        ) {
-            Ok(stream) => stream,
-            Err(e) => {
-                error!(
-                    "L{}->L{} compaction read failed: {}",
-                    plan.source_level, plan.target_level, e
-                );
-                return false;
+        let (outputs, max_seq) = if planned_sub_ranges.len() == 1 {
+            let mut stream = match CompactionStream::from_files(
+                sstable_paths,
+                &plan.source_files,
+                &plan.target_files,
+            ) {
+                Ok(stream) => stream,
+                Err(e) => {
+                    error!(
+                        "L{}->L{} compaction read failed: {}",
+                        plan.source_level, plan.target_level, e
+                    );
+                    return false;
+                }
+            };
+            match Self::build_compacted_sstables(
+                version_set,
+                sstable_paths,
+                &mut stream,
+                snapshot_seqs,
+                OverlapBudget {
+                    grandparent_files: &plan.grandparent_files,
+                    grandparent_overlap_bytes_limit: plan.grandparent_overlap_bytes_limit,
+                },
+                bloom_prefix_extractor_len,
+                planned_sub_ranges.first(),
+            ) {
+                Ok(result) => result,
+                Err(e) => {
+                    error!(
+                        "L{}->L{} compaction build failed: {}",
+                        plan.source_level, plan.target_level, e
+                    );
+                    return false;
+                }
             }
-        };
-
-        let (outputs, max_seq) = match Self::build_compacted_sstables(
-            version_set,
-            sstable_paths,
-            &mut stream,
-            snapshot_seqs,
-            &plan.grandparent_files,
-            plan.grandparent_overlap_bytes_limit,
-            bloom_prefix_extractor_len,
-        ) {
-            Ok(result) => result,
-            Err(e) => {
-                error!(
-                    "L{}->L{} compaction build failed: {}",
-                    plan.source_level, plan.target_level, e
-                );
-                return false;
+        } else {
+            match Self::build_compacted_sstables_parallel(
+                version_set,
+                sstable_paths,
+                &plan,
+                snapshot_seqs,
+                bloom_prefix_extractor_len,
+                &planned_sub_ranges,
+            ) {
+                Ok(result) => result,
+                Err(e) => {
+                    error!(
+                        "L{}->L{} subcompaction build failed: {}",
+                        plan.source_level, plan.target_level, e
+                    );
+                    return false;
+                }
             }
         };
 
@@ -860,9 +895,9 @@ impl FlushWorker {
         sstable_paths: &SstablePaths,
         stream: &mut CompactionStream,
         snapshot_seqs: &[u64],
-        grandparent_files: &[Arc<FileMetadata>],
-        grandparent_overlap_bytes_limit: u64,
+        overlap_budget: OverlapBudget<'_>,
         bloom_prefix_extractor_len: usize,
+        sub_range: Option<&SubcompactionRange>,
     ) -> GoatResult<(Vec<(u64, TableProperties)>, u64)> {
         let mut outputs = Vec::new();
         let mut current_file_id: Option<u64> = None;
@@ -874,6 +909,11 @@ impl FlushWorker {
         let mut last_emitted_snapshot_stripe: Option<u64> = None;
 
         while let Some((internal_key, value)) = stream.next_entry()? {
+            if let Some(range) = sub_range {
+                if !Self::user_key_in_sub_range(internal_key.user_key(), range) {
+                    continue;
+                }
+            }
             max_seq = max_seq.max(internal_key.sequence_number());
             let snapshot_stripe =
                 Self::find_earliest_visible_snapshot(snapshot_seqs, internal_key.sequence_number());
@@ -889,20 +929,22 @@ impl FlushWorker {
             if current_entries > 0 {
                 if let Some(current_smallest) = current_smallest_user.as_ref() {
                     let overlap_bytes = Self::overlap_bytes(
-                        grandparent_files,
+                        overlap_budget.grandparent_files,
                         current_smallest.as_slice(),
                         internal_key.user_key(),
                     );
-                    if overlap_bytes > grandparent_overlap_bytes_limit {
+                    if overlap_bytes > overlap_budget.grandparent_overlap_bytes_limit {
                         if let (Some(mut current_builder), Some(file_id)) =
                             (builder.take(), current_file_id.take())
                         {
                             let props = match current_builder.finish() {
                                 Ok(props) => props,
                                 Err(e) => {
-                                    let output_ids =
-                                        outputs.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-                                    Self::cleanup_generated_sstables(sstable_paths, &output_ids);
+                                    Self::cleanup_partial_compaction_outputs(
+                                        sstable_paths,
+                                        &outputs,
+                                        Some(file_id),
+                                    );
                                     return Err(e);
                                 }
                             };
@@ -927,8 +969,11 @@ impl FlushWorker {
                     ) {
                         Ok(builder) => builder,
                         Err(e) => {
-                            let output_ids = outputs.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-                            Self::cleanup_generated_sstables(sstable_paths, &output_ids);
+                            Self::cleanup_partial_compaction_outputs(
+                                sstable_paths,
+                                &outputs,
+                                Some(file_id),
+                            );
                             return Err(e);
                         }
                     },
@@ -940,8 +985,11 @@ impl FlushWorker {
             let key = internal_key.serialize();
             if let Some(current_builder) = builder.as_mut() {
                 if let Err(e) = current_builder.write(&key, &value) {
-                    let output_ids = outputs.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-                    Self::cleanup_generated_sstables(sstable_paths, &output_ids);
+                    Self::cleanup_partial_compaction_outputs(
+                        sstable_paths,
+                        &outputs,
+                        current_file_id,
+                    );
                     return Err(e);
                 }
             }
@@ -955,8 +1003,11 @@ impl FlushWorker {
             let props = match current_builder.finish() {
                 Ok(props) => props,
                 Err(e) => {
-                    let output_ids = outputs.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-                    Self::cleanup_generated_sstables(sstable_paths, &output_ids);
+                    Self::cleanup_partial_compaction_outputs(
+                        sstable_paths,
+                        &outputs,
+                        Some(file_id),
+                    );
                     return Err(e);
                 }
             };
@@ -964,6 +1015,99 @@ impl FlushWorker {
         }
 
         Ok((outputs, max_seq))
+    }
+
+    fn user_key_in_sub_range(user_key: &[u8], range: &SubcompactionRange) -> bool {
+        if let Some(start) = range.start_user_key.as_ref() {
+            if user_key < start.as_slice() {
+                return false;
+            }
+        }
+        if let Some(end) = range.end_user_key.as_ref() {
+            if user_key >= end.as_slice() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn build_compacted_sstables_parallel(
+        version_set: &Arc<RwLock<VersionSet>>,
+        sstable_paths: &Arc<SstablePaths>,
+        plan: &CompactionPlan,
+        snapshot_seqs: &[u64],
+        bloom_prefix_extractor_len: usize,
+        sub_ranges: &[SubcompactionRange],
+    ) -> GoatResult<(Vec<(u64, TableProperties)>, u64)> {
+        if sub_ranges.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        let snapshot_seqs = snapshot_seqs.to_vec();
+        let mut handles = Vec::with_capacity(sub_ranges.len());
+        for sub_range in sub_ranges {
+            let version_set = version_set.clone();
+            let sstable_paths = sstable_paths.clone();
+            let source_files = plan.source_files.clone();
+            let target_files = plan.target_files.clone();
+            let grandparent_files = plan.grandparent_files.clone();
+            let snapshot_seqs = snapshot_seqs.clone();
+            let overlap_limit = plan.grandparent_overlap_bytes_limit;
+            let sub_range = sub_range.clone();
+            let handle = thread::spawn(move || {
+                let mut stream =
+                    CompactionStream::from_files(&sstable_paths, &source_files, &target_files)?;
+                Self::build_compacted_sstables(
+                    &version_set,
+                    &sstable_paths,
+                    &mut stream,
+                    &snapshot_seqs,
+                    OverlapBudget {
+                        grandparent_files: &grandparent_files,
+                        grandparent_overlap_bytes_limit: overlap_limit,
+                    },
+                    bloom_prefix_extractor_len,
+                    Some(&sub_range),
+                )
+            });
+            handles.push(handle);
+        }
+
+        let mut all_outputs = Vec::new();
+        let mut max_seq = 0u64;
+        let mut first_error: Option<GoatError> = None;
+        for handle in handles {
+            let result = match handle.join() {
+                Ok(result) => result,
+                Err(_) => Err(GoatError::internal(
+                    "subcompaction",
+                    "subcompaction thread panicked",
+                )),
+            };
+            match result {
+                Ok((mut outputs, sub_max_seq)) => {
+                    max_seq = max_seq.max(sub_max_seq);
+                    all_outputs.append(&mut outputs);
+                }
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
+        }
+
+        if let Some(e) = first_error {
+            Self::cleanup_partial_compaction_outputs(sstable_paths, &all_outputs, None);
+            return Err(e);
+        }
+
+        all_outputs.sort_by(|a, b| {
+            a.1.smallest_key
+                .cmp(&b.1.smallest_key)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        Ok((all_outputs, max_seq))
     }
 
     fn find_earliest_visible_snapshot(snapshot_seqs: &[u64], sequence: u64) -> u64 {
@@ -985,6 +1129,18 @@ impl FlushWorker {
                 }
             }
         }
+    }
+
+    fn cleanup_partial_compaction_outputs(
+        sstable_paths: &SstablePaths,
+        outputs: &[(u64, TableProperties)],
+        current_file_id: Option<u64>,
+    ) {
+        let mut output_ids = outputs.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        if let Some(file_id) = current_file_id {
+            output_ids.push(file_id);
+        }
+        Self::cleanup_generated_sstables(sstable_paths, &output_ids);
     }
 
     fn user_key_range(files: &[Arc<FileMetadata>]) -> Option<(Vec<u8>, Vec<u8>)> {
@@ -1237,8 +1393,15 @@ mod tests {
             grandparent_overlap_bytes_limit: u64::MAX,
         };
 
-        let ok =
-            FlushWorker::compact_one_level(&lsm_state, &version_set, &sstable_paths, &[], plan, 0);
+        let ok = FlushWorker::compact_one_level(
+            &lsm_state,
+            &version_set,
+            &sstable_paths,
+            &[],
+            plan,
+            1,
+            0,
+        );
         assert!(!ok, "compaction should fail when apply_edit fails");
         assert!(
             version_set.read().unwrap().next_file_number() > expected_output_file_id,
@@ -1306,9 +1469,12 @@ mod tests {
             &sstable_paths,
             &mut stream_without_snapshot,
             &[],
-            &[],
-            u64::MAX,
+            OverlapBudget {
+                grandparent_files: &[],
+                grandparent_overlap_bytes_limit: u64::MAX,
+            },
             0,
+            None,
         )
         .expect("build compacted sstable without snapshot");
         assert_eq!(outputs_without_snapshot.len(), 1);
@@ -1333,9 +1499,12 @@ mod tests {
             &sstable_paths,
             &mut stream_with_snapshot,
             &[15],
-            &[],
-            u64::MAX,
+            OverlapBudget {
+                grandparent_files: &[],
+                grandparent_overlap_bytes_limit: u64::MAX,
+            },
             0,
+            None,
         )
         .expect("build compacted sstable with snapshot");
         assert_eq!(outputs_with_snapshot.len(), 1);
@@ -1371,9 +1540,12 @@ mod tests {
             &sstable_paths,
             &mut stream_after_release,
             &[],
-            &[],
-            u64::MAX,
+            OverlapBudget {
+                grandparent_files: &[],
+                grandparent_overlap_bytes_limit: u64::MAX,
+            },
             0,
+            None,
         )
         .expect("build compacted sstable after snapshot release");
         assert_eq!(outputs_after_release.len(), 1);
@@ -1389,5 +1561,124 @@ mod tests {
             .map(|(key, _)| key.sequence_number())
             .collect();
         assert_eq!(k1_versions_after_release, vec![30]);
+    }
+
+    #[test]
+    fn subcompaction_parallel_matches_single_thread_output() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let (_wal_paths, sstable_paths, manifest_paths) =
+            KvEngine::init_db_paths(temp_dir.path()).expect("init paths");
+        let (obsolete_tx, _obsolete_rx) = unbounded_channel::<CleanupTask>();
+
+        let source_left = build_sstable_file(
+            &sstable_paths,
+            obsolete_tx.clone(),
+            300,
+            vec![
+                (
+                    InternalKey::new(b"a".to_vec(), 30, InternalKeyKind::Put),
+                    b"va30".to_vec(),
+                ),
+                (
+                    InternalKey::new(b"b".to_vec(), 20, InternalKeyKind::Put),
+                    b"vb20".to_vec(),
+                ),
+            ],
+        );
+        let source_right = build_sstable_file(
+            &sstable_paths,
+            obsolete_tx.clone(),
+            301,
+            vec![
+                (
+                    InternalKey::new(b"m".to_vec(), 18, InternalKeyKind::Put),
+                    b"vm18".to_vec(),
+                ),
+                (
+                    InternalKey::new(b"z".to_vec(), 12, InternalKeyKind::Put),
+                    b"vz12".to_vec(),
+                ),
+            ],
+        );
+        let target_file = build_sstable_file(
+            &sstable_paths,
+            obsolete_tx.clone(),
+            302,
+            vec![(
+                InternalKey::new(b"n".to_vec(), 10, InternalKeyKind::Put),
+                b"vn10".to_vec(),
+            )],
+        );
+
+        let version_set = Arc::new(RwLock::new(
+            VersionSet::new_with_options(
+                manifest_paths,
+                sstable_paths.clone(),
+                VersionSetOptions {
+                    num_levels: 3,
+                    ..VersionSetOptions::default()
+                },
+                obsolete_tx.clone(),
+            )
+            .expect("create version set"),
+        ));
+        let source_files = vec![source_left, source_right];
+        let target_files = vec![target_file];
+
+        let mut single_stream =
+            CompactionStream::from_files(&sstable_paths, &source_files, &target_files)
+                .expect("build single stream");
+        let (single_outputs, _) = FlushWorker::build_compacted_sstables(
+            &version_set,
+            &sstable_paths,
+            &mut single_stream,
+            &[],
+            OverlapBudget {
+                grandparent_files: &[],
+                grandparent_overlap_bytes_limit: u64::MAX,
+            },
+            0,
+            None,
+        )
+        .expect("build single outputs");
+
+        let plan = CompactionPlan {
+            source_level: 1,
+            target_level: 2,
+            source_files: source_files.clone(),
+            target_files: target_files.clone(),
+            grandparent_files: Vec::new(),
+            grandparent_overlap_bytes_limit: u64::MAX,
+        };
+        let ranges = build_subcompaction_ranges(&source_files, &target_files, 4);
+        assert!(
+            ranges.len() > 1,
+            "test requires splitter to produce multiple ranges"
+        );
+        let (parallel_outputs, _) = FlushWorker::build_compacted_sstables_parallel(
+            &version_set,
+            &sstable_paths,
+            &plan,
+            &[],
+            0,
+            &ranges,
+        )
+        .expect("build parallel outputs");
+
+        let collect_entries = |outputs: &[(u64, TableProperties)]| {
+            let mut rows = Vec::new();
+            for (file_id, _props) in outputs {
+                let mut entries = SSTableReader::open(sstable_paths.sstable_path_by_id(*file_id))
+                    .expect("open output")
+                    .scan_all()
+                    .expect("scan output");
+                rows.append(&mut entries);
+            }
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            rows
+        };
+        let single_rows = collect_entries(&single_outputs);
+        let parallel_rows = collect_entries(&parallel_outputs);
+        assert_eq!(single_rows, parallel_rows);
     }
 }

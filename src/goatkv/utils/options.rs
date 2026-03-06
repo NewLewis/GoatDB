@@ -154,6 +154,11 @@ pub struct KvEngineOptions {
     /// Default: 10
     pub compaction_max_grandparent_overlap_bytes_factor: u64,
 
+    /// Maximum subcompactions per compaction task.
+    /// 1 means disabled (single-thread compaction).
+    /// Default: 1
+    pub max_subcompactions: usize,
+
     /// L0 文件数达到该阈值时进入写入减速（slowdown）
     /// Default: 20
     pub l0_slowdown_writes_trigger: usize,
@@ -217,6 +222,7 @@ impl Default for KvEngineOptions {
             compaction_max_bytes_for_level_base: 64 * 1024,
             compaction_max_bytes_for_level_multiplier: 10,
             compaction_max_grandparent_overlap_bytes_factor: 10,
+            max_subcompactions: 1,
             l0_slowdown_writes_trigger: 20,
             l0_stop_writes_trigger: 36,
             soft_pending_compaction_bytes_limit: 64 * 1024 * 1024,
@@ -413,6 +419,12 @@ impl KvEngineOptions {
         self
     }
 
+    /// Sets max subcompactions per task.
+    pub fn with_max_subcompactions(mut self, max_subcompactions: usize) -> Self {
+        self.max_subcompactions = max_subcompactions.max(1);
+        self
+    }
+
     /// Sets L0 slowdown trigger for writes.
     pub fn with_l0_slowdown_writes_trigger(mut self, trigger: usize) -> Self {
         self.l0_slowdown_writes_trigger = trigger.max(1);
@@ -502,6 +514,7 @@ impl KvEngineOptions {
             compaction_max_bytes_for_level_base: 64 * 1024,
             compaction_max_bytes_for_level_multiplier: 10,
             compaction_max_grandparent_overlap_bytes_factor: 10,
+            max_subcompactions: 1,
             l0_slowdown_writes_trigger: 20,
             l0_stop_writes_trigger: 36,
             soft_pending_compaction_bytes_limit: 64 * 1024 * 1024,
@@ -624,6 +637,15 @@ mod tests {
         assert_eq!(options.compaction_max_bytes_for_level_base, 256 * 1024);
         assert_eq!(options.compaction_max_bytes_for_level_multiplier, 12);
         assert_eq!(options.compaction_max_grandparent_overlap_bytes_factor, 7);
+    }
+
+    #[test]
+    fn test_with_max_subcompactions() {
+        let options = KvEngineOptions::default().with_max_subcompactions(8);
+        assert_eq!(options.max_subcompactions, 8);
+
+        let options = KvEngineOptions::default().with_max_subcompactions(0);
+        assert_eq!(options.max_subcompactions, 1);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # GoatKV 引擎问题跟踪清单
 
-更新时间：2026-03-05
+更新时间：2026-03-06
 
 目标：把当前已识别的风险和缺口落成可执行 backlog，按优先级逐条解决并验证。
 
@@ -27,6 +27,7 @@
 - 2026-03-04：完成读路径阶段 3（block 内 user-key hash index + pinned value + row cache）并复测：`/tmp/goatkv_bench_cmp_stage3` 下 `randread(times=80,key_nums=20000,threads=16)` GoatKV `351ms` vs RocksDB `450ms`；`hotread(times=120,key_nums=20000,hotset=512,threads=16)` GoatKV `461ms` vs RocksDB `563ms`。对照 `row_cache=0`（`/tmp/goatkv_bench_cmp_stage3_norow`）GoatKV `randread=1557ms`、`hotread=1357ms`，确认热点收益主要来自 row cache 与 pinned 短路径。
 - 2026-03-05：完成 GoatKV vs RocksDB 读路径再对齐走读，新增“读路径差异记录（2026-03-05）”章节，沉淀当前实现与配置差异。
 - 2026-03-05：完成快照能力设计草案（参考 RocksDB `ReadOptions::snapshot` / `SnapshotList` / `CompactionIterator` 规则），新增文档 `docs/goatkv/snapshot_design.md`。
+- 2026-03-06：完成 `SM5-01/SM5-02`，subcompaction 已支持按 key-range 并行执行与线程上限控制（`max_subcompactions`）；补充并行/串行结果一致性回归与高写入基准对照（含 debt 收敛观测）。
 
 ## 读路径差异记录（2026-03-05）
 
@@ -621,7 +622,7 @@
     - 2026-03-04：`Version` 读路径新增按 `(version_seqno, user_key)` 维度 row cache，满足 snapshot/可见性隔离；支持 miss 结果缓存（negative cache）。
     - 2026-03-04：基准验证：`/tmp/goatkv_bench_cmp_stage3` 下 GoatKV `randread=351ms`、`hotread=461ms`；对照 `row_cache=0`（`/tmp/goatkv_bench_cmp_stage3_norow`）分别为 `1557ms`、`1357ms`。
 
-- [ ] `P1-PARALLEL-COMPACTION-SUBCOMPACTION`
+- [x] `P1-PARALLEL-COMPACTION-SUBCOMPACTION`
   - 现象：当前 compaction 由单线程循环串行执行，未支持 subcompaction 并行拆分。
   - 影响：大 compaction debt 时后台追赶速度不足，易形成写放大与读放大叠加。
   - 代码定位：
@@ -633,9 +634,15 @@
     - 支持按 key range 切片并行执行 subcompaction。
     - 保证输出文件范围不重叠且 VersionEdit 提交一致。
     - 在高写入压测下 compaction backlog 能持续下降。
-  - 进展：
-    - 2026-03-05：`SM5-01` 第一阶段已落地：新增 `storage/compaction` 模块，包含 `SubcompactionRange` 与 key-range 切分器（`split_user_key_ranges`、`build_subcompaction_ranges`），并接入 compaction 计划阶段做范围预切分（当前仍串行执行）。
-    - 2026-03-05：新增切分器回归（有序/不重叠/上限约束）与边界提取回归（丢弃全局最大 cut point，避免尾段空范围）。
+  - 关闭记录：
+    - 2026-03-05：`SM5-01` 第一阶段落地：新增 `storage/compaction` 模块，包含 `SubcompactionRange` 与 key-range 切分器（`split_user_key_ranges`、`build_subcompaction_ranges`），并接入 compaction 计划流程。
+    - 2026-03-06：`FlushWorker` compaction 路径接入并行 subcompaction（按 `max_subcompactions` 控制线程上限），支持子范围过滤构建与统一排序提交。
+    - 2026-03-06：补齐错误收敛与清理路径：并行线程全部 join 后统一收敛错误，失败时清理已生成 SST 文件，避免 orphan 文件残留。
+    - 2026-03-06：新增一致性回归 `subcompaction_parallel_matches_single_thread_output`，验证并行输出与单线程语义一致（key/value 集合相同）。
+    - 2026-03-06：高写入基准（`populate --threads 16 --key-nums 120000 --batch-size 128 --value-size 512 --wal-sync`）3 轮对照：
+      - `max_subcompactions=1`：`total_ms=423/196/132`（avg `250.3ms`）。
+      - `max_subcompactions=4`：`total_ms=204/121/107`（avg `144.0ms`，较 `=1` 提升约 `42.5%`）。
+      - 两组均 `submitted=successful=120000`、`failed=0`，且 `post_wait pending_compaction_bytes=0`，满足 debt 可回落要求。
 
 - [ ] `P1-PER-LEVEL-COMPRESSION`
   - 现象：SSTable 数据块当前未支持按层压缩策略（如 LZ4/ZSTD/Snappy）。
@@ -1094,7 +1101,7 @@
 
 #### Milestone 5（compaction 吞吐与空间效率）
 
-- [ ] `TASK-SM5-01` subcompaction 范围切分器（status: in-progress, 2026-03-05）
+- [x] `TASK-SM5-01` subcompaction 范围切分器（status: done, 2026-03-06）
   - 目标：将大 compaction task 拆为可并行子任务。
   - 关键改动文件：
     - `src/goatkv/storage/compaction/mod.rs`
@@ -1105,24 +1112,37 @@
     - `cargo test --lib goatkv::storage::compaction::plan::tests`
     - `cargo test --lib goatkv::storage::compaction::picker::tests`
     - `cargo test --lib goatkv::core::flush_worker::tests::trivial_move_respects_grandparent_overlap_limit`
+    - `cargo test --lib goatkv::core::flush_worker::tests::subcompaction_parallel_matches_single_thread_output`
   - DoD：
     - 切分逻辑遵守 key-range 不重叠与顺序约束。
     - 单线程与并行结果一致。
-  - 进展记录：
-    - 2026-03-05：范围切分器与边界提取已实现并接入 compaction 计划流程，下一步在 `SM5-02` 引入并行执行后补“单线程 vs 并行结果一致性”对照验证。
+  - 关闭记录：
+    - 2026-03-05：范围切分器与边界提取已实现并接入 compaction 计划流程。
+    - 2026-03-06：补齐“单线程 vs 并行结果一致性”回归，确认切分边界无重叠且语义一致。
 
-- [ ] `TASK-SM5-02` 并行 subcompaction 执行与资源控制（status: planned）
+- [x] `TASK-SM5-02` 并行 subcompaction 执行与资源控制（status: done, 2026-03-06）
   - 目标：提高后台追赶速度且不击穿前台延迟。
   - 关键改动文件：
-    - `src/goatkv/storage/compaction/mod.rs`
-    - `src/goatkv/storage/compaction/worker.rs`
-    - `src/goatkv/options.rs`
+    - `src/goatkv/core/flush_worker.rs`
+    - `src/goatkv/core/kv_engine/engine.rs`
+    - `src/goatkv/utils/options.rs`
+    - `benches/goatkv_bench.rs`
   - 回归命令：
-    - `cargo test --lib --tests`
-    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine goatkv --wal-sync populate --threads 16`
+    - `cargo test --lib`
+    - `cargo bench --bench goatkv_bench -- --directory /tmp/goatkv_sm502_cmp2_m1_r1 --engine goatkv --wal-sync --threads 16 --max-subcompactions 1 populate --key-nums 120000 --batch-size 128 --value-size 512 --seq`
+    - `cargo bench --bench goatkv_bench -- --directory /tmp/goatkv_sm502_cmp2_m4_r1 --engine goatkv --wal-sync --threads 16 --max-subcompactions 4 populate --key-nums 120000 --batch-size 128 --value-size 512 --seq`
   - DoD：
     - compaction debt 在高写入下可持续下降。
     - 写路径延迟退化在阈值内。
+  - 关闭记录：
+    - 2026-03-06：新增 `KvEngineOptions::max_subcompactions`（默认 1）并接入 `CompactionConfig` 与 bench CLI `--max-subcompactions`。
+    - 2026-03-06：compaction 执行路径支持按 sub-range 并行构建输出 SST，串行路径保持兼容（`max_subcompactions=1`）。
+    - 2026-03-06：并行失败路径改为“全部 join 后统一收敛错误 + 清理已生成文件”，避免中途返回导致后台线程游离与 orphan 输出。
+    - 2026-03-06：`goatkv_bench` 新增写入错误统计（`submitted/successful/failed/unavailable_errors/thread_panics`）与 `runtime_metrics` 打点（`post_write/post_wait`）。
+    - 2026-03-06：高写入 3 轮对照（`threads=16,key_nums=120000,batch_size=128,value_size=512,wal_sync`）：
+      - `max_subcompactions=1`：`total_ms=423/196/132`（avg `250.3ms`）。
+      - `max_subcompactions=4`：`total_ms=204/121/107`（avg `144.0ms`）。
+      - 两组均 `failed=0`；`post_wait` 阶段 `pending_compaction_bytes` 与 `immutable_memtable_backlog` 均回落到 0，满足 debt 追赶目标。
 
 - [ ] `TASK-SM5-03` per-level compression 配置与读兼容（status: planned）
   - 目标：按层配置压缩策略，平衡 CPU 与空间放大。

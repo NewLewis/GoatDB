@@ -10,7 +10,7 @@ use rand::{Rng, SeedableRng};
 
 use goat_db::goatkv::storage::sstable::SSTableReader;
 use goat_db::goatkv::utils::init_logging;
-use goat_db::goatkv::{KvEngine, KvEngineOptions};
+use goat_db::goatkv::{ErrorKind, KvEngine, KvEngineOptions};
 #[cfg(feature = "rocksdb")]
 use rocksdb::{DBCompressionType, IteratorMode, Options, WriteBatch, WriteOptions, DB};
 
@@ -62,6 +62,10 @@ struct Cli {
     /// Filter cache size for GoatKV in MB (0 disables partitioned filter cache)
     #[arg(long, default_value_t = 16)]
     filter_cache_capacity_mb: usize,
+
+    /// Max subcompactions per compaction task for GoatKV
+    #[arg(long, default_value_t = 1)]
+    max_subcompactions: usize,
 
     #[command(subcommand)]
     command: Commands,
@@ -177,6 +181,27 @@ struct BenchResult {
     ms_per_iter: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct GoatkvWriteStats {
+    submitted: u64,
+    successful: u64,
+    failed: u64,
+    unavailable_errors: u64,
+    thread_panics: u64,
+}
+
+impl GoatkvWriteStats {
+    fn add(&mut self, other: Self) {
+        self.submitted = self.submitted.saturating_add(other.submitted);
+        self.successful = self.successful.saturating_add(other.successful);
+        self.failed = self.failed.saturating_add(other.failed);
+        self.unavailable_errors = self
+            .unavailable_errors
+            .saturating_add(other.unavailable_errors);
+        self.thread_panics = self.thread_panics.saturating_add(other.thread_panics);
+    }
+}
+
 #[cfg(not(feature = "rocksdb"))]
 fn ensure_rocksdb_available() -> ! {
     tracing::error!("rocksdb support is disabled; rebuild with --features rocksdb");
@@ -222,9 +247,9 @@ fn populate_goatkv(
     value_size: usize,
     seq: bool,
     threads: usize,
-) {
+) -> GoatkvWriteStats {
     if key_nums == 0 || threads == 0 {
-        return;
+        return GoatkvWriteStats::default();
     }
     let batch_size = batch_size.max(1);
     let mut handles = Vec::with_capacity(threads);
@@ -236,6 +261,7 @@ fn populate_goatkv(
         let handle = thread::spawn(move || {
             let mut rng = SmallRng::seed_from_u64(seed);
             let total = end.saturating_sub(start);
+            let mut stats = GoatkvWriteStats::default();
             if seq {
                 let mut processed = 0u64;
                 while processed < total {
@@ -247,7 +273,19 @@ fn populate_goatkv(
                         let value = make_value(value_size, key_id);
                         entries.push((key, value));
                     }
-                    engine.put_batch(entries).expect("goatkv put_batch");
+                    stats.submitted = stats.submitted.saturating_add(batch);
+                    match engine.put_batch(entries) {
+                        Ok(()) => {
+                            stats.successful = stats.successful.saturating_add(batch);
+                        }
+                        Err(err) => {
+                            stats.failed = stats.failed.saturating_add(batch);
+                            if err.kind() == ErrorKind::Unavailable {
+                                stats.unavailable_errors =
+                                    stats.unavailable_errors.saturating_add(batch);
+                            }
+                        }
+                    }
                     processed += batch;
                 }
             } else {
@@ -261,17 +299,35 @@ fn populate_goatkv(
                         let value = make_value(value_size, key_id);
                         entries.push((key, value));
                     }
-                    engine.put_batch(entries).expect("goatkv put_batch");
+                    stats.submitted = stats.submitted.saturating_add(batch);
+                    match engine.put_batch(entries) {
+                        Ok(()) => {
+                            stats.successful = stats.successful.saturating_add(batch);
+                        }
+                        Err(err) => {
+                            stats.failed = stats.failed.saturating_add(batch);
+                            if err.kind() == ErrorKind::Unavailable {
+                                stats.unavailable_errors =
+                                    stats.unavailable_errors.saturating_add(batch);
+                            }
+                        }
+                    }
                     remaining = remaining.saturating_sub(batch);
                 }
             }
+            stats
         });
         handles.push(handle);
     }
 
+    let mut aggregate = GoatkvWriteStats::default();
     for handle in handles {
-        let _ = handle.join();
+        match handle.join() {
+            Ok(stats) => aggregate.add(stats),
+            Err(_) => aggregate.thread_panics = aggregate.thread_panics.saturating_add(1),
+        }
     }
+    aggregate
 }
 
 fn singleput_goatkv(
@@ -280,9 +336,9 @@ fn singleput_goatkv(
     value_size: usize,
     seq: bool,
     threads: usize,
-) {
+) -> GoatkvWriteStats {
     if key_nums == 0 || threads == 0 {
-        return;
+        return GoatkvWriteStats::default();
     }
     let mut handles = Vec::with_capacity(threads);
 
@@ -292,11 +348,24 @@ fn singleput_goatkv(
         let seed = 0x517c_c1b7_u64.wrapping_mul(index as u64 + 1);
         let handle = thread::spawn(move || {
             let mut rng = SmallRng::seed_from_u64(seed);
+            let mut stats = GoatkvWriteStats::default();
             if seq {
                 for key_id in start..end {
                     let key = make_key(key_id);
                     let value = make_value(value_size, key_id);
-                    engine.put(key, value).expect("goatkv put");
+                    stats.submitted = stats.submitted.saturating_add(1);
+                    match engine.put(key, value) {
+                        Ok(()) => {
+                            stats.successful = stats.successful.saturating_add(1);
+                        }
+                        Err(err) => {
+                            stats.failed = stats.failed.saturating_add(1);
+                            if err.kind() == ErrorKind::Unavailable {
+                                stats.unavailable_errors =
+                                    stats.unavailable_errors.saturating_add(1);
+                            }
+                        }
+                    }
                 }
             } else {
                 let mut remaining = end.saturating_sub(start);
@@ -304,17 +373,35 @@ fn singleput_goatkv(
                     let key_id = rng.gen_range(0..key_nums);
                     let key = make_key(key_id);
                     let value = make_value(value_size, key_id);
-                    engine.put(key, value).expect("goatkv put");
+                    stats.submitted = stats.submitted.saturating_add(1);
+                    match engine.put(key, value) {
+                        Ok(()) => {
+                            stats.successful = stats.successful.saturating_add(1);
+                        }
+                        Err(err) => {
+                            stats.failed = stats.failed.saturating_add(1);
+                            if err.kind() == ErrorKind::Unavailable {
+                                stats.unavailable_errors =
+                                    stats.unavailable_errors.saturating_add(1);
+                            }
+                        }
+                    }
                     remaining = remaining.saturating_sub(1);
                 }
             }
+            stats
         });
         handles.push(handle);
     }
 
+    let mut aggregate = GoatkvWriteStats::default();
     for handle in handles {
-        let _ = handle.join();
+        match handle.join() {
+            Ok(stats) => aggregate.add(stats),
+            Err(_) => aggregate.thread_panics = aggregate.thread_panics.saturating_add(1),
+        }
     }
+    aggregate
 }
 
 #[cfg(feature = "rocksdb")]
@@ -568,6 +655,20 @@ fn wait_for_goatkv_flush(engine: &KvEngine, timeout: Duration) {
     }
 }
 
+fn wait_for_goatkv_background_idle(engine: &KvEngine, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let metrics = engine.runtime_metrics();
+        if metrics.immutable_memtable_backlog == 0 && metrics.pending_compaction_bytes == 0 {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn scanread_goatkv(engine: Arc<KvEngine>, times: u64, mode: ScanMode) -> u64 {
     if times == 0 {
         return 0;
@@ -740,6 +841,39 @@ fn print_result(result: &BenchResult) {
     );
 }
 
+fn print_goatkv_write_stats(workload: &str, stats: GoatkvWriteStats) {
+    println!(
+        "goatkv_write_stats workload={} submitted={} successful={} failed={} unavailable_errors={} thread_panics={}",
+        workload,
+        stats.submitted,
+        stats.successful,
+        stats.failed,
+        stats.unavailable_errors,
+        stats.thread_panics,
+    );
+}
+
+fn print_runtime_metrics(engine: &KvEngine, phase: &str) {
+    let metrics = engine.runtime_metrics();
+    println!(
+        "runtime_metrics phase={} immutable_memtable_backlog={} flush_failure_streak={} flush_circuit_open={} l0_file_count={} pending_compaction_bytes={} write_pressure_level={} wal_queue_reqs={} wal_queue_bytes={} mem_queue_reqs={} mem_queue_bytes={} wal_inflight_groups={} mem_inflight_groups={} flush_blocked={}",
+        phase,
+        metrics.immutable_memtable_backlog,
+        metrics.flush_failure_streak,
+        metrics.flush_circuit_open,
+        metrics.l0_file_count,
+        metrics.pending_compaction_bytes,
+        metrics.write_pressure_level,
+        metrics.writer_queue_metrics.wal_queue_reqs,
+        metrics.writer_queue_metrics.wal_queue_bytes,
+        metrics.writer_queue_metrics.mem_queue_reqs,
+        metrics.writer_queue_metrics.mem_queue_bytes,
+        metrics.writer_queue_metrics.wal_inflight_groups,
+        metrics.writer_queue_metrics.mem_inflight_groups,
+        metrics.writer_queue_metrics.flush_blocked,
+    );
+}
+
 fn prepare_engine_dir(base: &Path, engine: EngineKind, both: bool) -> PathBuf {
     if both {
         base.join(engine.label())
@@ -758,6 +892,7 @@ fn goatkv_options_from_cli(cli: &Cli, base_dir: &Path) -> KvEngineOptions {
         .with_block_cache_capacity_bytes(cli.block_cache_capacity_mb.saturating_mul(1024 * 1024))
         .with_row_cache_capacity_bytes(cli.row_cache_capacity_mb.saturating_mul(1024 * 1024))
         .with_filter_cache_capacity_bytes(cli.filter_cache_capacity_mb.saturating_mul(1024 * 1024))
+        .with_max_subcompactions(cli.max_subcompactions)
 }
 
 fn print_cache_metrics(engine: &KvEngine) {
@@ -831,7 +966,14 @@ fn main() {
                         let engine =
                             Arc::new(KvEngine::new_with_options(options).expect("open engine"));
                         let begin = Instant::now();
-                        populate_goatkv(engine, key_nums, batch_size, value_size, seq, cli.threads);
+                        let stats = populate_goatkv(
+                            engine.clone(),
+                            key_nums,
+                            batch_size,
+                            value_size,
+                            seq,
+                            cli.threads,
+                        );
                         let total_ms = begin.elapsed().as_millis();
                         let result = BenchResult {
                             engine: "goatkv",
@@ -841,6 +983,11 @@ fn main() {
                             ms_per_iter: ms_per_iter(total_ms, iters),
                         };
                         print_result(&result);
+                        print_goatkv_write_stats("populate", stats);
+                        print_runtime_metrics(&engine, "post_write");
+                        let idle = wait_for_goatkv_background_idle(&engine, Duration::from_secs(5));
+                        println!("runtime_idle_reached={}", idle);
+                        print_runtime_metrics(&engine, "post_wait");
                     }
                     EngineKind::Rocksdb => {
                         ensure_rocksdb_available();
@@ -887,7 +1034,13 @@ fn main() {
                         let engine =
                             Arc::new(KvEngine::new_with_options(options).expect("open engine"));
                         let begin = Instant::now();
-                        singleput_goatkv(engine, key_nums, value_size, seq, cli.threads);
+                        let stats = singleput_goatkv(
+                            engine.clone(),
+                            key_nums,
+                            value_size,
+                            seq,
+                            cli.threads,
+                        );
                         let total_ms = begin.elapsed().as_millis();
                         let result = BenchResult {
                             engine: "goatkv",
@@ -897,6 +1050,8 @@ fn main() {
                             ms_per_iter: ms_per_iter(total_ms, iters),
                         };
                         print_result(&result);
+                        print_goatkv_write_stats("singleput", stats);
+                        print_runtime_metrics(&engine, "post_write");
                     }
                     EngineKind::Rocksdb => {
                         ensure_rocksdb_available();

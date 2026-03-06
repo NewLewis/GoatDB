@@ -495,6 +495,7 @@ impl KvEngine {
                 max_bytes_for_level_multiplier: options.compaction_max_bytes_for_level_multiplier,
                 max_grandparent_overlap_bytes_factor: options
                     .compaction_max_grandparent_overlap_bytes_factor,
+                max_subcompactions: options.max_subcompactions,
             },
             options.bloom_prefix_extractor_len,
         );
