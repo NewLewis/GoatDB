@@ -4,7 +4,7 @@ use std::time::Duration;
 use std::{collections::HashSet, fs};
 
 use clap::{ArgAction, Parser};
-use goat_db::goatkv::core::kv_engine::KvEngine;
+use goat_db::goatkv::core::kv_engine::{KvEngine, ScanOptions};
 use goat_db::goatkv::metrics::{RpcMethod, RpcMetricsCollector};
 use goat_db::goatkv::server::health::{run_http_health_server, HealthState};
 use goat_db::goatkv::utils::{init_logging, KvEngineOptions};
@@ -13,8 +13,8 @@ use goatkv::{
     goat_kv_service_server::{GoatKvService, GoatKvServiceServer},
     CreateSnapshotRequest, CreateSnapshotResponse, DeleteRequest, DeleteResponse, FlushRequest,
     FlushResponse, GetRequest, GetResponse, MultiGetItem, MultiGetRequest, MultiGetResponse,
-    ReleaseSnapshotRequest, ReleaseSnapshotResponse, UpdateRequest, UpdateResponse, WriteRequest,
-    WriteResponse,
+    ReleaseSnapshotRequest, ReleaseSnapshotResponse, ScanItem, ScanRequest, ScanResponse,
+    UpdateRequest, UpdateResponse, WriteRequest, WriteResponse,
 };
 use std::time::Instant;
 use tokio::{signal, sync::watch, time::sleep};
@@ -233,6 +233,48 @@ impl GoatKvService for GoatKVServiceImpl {
             entries,
         };
         self.ok_response(RpcMethod::MultiGet, started_at, reply)
+    }
+
+    async fn scan(&self, request: Request<ScanRequest>) -> Result<Response<ScanResponse>, Status> {
+        let started_at = Instant::now();
+        let req = request.into_inner();
+        debug!(
+            "Received scan request - start_len: {}, end_len: {}, prefix_len: {}, limit: {}, reverse: {}, snapshot_id: {}",
+            req.start_key.len(),
+            req.end_key.len(),
+            req.prefix.len(),
+            req.limit,
+            req.reverse,
+            req.snapshot_id
+        );
+
+        let options = ScanOptions {
+            start_key: (!req.start_key.is_empty()).then_some(req.start_key),
+            end_key: (!req.end_key.is_empty()).then_some(req.end_key),
+            prefix: (!req.prefix.is_empty()).then_some(req.prefix),
+            limit: req.limit as usize,
+            reverse: req.reverse,
+        };
+        let rows = if req.snapshot_id == 0 {
+            self.engine.scan(options)
+        } else {
+            self.engine.scan_with_snapshot(options, req.snapshot_id)
+        };
+        let rows = match rows.map_err(Self::map_engine_err) {
+            Ok(rows) => rows,
+            Err(status) => return self.err_response(RpcMethod::Scan, started_at, status),
+        };
+
+        let entries = rows
+            .into_iter()
+            .map(|(key, value)| ScanItem { key, value })
+            .collect::<Vec<_>>();
+        let reply = ScanResponse {
+            success: true,
+            message: format!("Scan completed - returned {} rows", entries.len()),
+            entries,
+        };
+        self.ok_response(RpcMethod::Scan, started_at, reply)
     }
 
     async fn update(

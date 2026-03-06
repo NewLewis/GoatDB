@@ -5,6 +5,7 @@ service GoatKVService {
   rpc Write(WriteRequest) returns (WriteResponse);
   rpc Get(GetRequest) returns (GetResponse);
   rpc MultiGet(MultiGetRequest) returns (MultiGetResponse);
+  rpc Scan(ScanRequest) returns (ScanResponse);
   rpc Update(UpdateRequest) returns (UpdateResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
   rpc Flush(FlushRequest) returns (FlushResponse);
@@ -49,6 +50,26 @@ message MultiGetResponse {
   bool success = 1;
   string message = 2;
   repeated MultiGetItem entries = 3;
+}
+
+message ScanRequest {
+  bytes start_key = 1;
+  bytes end_key = 2;
+  bytes prefix = 3;
+  uint32 limit = 4;
+  bool reverse = 5;
+  uint64 snapshot_id = 6;
+}
+
+message ScanItem {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message ScanResponse {
+  bool success = 1;
+  string message = 2;
+  repeated ScanItem entries = 3;
 }
 
 message UpdateRequest {

@@ -15,19 +15,21 @@ pub enum RpcMethod {
     Write = 0,
     Get = 1,
     MultiGet = 2,
-    Update = 3,
-    Delete = 4,
-    Flush = 5,
-    CreateSnapshot = 6,
-    ReleaseSnapshot = 7,
+    Scan = 3,
+    Update = 4,
+    Delete = 5,
+    Flush = 6,
+    CreateSnapshot = 7,
+    ReleaseSnapshot = 8,
 }
 
 impl RpcMethod {
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 9;
     pub const ALL: [RpcMethod; Self::COUNT] = [
         RpcMethod::Write,
         RpcMethod::Get,
         RpcMethod::MultiGet,
+        RpcMethod::Scan,
         RpcMethod::Update,
         RpcMethod::Delete,
         RpcMethod::Flush,
@@ -40,6 +42,7 @@ impl RpcMethod {
             RpcMethod::Write => "write",
             RpcMethod::Get => "get",
             RpcMethod::MultiGet => "multiget",
+            RpcMethod::Scan => "scan",
             RpcMethod::Update => "update",
             RpcMethod::Delete => "delete",
             RpcMethod::Flush => "flush",

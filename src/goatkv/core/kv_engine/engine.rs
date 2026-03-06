@@ -51,6 +51,15 @@ pub enum BatchWriteOp {
     Delete(Vec<u8>),
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanOptions {
+    pub start_key: Option<Vec<u8>>,
+    pub end_key: Option<Vec<u8>>,
+    pub prefix: Option<Vec<u8>>,
+    pub limit: usize,
+    pub reverse: bool,
+}
+
 struct BuildEngineInput {
     wal_writer: WalWriter,
     sequence_number: Arc<SequenceNumber>,
@@ -255,6 +264,39 @@ impl KvEngine {
     pub fn read_cache_metrics(&self) -> Option<ReadCacheMetrics> {
         let lsm_state = self.lsm_state.read().unwrap();
         lsm_state.version.read_cache_metrics()
+    }
+
+    pub fn scan(&self, options: ScanOptions) -> GoatResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        let read_seq = self.writer.last_published_sequence();
+        self.reader.scan_at_seq(
+            options.start_key.as_deref(),
+            options.end_key.as_deref(),
+            options.prefix.as_deref(),
+            options.limit,
+            options.reverse,
+            read_seq,
+        )
+    }
+
+    pub fn scan_with_snapshot(
+        &self,
+        options: ScanOptions,
+        snapshot_id: u64,
+    ) -> GoatResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        let seq = {
+            let manager = self.snapshot_manager.read().unwrap();
+            manager.lookup_sequence(snapshot_id).ok_or_else(|| {
+                GoatError::not_found("snapshot", format!("snapshot {} not found", snapshot_id))
+            })?
+        };
+        self.reader.scan_at_seq(
+            options.start_key.as_deref(),
+            options.end_key.as_deref(),
+            options.prefix.as_deref(),
+            options.limit,
+            options.reverse,
+            seq,
+        )
     }
 
     pub fn runtime_metrics(&self) -> EngineRuntimeMetrics {
@@ -891,7 +933,7 @@ impl KvEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{BatchWriteOp, KvEngine};
+    use super::{BatchWriteOp, KvEngine, ScanOptions};
     use crate::goatkv::error::ErrorKind;
     use crate::goatkv::storage::sstable::{SSTableReader, SstableBlockCompression};
     use crate::goatkv::utils::options::KvEngineOptions;
@@ -995,6 +1037,94 @@ mod tests {
             results,
             vec![Some(b"v1".to_vec()), None, None, Some(b"v3".to_vec())]
         );
+    }
+
+    #[test]
+    fn test_scan_returns_ordered_live_keys() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"a".to_vec(), b"va".to_vec()).unwrap();
+        engine.put(b"b".to_vec(), b"vb".to_vec()).unwrap();
+        engine.put(b"c".to_vec(), b"vc".to_vec()).unwrap();
+        engine.delete(b"b".to_vec()).unwrap();
+
+        let rows = engine.scan(ScanOptions::default()).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (b"a".to_vec(), b"va".to_vec()),
+                (b"c".to_vec(), b"vc".to_vec())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_scan_snapshot_sees_old_versions() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"district:1".to_vec(), b"v1".to_vec()).unwrap();
+        engine.put(b"district:2".to_vec(), b"v2".to_vec()).unwrap();
+        let snapshot = engine.create_snapshot().unwrap();
+
+        engine
+            .put(b"district:1".to_vec(), b"v1-new".to_vec())
+            .unwrap();
+        engine.delete(b"district:2".to_vec()).unwrap();
+
+        let current_rows = engine
+            .scan(ScanOptions {
+                prefix: Some(b"district:".to_vec()),
+                ..ScanOptions::default()
+            })
+            .unwrap();
+        assert_eq!(
+            current_rows,
+            vec![(b"district:1".to_vec(), b"v1-new".to_vec())]
+        );
+
+        let snapshot_rows = engine
+            .scan_with_snapshot(
+                ScanOptions {
+                    prefix: Some(b"district:".to_vec()),
+                    ..ScanOptions::default()
+                },
+                snapshot.id,
+            )
+            .unwrap();
+        assert_eq!(
+            snapshot_rows,
+            vec![
+                (b"district:1".to_vec(), b"v1".to_vec()),
+                (b"district:2".to_vec(), b"v2".to_vec())
+            ]
+        );
+        engine.release_snapshot(snapshot.id).unwrap();
+    }
+
+    #[test]
+    fn test_scan_respects_bounds_reverse_and_limit() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        for key in [b"k1", b"k2", b"k3", b"k4"] {
+            engine.put(key.to_vec(), key.to_vec()).unwrap();
+        }
+
+        let rows = engine
+            .scan(ScanOptions {
+                start_key: Some(b"k2".to_vec()),
+                end_key: Some(b"k4".to_vec()),
+                limit: 1,
+                reverse: true,
+                ..ScanOptions::default()
+            })
+            .unwrap();
+        assert_eq!(rows, vec![(b"k3".to_vec(), b"k3".to_vec())]);
     }
 
     #[test]

@@ -97,6 +97,11 @@ path = "tests/e2e/multiget_test.rs"
 harness = true
 
 [[test]]
+name = "e2e_scan"
+path = "tests/e2e/scan_test.rs"
+harness = true
+
+[[test]]
 name = "integration_recovery"
 path = "tests/integration/recovery_test.rs"
 harness = true

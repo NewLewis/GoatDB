@@ -162,6 +162,10 @@ impl MemTable {
         self.inner.seek_pinned(key)
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = (InternalKey, Bytes)> + '_ {
+        self.inner.iter()
+    }
+
     /// 是否需要 flush 到 immutable memtable
     pub fn should_flush(&self) -> bool {
         self.inner.should_flush()

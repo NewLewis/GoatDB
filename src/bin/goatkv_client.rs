@@ -104,6 +104,27 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         snapshot_id: u64,
     },
+    /// 范围扫描
+    Scan {
+        /// 起始 key（包含）
+        #[arg(long)]
+        start: Option<String>,
+        /// 结束 key（不包含）
+        #[arg(long)]
+        end: Option<String>,
+        /// 前缀过滤
+        #[arg(long)]
+        prefix: Option<String>,
+        /// 返回条数上限（0 表示不限制）
+        #[arg(long, default_value_t = 0)]
+        limit: u32,
+        /// 是否倒序返回
+        #[arg(long, default_value_t = false)]
+        reverse: bool,
+        /// 快照 ID（0 表示最新读）
+        #[arg(long, default_value_t = 0)]
+        snapshot_id: u64,
+    },
     /// 更新键的值
     Update {
         /// 键
@@ -132,7 +153,7 @@ async fn run_interactive(mut client: GoatKvServiceClient<Channel>) -> GoatResult
     println!("GoatDB Interactive Client");
     println!("Connected to server successfully!");
     println!(
-        "Commands: put <key> <value>, get <key> [snapshot_id], multiget <key1> <key2>..., update <key> <value>, delete <key>, flush, snapshot-create, snapshot-release <id>, exit"
+        "Commands: put <key> <value>, get <key> [snapshot_id], multiget <key1> <key2>..., scan [--start k] [--end k] [--prefix p] [--limit n] [--reverse] [--snapshot-id id], update <key> <value>, delete <key>, flush, snapshot-create, snapshot-release <id>, exit"
     );
     println!("Use Tab for auto-completion, ↑↓ for history, Ctrl+C to exit");
 
@@ -188,6 +209,7 @@ async fn run_interactive(mut client: GoatKvServiceClient<Channel>) -> GoatResult
                             "multiget" | "multi-get" | "multi_get" => {
                                 handle_multiget(&mut client, &args_refs[1..]).await
                             }
+                            "scan" => handle_scan(&mut client, &args_refs[1..]).await,
                             "update" => handle_update(&mut client, &args_refs[1..]).await,
                             "delete" => handle_delete(&mut client, &args_refs[1..]).await,
                             "flush" => handle_flush(&mut client).await,
@@ -240,6 +262,7 @@ fn print_help() {
     println!("  put <key> <value>   - Insert or update a key-value pair");
     println!("  get <key> [snapshot_id] - Get the value of a key");
     println!("  multiget <key1> <key2>... - Batch get values by keys");
+    println!("  scan [--start k] [--end k] [--prefix p] [--limit n] [--reverse] [--snapshot-id id] - Scan visible keys");
     println!("  update <key> <value> - Update an existing key's value");
     println!("  delete <key>        - Delete a key-value pair");
     println!("  flush               - Manually trigger flush");
@@ -253,6 +276,7 @@ fn print_help() {
     println!("  get my_key");
     println!("  get my_key 42");
     println!("  multiget key1 key2 key3");
+    println!("  scan --prefix warehouse: --limit 10");
     println!("  snapshot-create");
     println!("  snapshot-release 42");
     println!("  delete \"key with spaces\"");
@@ -372,6 +396,110 @@ async fn handle_multiget(
         } else {
             println!("  {} => <not found>", key);
         }
+    }
+    Ok(())
+}
+
+fn parse_scan_args(args: &[&str]) -> GoatResult<goatkv::ScanRequest> {
+    let mut request = goatkv::ScanRequest {
+        start_key: Vec::new(),
+        end_key: Vec::new(),
+        prefix: Vec::new(),
+        limit: 0,
+        reverse: false,
+        snapshot_id: 0,
+    };
+
+    let mut idx = 0usize;
+    while idx < args.len() {
+        match args[idx] {
+            "--start" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    GoatError::invalid_argument("scan", "Usage: scan [--start k] [--end k] [--prefix p] [--limit n] [--reverse] [--snapshot-id id]")
+                })?;
+                request.start_key = value.as_bytes().to_vec();
+            }
+            "--end" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    GoatError::invalid_argument("scan", "Usage: scan [--start k] [--end k] [--prefix p] [--limit n] [--reverse] [--snapshot-id id]")
+                })?;
+                request.end_key = value.as_bytes().to_vec();
+            }
+            "--prefix" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    GoatError::invalid_argument("scan", "Usage: scan [--start k] [--end k] [--prefix p] [--limit n] [--reverse] [--snapshot-id id]")
+                })?;
+                request.prefix = value.as_bytes().to_vec();
+            }
+            "--limit" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    GoatError::invalid_argument("scan", "Usage: scan [--start k] [--end k] [--prefix p] [--limit n] [--reverse] [--snapshot-id id]")
+                })?;
+                request.limit = value.parse::<u32>().map_err(|e| {
+                    GoatError::invalid_argument(
+                        "limit",
+                        format!("limit must be an unsigned integer: {}", e),
+                    )
+                })?;
+            }
+            "--snapshot-id" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    GoatError::invalid_argument("scan", "Usage: scan [--start k] [--end k] [--prefix p] [--limit n] [--reverse] [--snapshot-id id]")
+                })?;
+                request.snapshot_id = value.parse::<u64>().map_err(|e| {
+                    GoatError::invalid_argument(
+                        "snapshot_id",
+                        format!("snapshot_id must be an unsigned integer: {}", e),
+                    )
+                })?;
+            }
+            "--reverse" => {
+                request.reverse = true;
+            }
+            other => {
+                return Err(GoatError::invalid_argument(
+                    "scan",
+                    format!("unknown scan option `{}`", other),
+                ));
+            }
+        }
+        idx += 1;
+    }
+
+    Ok(request)
+}
+
+async fn handle_scan(client: &mut GoatKvServiceClient<Channel>, args: &[&str]) -> GoatResult<()> {
+    let request = parse_scan_args(args)?;
+    handle_scan_request(client, request).await
+}
+
+async fn handle_scan_request(
+    client: &mut GoatKvServiceClient<Channel>,
+    request: goatkv::ScanRequest,
+) -> GoatResult<()> {
+    let request = tonic::Request::new(request);
+    let response = client
+        .scan(request)
+        .await
+        .map_err(|e| GoatError::unavailable("grpc_scan", e.to_string()))?;
+    let resp_data = response.into_inner();
+
+    if !resp_data.success {
+        println!("✗ Failed: {}", resp_data.message);
+        return Ok(());
+    }
+
+    println!("✓ Success: {}", resp_data.message);
+    for item in resp_data.entries {
+        let key = String::from_utf8_lossy(&item.key);
+        let value = String::from_utf8_lossy(&item.value);
+        println!("  {} => {}", key, value);
     }
     Ok(())
 }
@@ -528,6 +656,27 @@ async fn execute_command(
             }
             let args = keys.iter().map(String::as_str).collect::<Vec<_>>();
             handle_multiget(&mut client, &args).await
+        }
+        Commands::Scan {
+            start,
+            end,
+            prefix,
+            limit,
+            reverse,
+            snapshot_id,
+        } => {
+            handle_scan_request(
+                &mut client,
+                goatkv::ScanRequest {
+                    start_key: start.map(|v| v.into_bytes()).unwrap_or_default(),
+                    end_key: end.map(|v| v.into_bytes()).unwrap_or_default(),
+                    prefix: prefix.map(|v| v.into_bytes()).unwrap_or_default(),
+                    limit,
+                    reverse,
+                    snapshot_id,
+                },
+            )
+            .await
         }
         Commands::Update { key, value } => {
             let args = vec![key.as_str(), value.as_str()];

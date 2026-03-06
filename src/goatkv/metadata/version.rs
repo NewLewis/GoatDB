@@ -259,6 +259,23 @@ impl Version {
         Ok(None)
     }
 
+    pub(crate) fn scan_all_entries(&self) -> GoatResult<Vec<(InternalKey, Vec<u8>)>> {
+        let mut entries = Vec::new();
+        for level in 0..self.files.len() {
+            for file in &self.files[level] {
+                let sstable_path = file.sstable_path();
+                let reader = self
+                    .open_sstable_reader(file.file_id, sstable_path)
+                    .map_err(|e| Self::map_sstable_open_err(sstable_path, e))?;
+                let file_entries = reader
+                    .scan_all()
+                    .map_err(|e| Self::map_sstable_read_err(sstable_path, e))?;
+                entries.extend(file_entries);
+            }
+        }
+        Ok(entries)
+    }
+
     fn get_cached_row(
         &self,
         key: &[u8],

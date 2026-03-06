@@ -497,7 +497,9 @@
     - 2026-03-05：Phase 2 已落地：`proto` 新增 `CreateSnapshot/ReleaseSnapshot`，`GetRequest` 增加 `snapshot_id`（`0`=最新读）；server/client 已接入快照 API；新增 e2e `tests/e2e/snapshot_test.rs` 覆盖“快照读旧值”和“释放后 NotFound”。
     - 2026-03-05：Phase 3 第一阶段已落地：row cache 键从 `(version_seqno, user_key)` 扩展为 `(version_seqno, read_seq, user_key)`，显式快照读启用 row cache 且按可见性序列隔离；新增 `test_snapshot_row_cache_respects_read_seq_visibility` 与 `row_cache_distinguishes_visibility_sequence`。
     - 2026-03-05：Phase 3 第二阶段已落地：`BlockReader` 增加 `get_by_user_key_with_value_range_at_seq`，`SSTableReader::get_pinned_at_seq` 改为块内按 seq 命中并返回 pinned value（避免全块线扫+value 拷贝）；`Version` 增加 `read_seq >= largest_seqno` 快路径复用普通点查；新增 `test_block_reader_get_by_user_key_at_seq_with_versions`、`test_block_reader_get_by_user_key_at_seq_cross_restart_boundary`、`test_sstable_reader_get_pinned_at_seq_returns_visible_version`、`test_sstable_reader_get_pinned_at_seq_crosses_blocks`。
-    - 2026-03-06：`MultiGet` 已落地，但 `Scan(snapshot_id)` 与 `CompareAndSet` 仍未完成；就“关系型/TPC-C 第一阶段”而言，该 issue 仍保持 open。
+    - 2026-03-06：`MultiGet` 已落地。
+    - 2026-03-06：`Scan(snapshot_id)` 已落地：engine 增加 `ScanOptions + scan/scan_with_snapshot`，proto/server/client 新增 `Scan` RPC，e2e `tests/e2e/scan_test.rs` 覆盖前缀/边界/倒序/limit 与快照视图。
+    - 2026-03-06：`CompareAndSet` 仍未完成；就“关系型/TPC-C 第一阶段”而言，该 issue 仍保持 open。
 
 - [ ] `P1-TRANSACTION-CONCURRENCY-CONTROL-MISSING`
   - 现象：当前引擎没有事务级冲突检测、锁管理、读写集校验或提交时版本验证；`Conflict` 错误类型已存在，但尚无成体系的事务并发控制路径。
