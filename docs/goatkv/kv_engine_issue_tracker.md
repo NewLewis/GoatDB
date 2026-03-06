@@ -217,7 +217,7 @@
     - 2026-03-04：新增单测 `authorize_request_*` 与 `load_tls_config_*`，并通过 `cargo test --bin goatkv_server`。
     - 2026-03-04：当前 mTLS 采用 CA 信任链校验客户端证书，尚未引入证书主体到租户/账号的细粒度映射（如有多租户需求可拆分后续 issue）。
 
-- [ ] `P0-TRANSACTION-ATOMIC-COMMIT-RECOVERY-MISSING`
+- [x] `P0-TRANSACTION-ATOMIC-COMMIT-RECOVERY-MISSING`
   - 现象：引擎当前仅提供点查/批量写/删除/快照读接口，缺少多 key 事务的 begin/commit/rollback 语义，也没有事务提交记录或崩溃恢复规则。
   - 影响：无法为关系型上层提供“多行/多索引原子提交”保证；TPC-C 的 `NewOrder/Payment/Delivery` 等事务在崩溃或并发下可能出现部分提交、索引与主记录不一致。
   - 代码定位：
@@ -234,7 +234,10 @@
     - 事务 WAL 建议显式引入 `txn_id + commit marker`（或 intent + commit record），避免恢复时依赖猜测。
   - 进展记录：
     - 2026-03-06：已落地 v1 原子批量提交闭环：新增 `KvEngine::commit_batch`（支持混合 put/delete）、WAL 原子批次标记、恢复时整批回滚未完成尾批。
-    - 2026-03-06：该项暂不关闭；长事务 `begin/rollback`、事务 ID、并发冲突检测仍未实现。
+    - 2026-03-06：已落地等价事务接口：`KvEngine::with_transaction` + `EngineTransaction::{get,scan,put,delete,compare_and_set,commit,rollback}`，事务内写入在提交前仅保留在本地 overlay，提交时一次性转为原子批量写。
+    - 2026-03-06：新增回归：`test_with_transaction_commit_applies_staged_ops_atomically`、`test_with_transaction_rollback_discards_staged_ops`、`test_with_transaction_scan_sees_pending_overlay`。
+  - 关闭记录：
+    - 2026-03-06：单机 v1 已具备“等价 begin/commit/rollback + 原子恢复”事务接口；该项关闭。
 
 ### P1（核心能力缺口）
 
@@ -503,7 +506,7 @@
   - 关闭记录：
     - 2026-03-06：`Scan + SnapshotGet + CompareAndSet + MultiGet` 已全部接入 engine/proto/server/client/e2e；该项关闭。
 
-- [ ] `P1-TRANSACTION-CONCURRENCY-CONTROL-MISSING`
+- [x] `P1-TRANSACTION-CONCURRENCY-CONTROL-MISSING`
   - 现象：当前引擎没有事务级冲突检测、锁管理、读写集校验或提交时版本验证；`Conflict` 错误类型已存在，但尚无成体系的事务并发控制路径。
   - 影响：即使补上事务提交接口，若没有并发控制，TPC-C 在热点键（如 `D_NEXT_O_ID`、`STOCK`、`CUSTOMER`）上仍无法保证隔离级别与冲突可观测，容易退化为隐式丢更新。
   - 代码定位：
@@ -520,7 +523,33 @@
     - 在 TPC-C 进入压测前，必须先把冲突统计与 abort rate 暴露到 metrics/bench 输出。
   - 进展记录：
     - 2026-03-06：为保证 `compare_and_set` correctness，engine 写入入口新增保守型全局 `commit_lock`，普通 `put/delete/commit_batch/CAS` 已串行化提交。
-    - 2026-03-06：该项暂不关闭；当前只解决了单条 CAS 与写写互斥，尚未提供事务级 read set / write set 校验、abort 语义或热点冲突指标。
+    - 2026-03-06：`with_transaction` 期间全程持有全局 `commit_lock`，事务读写集在提交前只保留在本地 overlay，因此 v1 提供保守型 single-node serializable 语义。
+    - 2026-03-06：新增并发回归 `test_with_transaction_serializes_conflicting_updates`，验证热点计数更新不会出现隐式丢更新；CAS 冲突统一返回 `Conflict/FailedPrecondition`。
+  - 关闭记录：
+    - 2026-03-06：v1 以“全局 commit gate + staged overlay transaction”满足单机 serializable correctness；该项关闭。后续若需提升吞吐，再另开优化项替代当前保守实现。
+
+- [ ] `P1-ROW-INDEX-CODEC-MISSING`
+  - 现象：虽然底层已具备 `Scan`/`CAS`/单机事务，但仍缺少关系型表行编码、主键布局、二级索引 key 编码规范。
+  - 影响：无法把 `WAREHOUSE/DISTRICT/CUSTOMER/ORDER/ORDER_LINE/STOCK` 等表稳定映射到有序 KV keyspace，TPC-C 查询路径还不能真正落地。
+  - 代码定位：
+    - `docs/goatkv/kv_engine_issue_tracker.md:787`
+    - `src/goatkv/core/kv_engine/engine.rs:52`
+  - 验收标准：
+    - 定义表行 value codec、主键 key layout、二级索引 key layout。
+    - 明确前缀设计，保证 `Scan(prefix/start/end/reverse)` 可直接支撑 TPC-C 各表访问路径。
+    - 增加样例编码/解码回归与索引顺序回归。
+  - 实施建议：
+    - v1 先固定 TPC-C 需要的最小 schema codec，不必先抽象完整 SQL catalog。
+
+- [ ] `P1-TPCC-EXECUTION-LAYER-MISSING`
+  - 现象：当前只有通用 KV API，还没有把 TPC-C 数据装载、五类事务过程、索引维护规则映射到引擎事务接口。
+  - 影响：即使底层 KV 原语齐备，也还不能“直接跑起来” TPC-C。
+  - 验收标准：
+    - 提供最小 TPC-C adapter：loader + 五类事务过程 + 主记录/索引项同事务提交。
+    - 形成可执行的 TPC-C smoke 路径（至少单仓/小规模）。
+    - 增加事务过程 correctness 回归。
+  - 实施建议：
+    - 不先做 SQL parser/planner；直接用 Rust 过程把 TPC-C 表和索引映射到 KV 事务接口。
 
 - [ ] `P1-ONDISK-FORMAT-VERSIONING-GAP`
   - 现象：SSTable/MANIFEST 缺少明确的格式版本演进策略与兼容矩阵定义。
@@ -790,16 +819,16 @@
 目标：让 GoatKV 能作为“行记录 + 二级索引”上层的单机事务 KV 底座，先把 TPC-C 跑通，再讨论 SQL 层和分布式扩展。
 
 - 直接阻塞项：
-  - `P0-TRANSACTION-ATOMIC-COMMIT-RECOVERY-MISSING`：没有多 key 原子提交与事务恢复，TPC-C 五个事务都无法正确落地。
-  - `P1-TRANSACTION-CONCURRENCY-CONTROL-MISSING`：没有事务级冲突检测与隔离语义，热点键会出现丢更新或不可观测 abort。
+  - `P1-ROW-INDEX-CODEC-MISSING`：虽然 KV 原语已齐，但没有表行/主键/二级索引编码规范，TPC-C 表结构还无法稳定映射到 keyspace。
+  - `P1-TPCC-EXECUTION-LAYER-MISSING`：还没有 loader 与五类事务过程，当前能力还停留在“底层原语可用”，没有真正形成 TPC-C workload。
 - 第一阶段建议交付顺序：
-  - Phase A：补单机事务提交层（可先做保守串行化提交），同时接入 WAL 提交记录与恢复规则。
-  - Phase B：补事务冲突检测、abort/冲突指标与 TPC-C 热点场景回归。
-  - Phase C：在事务层之上补 TPC-C row/index codec 与过程映射。
+  - Phase A：补 TPC-C row/index codec，固定前缀布局与索引约束。
+  - Phase B：在当前事务原语之上实现 loader 与五类事务过程。
+  - Phase C：补 smoke benchmark / correctness harness，再决定是否为吞吐改造事务并发实现。
 - 不属于 KV 核心、但 TPC-C 上层必须同步规划：
-  - 行编码与主键/二级索引 key codec（前缀有序、支持范围/反向扫描）。
   - 二级索引维护策略（主记录与索引项同事务提交）。
   - 最小执行层：把 TPC-C 五个事务过程映射到 KV API，而不是先做完整 SQL parser/planner。
+  - 若后续要追求吞吐，再把当前全局 `commit_lock` 替换为 OCC / finer-grained locking。
 
 ### 里程碑 0：基线冻结（0.5 周）
 
@@ -1341,17 +1370,16 @@
 
 ## 建议修复顺序
 
-1. `P0-TRANSACTION-ATOMIC-COMMIT-RECOVERY-MISSING`
-2. `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
-3. `P1-TRANSACTION-CONCURRENCY-CONTROL-MISSING`
-4. `P1-ONDISK-FORMAT-VERSIONING-GAP`
-5. `P1-PREFIX-BLOOM-PARTITIONED-FILTER`
-6. `P1-READAHEAD-ITERATOR-OPT`
-7. `P1-MULTIGET-BATCH-READ-PATH`
-8. `P1-PARALLEL-COMPACTION-SUBCOMPACTION`
-9. `P1-PER-LEVEL-COMPRESSION`
-10. `P2-WAL-PREALLOC-BYTES-PER-SYNC`
-11. `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
+1. `P1-ROW-INDEX-CODEC-MISSING`
+2. `P1-TPCC-EXECUTION-LAYER-MISSING`
+3. `P1-ONDISK-FORMAT-VERSIONING-GAP`
+4. `P1-PREFIX-BLOOM-PARTITIONED-FILTER`
+5. `P1-READAHEAD-ITERATOR-OPT`
+6. `P1-MULTIGET-BATCH-READ-PATH`
+7. `P1-PARALLEL-COMPACTION-SUBCOMPACTION`
+8. `P1-PER-LEVEL-COMPRESSION`
+9. `P2-WAL-PREALLOC-BYTES-PER-SYNC`
+10. `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
 
 ## 逐项关闭记录（执行时填写）
 

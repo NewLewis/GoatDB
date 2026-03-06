@@ -1,4 +1,5 @@
 use std::cmp::max;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -60,6 +61,13 @@ pub struct ScanOptions {
     pub reverse: bool,
 }
 
+pub struct EngineTransaction<'a> {
+    engine: &'a KvEngine,
+    pending: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    staged_ops: Vec<BatchWriteOp>,
+    committed: bool,
+}
+
 struct BuildEngineInput {
     wal_writer: WalWriter,
     sequence_number: Arc<SequenceNumber>,
@@ -118,6 +126,108 @@ pub struct KvEngine {
 impl Default for KvEngine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl EngineTransaction<'_> {
+    pub fn get(&self, key: &[u8]) -> GoatResult<Option<Vec<u8>>> {
+        if let Some(value) = self.pending.get(key) {
+            return Ok(value.clone());
+        }
+        self.engine.reader.get(key)
+    }
+
+    pub fn scan(&self, options: ScanOptions) -> GoatResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut base_options = options.clone();
+        base_options.limit = 0;
+        base_options.reverse = false;
+        let mut visible = self
+            .engine
+            .scan(base_options)?
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        for (key, value) in &self.pending {
+            match value {
+                Some(value) => {
+                    visible.insert(key.clone(), value.clone());
+                }
+                None => {
+                    visible.remove(key);
+                }
+            }
+        }
+
+        let mut rows = visible
+            .into_iter()
+            .filter(|(key, _)| KvEngine::scan_key_matches(key, &options))
+            .collect::<Vec<_>>();
+        if options.reverse {
+            rows.reverse();
+        }
+        if options.limit > 0 && rows.len() > options.limit {
+            rows.truncate(options.limit);
+        }
+        Ok(rows)
+    }
+
+    pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> GoatResult<()> {
+        self.ensure_open()?;
+        self.pending.insert(key.clone(), Some(value.clone()));
+        self.staged_ops.push(BatchWriteOp::Put(key, value));
+        Ok(())
+    }
+
+    pub fn delete(&mut self, key: Vec<u8>) -> GoatResult<()> {
+        self.ensure_open()?;
+        self.pending.insert(key.clone(), None);
+        self.staged_ops.push(BatchWriteOp::Delete(key));
+        Ok(())
+    }
+
+    pub fn compare_and_set(
+        &mut self,
+        key: Vec<u8>,
+        expected_value: Option<Vec<u8>>,
+        new_value: Option<Vec<u8>>,
+    ) -> GoatResult<()> {
+        self.ensure_open()?;
+        let current = self.get(&key)?;
+        if current != expected_value {
+            return Err(GoatError::conflict(
+                "transaction_compare_and_set",
+                "expected value does not match current value",
+            ));
+        }
+        match new_value {
+            Some(value) => self.put(key, value),
+            None => self.delete(key),
+        }
+    }
+
+    pub fn rollback(&mut self) -> GoatResult<()> {
+        self.ensure_open()?;
+        self.pending.clear();
+        self.staged_ops.clear();
+        Ok(())
+    }
+
+    pub fn commit(&mut self) -> GoatResult<()> {
+        self.ensure_open()?;
+        self.engine
+            .submit_batch_ops_unlocked(self.staged_ops.clone())?;
+        self.committed = true;
+        Ok(())
+    }
+
+    fn ensure_open(&self) -> GoatResult<()> {
+        if self.committed {
+            return Err(GoatError::conflict(
+                "transaction",
+                "transaction already committed",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -301,6 +411,20 @@ impl KvEngine {
         )
     }
 
+    pub fn with_transaction<T, F>(&self, f: F) -> GoatResult<T>
+    where
+        F: FnOnce(&mut EngineTransaction<'_>) -> GoatResult<T>,
+    {
+        let _commit_guard = self.commit_lock.lock().unwrap();
+        let mut txn = EngineTransaction {
+            engine: self,
+            pending: BTreeMap::new(),
+            staged_ops: Vec::new(),
+            committed: false,
+        };
+        f(&mut txn)
+    }
+
     pub fn runtime_metrics(&self) -> EngineRuntimeMetrics {
         let (immutable_memtable_backlog, flush_failure_streak, flush_circuit_open, l0_file_count) = {
             let lsm_state = self.lsm_state.read().unwrap();
@@ -326,7 +450,7 @@ impl KvEngine {
 
     pub fn put(&self, key: Vec<u8>, value: Vec<u8>) -> GoatResult<()> {
         let _commit_guard = self.commit_lock.lock().unwrap();
-        self.submit_write(vec![WriteOp::Put(key, value)])
+        self.submit_batch_ops_unlocked(vec![BatchWriteOp::Put(key, value)])
     }
 
     pub fn commit_batch(&self, ops: Vec<BatchWriteOp>) -> GoatResult<()> {
@@ -334,14 +458,7 @@ impl KvEngine {
             return Ok(());
         }
         let _commit_guard = self.commit_lock.lock().unwrap();
-        let ops = ops
-            .into_iter()
-            .map(|op| match op {
-                BatchWriteOp::Put(key, value) => WriteOp::Put(key, value),
-                BatchWriteOp::Delete(key) => WriteOp::Delete(key),
-            })
-            .collect();
-        self.submit_write(ops)
+        self.submit_batch_ops_unlocked(ops)
     }
 
     pub fn put_batch(&self, entries: Vec<(Vec<u8>, Vec<u8>)>) -> GoatResult<()> {
@@ -354,7 +471,7 @@ impl KvEngine {
 
     pub fn delete(&self, key: Vec<u8>) -> GoatResult<()> {
         let _commit_guard = self.commit_lock.lock().unwrap();
-        self.submit_write(vec![WriteOp::Delete(key)])
+        self.submit_batch_ops_unlocked(vec![BatchWriteOp::Delete(key)])
     }
 
     pub fn compare_and_set(
@@ -373,8 +490,8 @@ impl KvEngine {
         }
 
         match new_value {
-            Some(value) => self.submit_write(vec![WriteOp::Put(key, value)]),
-            None => self.submit_write(vec![WriteOp::Delete(key)]),
+            Some(value) => self.submit_batch_ops_unlocked(vec![BatchWriteOp::Put(key, value)]),
+            None => self.submit_batch_ops_unlocked(vec![BatchWriteOp::Delete(key)]),
         }
     }
 
@@ -711,6 +828,39 @@ impl KvEngine {
 impl KvEngine {
     fn submit_write(&self, ops: Vec<WriteOp>) -> GoatResult<()> {
         self.writer.submit_write(ops, || self.flush())
+    }
+
+    fn submit_batch_ops_unlocked(&self, ops: Vec<BatchWriteOp>) -> GoatResult<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let ops = ops
+            .into_iter()
+            .map(|op| match op {
+                BatchWriteOp::Put(key, value) => WriteOp::Put(key, value),
+                BatchWriteOp::Delete(key) => WriteOp::Delete(key),
+            })
+            .collect();
+        self.submit_write(ops)
+    }
+
+    fn scan_key_matches(key: &[u8], options: &ScanOptions) -> bool {
+        if let Some(start_key) = options.start_key.as_deref() {
+            if key < start_key {
+                return false;
+            }
+        }
+        if let Some(end_key) = options.end_key.as_deref() {
+            if key >= end_key {
+                return false;
+            }
+        }
+        if let Some(prefix) = options.prefix.as_deref() {
+            if !key.starts_with(prefix) {
+                return false;
+            }
+        }
+        true
     }
 
     fn estimated_pending_compaction_bytes(&self) -> u64 {
@@ -1200,6 +1350,114 @@ mod tests {
             .compare_and_set(b"cas_new".to_vec(), Some(b"v1".to_vec()), None)
             .unwrap();
         assert_eq!(engine.get(b"cas_new").unwrap(), None);
+    }
+
+    #[test]
+    fn test_with_transaction_commit_applies_staged_ops_atomically() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"txn:k1".to_vec(), b"old1".to_vec()).unwrap();
+        engine.put(b"txn:k2".to_vec(), b"old2".to_vec()).unwrap();
+
+        engine
+            .with_transaction(|txn| {
+                assert_eq!(txn.get(b"txn:k1")?, Some(b"old1".to_vec()));
+                txn.put(b"txn:k1".to_vec(), b"new1".to_vec())?;
+                txn.delete(b"txn:k2".to_vec())?;
+                txn.put(b"txn:k3".to_vec(), b"new3".to_vec())?;
+                txn.commit()
+            })
+            .unwrap();
+
+        assert_eq!(engine.get(b"txn:k1").unwrap(), Some(b"new1".to_vec()));
+        assert_eq!(engine.get(b"txn:k2").unwrap(), None);
+        assert_eq!(engine.get(b"txn:k3").unwrap(), Some(b"new3".to_vec()));
+    }
+
+    #[test]
+    fn test_with_transaction_rollback_discards_staged_ops() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"txn:keep".to_vec(), b"v1".to_vec()).unwrap();
+        engine
+            .with_transaction(|txn| {
+                txn.put(b"txn:keep".to_vec(), b"v2".to_vec())?;
+                txn.put(b"txn:new".to_vec(), b"v3".to_vec())?;
+                txn.rollback()
+            })
+            .unwrap();
+
+        assert_eq!(engine.get(b"txn:keep").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(engine.get(b"txn:new").unwrap(), None);
+    }
+
+    #[test]
+    fn test_with_transaction_scan_sees_pending_overlay() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"txn:a".to_vec(), b"va".to_vec()).unwrap();
+        engine.put(b"txn:b".to_vec(), b"vb".to_vec()).unwrap();
+
+        engine
+            .with_transaction(|txn| {
+                txn.delete(b"txn:a".to_vec())?;
+                txn.put(b"txn:c".to_vec(), b"vc".to_vec())?;
+
+                let rows = txn.scan(ScanOptions {
+                    prefix: Some(b"txn:".to_vec()),
+                    ..ScanOptions::default()
+                })?;
+                assert_eq!(
+                    rows,
+                    vec![
+                        (b"txn:b".to_vec(), b"vb".to_vec()),
+                        (b"txn:c".to_vec(), b"vc".to_vec())
+                    ]
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn test_with_transaction_serializes_conflicting_updates() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = Arc::new(KvEngine::new_for_test());
+        engine.put(b"txn:counter".to_vec(), b"0".to_vec()).unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let engine = Arc::clone(&engine);
+            handles.push(thread::spawn(move || {
+                engine
+                    .with_transaction(|txn| {
+                        let current = txn
+                            .get(b"txn:counter")?
+                            .expect("counter must exist before update");
+                        let next = String::from_utf8(current)
+                            .expect("counter utf8")
+                            .parse::<u64>()
+                            .expect("counter number")
+                            + 1;
+                        txn.put(b"txn:counter".to_vec(), next.to_string().into_bytes())?;
+                        txn.commit()
+                    })
+                    .unwrap();
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("txn worker panicked");
+        }
+
+        assert_eq!(engine.get(b"txn:counter").unwrap(), Some(b"2".to_vec()));
     }
 
     #[test]
