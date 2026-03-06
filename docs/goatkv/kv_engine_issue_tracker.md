@@ -28,6 +28,7 @@
 - 2026-03-05：完成 GoatKV vs RocksDB 读路径再对齐走读，新增“读路径差异记录（2026-03-05）”章节，沉淀当前实现与配置差异。
 - 2026-03-05：完成快照能力设计草案（参考 RocksDB `ReadOptions::snapshot` / `SnapshotList` / `CompactionIterator` 规则），新增文档 `docs/goatkv/snapshot_design.md`。
 - 2026-03-06：完成 `SM5-01/SM5-02`，subcompaction 已支持按 key-range 并行执行与线程上限控制（`max_subcompactions`）；补充并行/串行结果一致性回归与高写入基准对照（含 debt 收敛观测）。
+- 2026-03-06：完成 `SM6-03` 长稳压测作业骨架，新增 ignored `e2e_soak`、标准化 JSON 报告、失败样本归档脚本与复盘模板。
 
 ## 读路径差异记录（2026-03-05）
 
@@ -1234,16 +1235,24 @@
     - 2026-03-06：新增可复现 WAL fuzz corpus（`tests/fuzz/wal_corpus/*.hex`）与 ignored 回放用例 `test_wal_fuzz_corpus_replay_is_total`。
     - 2026-03-06：`scripts/verify-ci.sh` / `scripts/verify-ci.ps1` 接入 Loom 与 fuzz corpus 回放步骤，形成自动触发路径。
 
-- [ ] `TASK-SM6-03` 长稳压测（soak）作业与失败归档（status: planned）
+- [x] `TASK-SM6-03` 长稳压测（soak）作业与失败归档（status: done, 2026-03-06）
   - 目标：验证长时间运行下内存/句柄/延迟稳定性。
   - 关键改动文件：
-    - `scripts/`
+    - `tests/e2e/soak_test.rs`
+    - `scripts/run-soak.sh`
+    - `docs/goatkv/soak_failure_postmortem_template.md`
     - `docs/goatkv/kv_engine_issue_tracker.md`
+    - `Cargo.toml`
   - 回归命令：
-    - `cargo test --test e2e_soak -- --ignored`
+    - `GOATKV_SOAK_DURATION_SECS=5 cargo test --test e2e_soak -- --ignored --nocapture`
+    - `GOATKV_SOAK_DURATION_SECS=300 scripts/run-soak.sh`
   - DoD：
     - 输出标准化报告（持续时长、错误、资源曲线）。
     - 明确失败样本归档路径和复盘模板。
+  - 关闭记录：
+    - 2026-03-06：新增 ignored 测试 `test_e2e_soak_read_write_stability`，支持通过环境变量配置时长/并发/阈值，并输出标准化报告（默认 `GOATKV_SOAK_REPORT=/tmp/goatkv_soak_report.json`）。
+    - 2026-03-06：报告覆盖持续时长、请求错误计数、读写延迟分位、RSS/FD 变化，以及 `pending_compaction_bytes`/`write_pressure_level`/RPC 延迟等资源曲线样本。
+    - 2026-03-06：新增 `scripts/run-soak.sh`，失败时归档到 `artifacts/soak_failures/<timestamp>/`，包含 `test.log`、`soak_report.json`、`postmortem_template.md` 与运行参数快照 `run_config.env`。
 
 ### 预计总工期
 

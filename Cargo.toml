@@ -35,6 +35,8 @@ predicates = "3.1"
 ntest = "0.9"
 rand = "0.8"
 loom = "0.7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 # ===========================================================================
 # Integration Tests Configuration
@@ -82,6 +84,11 @@ harness = true
 [[test]]
 name = "e2e_health"
 path = "tests/e2e/health_test.rs"
+harness = true
+
+[[test]]
+name = "e2e_soak"
+path = "tests/e2e/soak_test.rs"
 harness = true
 
 [[test]]
