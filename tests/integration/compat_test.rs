@@ -56,6 +56,13 @@ fn engine_options(base_dir: &Path) -> KvEngineOptions {
         .with_recover_from_wal(true)
 }
 
+fn engine_options_with_manifest_rewrite(
+    base_dir: &Path,
+    rewrite_edit_count: usize,
+) -> KvEngineOptions {
+    engine_options(base_dir).with_manifest_rewrite_edit_count(rewrite_edit_count)
+}
+
 fn seed_dataset(base_dir: &Path) {
     let engine = KvEngine::new_with_options(engine_options(base_dir)).expect("open seed engine");
     engine
@@ -267,5 +274,258 @@ fn compatibility_matrix_covers_forward_and_backward_paths() {
 
     for scenario in scenarios {
         run_scenario(scenario);
+    }
+}
+
+#[test]
+fn reopen_recovers_via_latest_manifest_when_current_is_missing() {
+    let rt = test_runtime();
+    let _guard = rt.enter();
+
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    seed_dataset(temp_dir.path());
+    let (_wal_paths, _sstable_paths, manifest_paths) =
+        KvEngine::init_db_paths(temp_dir.path()).expect("init db paths");
+
+    let latest_manifest =
+        current::find_latest_manifest(manifest_paths.as_ref()).expect("find latest manifest");
+    let latest_manifest = latest_manifest.expect("latest manifest should exist after seed");
+    fs::remove_file(current::current_path(manifest_paths.as_ref())).expect("remove CURRENT");
+
+    let reopen =
+        KvEngine::new_with_options(engine_options(temp_dir.path())).expect("reopen engine");
+    assert_eq!(reopen.get(b"apple").unwrap(), Some(b"red".to_vec()));
+    assert_eq!(reopen.get(b"banana").unwrap(), Some(b"yellow".to_vec()));
+    assert_eq!(
+        current::read_current(manifest_paths.as_ref()).expect("read rewritten CURRENT"),
+        Some(latest_manifest),
+        "reopen should recreate CURRENT to point at latest manifest"
+    );
+}
+
+#[test]
+fn fresh_open_bootstraps_initial_manifest_when_current_and_manifests_are_missing() {
+    let rt = test_runtime();
+    let _guard = rt.enter();
+
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let (_wal_paths, _sstable_paths, manifest_paths) =
+        KvEngine::init_db_paths(temp_dir.path()).expect("init db paths");
+
+    assert_eq!(
+        current::find_latest_manifest(manifest_paths.as_ref()).expect("find latest manifest"),
+        None,
+        "fresh directory should not have any MANIFEST files before open"
+    );
+    assert_eq!(
+        current::read_current(manifest_paths.as_ref()).expect("read CURRENT before open"),
+        None,
+        "fresh directory should not have CURRENT before open"
+    );
+
+    let engine = KvEngine::new_with_options(engine_options(temp_dir.path()))
+        .expect("open engine on empty directory");
+    assert_eq!(engine.get(b"missing").unwrap(), None);
+
+    let current_name = current::read_current(manifest_paths.as_ref())
+        .expect("read CURRENT after bootstrap")
+        .expect("CURRENT should be created during bootstrap");
+    let latest_manifest =
+        current::find_latest_manifest(manifest_paths.as_ref()).expect("find latest manifest");
+    assert_eq!(
+        Some(current_name.clone()),
+        latest_manifest,
+        "bootstrap should create CURRENT pointing at the initial MANIFEST"
+    );
+    assert!(
+        manifest_paths.data_dir().join(current_name).is_file(),
+        "bootstrap should materialize the MANIFEST file on disk"
+    );
+}
+
+#[test]
+fn reopen_recovers_via_latest_manifest_when_current_points_to_missing_manifest() {
+    let rt = test_runtime();
+    let _guard = rt.enter();
+
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    seed_dataset(temp_dir.path());
+    let (_wal_paths, _sstable_paths, manifest_paths) =
+        KvEngine::init_db_paths(temp_dir.path()).expect("init db paths");
+
+    let latest_manifest =
+        current::find_latest_manifest(manifest_paths.as_ref()).expect("find latest manifest");
+    let latest_manifest = latest_manifest.expect("latest manifest should exist after seed");
+    current::write_current(manifest_paths.as_ref(), "MANIFEST-999999")
+        .expect("poison CURRENT with missing manifest");
+
+    let reopen =
+        KvEngine::new_with_options(engine_options(temp_dir.path())).expect("reopen engine");
+    assert_eq!(reopen.get(b"apple").unwrap(), Some(b"red".to_vec()));
+    assert_eq!(reopen.get(b"banana").unwrap(), Some(b"yellow".to_vec()));
+    assert_eq!(
+        current::read_current(manifest_paths.as_ref()).expect("read repaired CURRENT"),
+        Some(latest_manifest),
+        "reopen should heal CURRENT back to the latest valid manifest"
+    );
+}
+
+#[test]
+fn fresh_open_bootstraps_initial_manifest_when_current_is_invalid_and_no_manifest_exists() {
+    let rt = test_runtime();
+    let _guard = rt.enter();
+
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let (_wal_paths, _sstable_paths, manifest_paths) =
+        KvEngine::init_db_paths(temp_dir.path()).expect("init db paths");
+    fs::write(
+        current::current_path(manifest_paths.as_ref()),
+        "invalid-current-name\n",
+    )
+    .expect("write invalid CURRENT in empty directory");
+
+    let engine = KvEngine::new_with_options(engine_options(temp_dir.path()))
+        .expect("open engine with invalid CURRENT and no MANIFEST");
+    assert_eq!(engine.get(b"missing").unwrap(), None);
+
+    let current_name = current::read_current(manifest_paths.as_ref())
+        .expect("read CURRENT after repair")
+        .expect("CURRENT should be repaired during bootstrap");
+    let latest_manifest =
+        current::find_latest_manifest(manifest_paths.as_ref()).expect("find latest manifest");
+    assert_eq!(
+        Some(current_name.clone()),
+        latest_manifest,
+        "bootstrap should repair invalid CURRENT to the new MANIFEST"
+    );
+    assert!(
+        manifest_paths.data_dir().join(current_name).is_file(),
+        "bootstrap should create a MANIFEST file even when CURRENT starts invalid"
+    );
+}
+
+#[test]
+fn reopen_recovers_via_latest_manifest_when_current_contents_are_invalid() {
+    let rt = test_runtime();
+    let _guard = rt.enter();
+
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    seed_dataset(temp_dir.path());
+    let (_wal_paths, _sstable_paths, manifest_paths) =
+        KvEngine::init_db_paths(temp_dir.path()).expect("init db paths");
+
+    let latest_manifest =
+        current::find_latest_manifest(manifest_paths.as_ref()).expect("find latest manifest");
+    let latest_manifest = latest_manifest.expect("latest manifest should exist after seed");
+    fs::write(
+        current::current_path(manifest_paths.as_ref()),
+        "not-a-manifest-name\n",
+    )
+    .expect("write invalid CURRENT contents");
+
+    let reopen =
+        KvEngine::new_with_options(engine_options(temp_dir.path())).expect("reopen engine");
+    assert_eq!(reopen.get(b"apple").unwrap(), Some(b"red".to_vec()));
+    assert_eq!(reopen.get(b"banana").unwrap(), Some(b"yellow".to_vec()));
+    assert_eq!(
+        current::read_current(manifest_paths.as_ref()).expect("read repaired CURRENT"),
+        Some(latest_manifest),
+        "reopen should heal invalid CURRENT contents back to the latest valid manifest"
+    );
+}
+
+#[test]
+fn manifest_rewrite_rotates_current_and_preserves_dataset_on_reopen() {
+    let rt = test_runtime();
+    let _guard = rt.enter();
+
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let options = engine_options_with_manifest_rewrite(temp_dir.path(), 1);
+    let engine = KvEngine::new_with_options(options.clone()).expect("open engine");
+    let (_wal_paths, _sstable_paths, manifest_paths) =
+        KvEngine::init_db_paths(temp_dir.path()).expect("init db paths");
+
+    let initial_current = current::read_current(manifest_paths.as_ref())
+        .expect("read initial CURRENT")
+        .expect("initial CURRENT should exist");
+    assert_eq!(initial_current, "MANIFEST-0");
+
+    engine.put(b"apple".to_vec(), b"red".to_vec()).unwrap();
+    engine.flush();
+    engine.shutdown().expect("shutdown rewritten engine");
+
+    let rewritten_current = current::read_current(manifest_paths.as_ref())
+        .expect("read rewritten CURRENT")
+        .expect("rewritten CURRENT should exist");
+    assert_ne!(
+        rewritten_current, initial_current,
+        "manifest rewrite should rotate CURRENT to a newer MANIFEST"
+    );
+    let latest_manifest =
+        current::find_latest_manifest(manifest_paths.as_ref()).expect("find latest manifest");
+    assert_eq!(
+        Some(rewritten_current.clone()),
+        latest_manifest,
+        "CURRENT should track the latest rewritten MANIFEST"
+    );
+
+    let reopen = KvEngine::new_with_options(options).expect("reopen rewritten engine");
+    assert_eq!(reopen.get(b"apple").unwrap(), Some(b"red".to_vec()));
+}
+
+#[test]
+fn manifest_rewrite_multiple_rotations_keep_current_on_latest_manifest() {
+    let rt = test_runtime();
+    let _guard = rt.enter();
+
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let options = engine_options_with_manifest_rewrite(temp_dir.path(), 1);
+    let (_wal_paths, _sstable_paths, manifest_paths) =
+        KvEngine::init_db_paths(temp_dir.path()).expect("init db paths");
+
+    let mut seen_currents = Vec::new();
+    for round in 0..3 {
+        let engine = KvEngine::new_with_options(options.clone()).expect("open engine");
+        let key = format!("k{round}");
+        let value = format!("v{round}");
+        engine
+            .put(key.as_bytes().to_vec(), value.as_bytes().to_vec())
+            .unwrap();
+        engine.flush();
+        engine.shutdown().expect("shutdown rewritten engine");
+
+        let current_name = current::read_current(manifest_paths.as_ref())
+            .expect("read CURRENT after shutdown")
+            .expect("CURRENT should exist after rewrite");
+        seen_currents.push(current_name);
+    }
+
+    seen_currents.sort();
+    seen_currents.dedup();
+    assert!(
+        seen_currents.len() >= 2,
+        "multiple rewrite rounds should rotate through newer MANIFEST files"
+    );
+
+    let current_name = current::read_current(manifest_paths.as_ref())
+        .expect("read final CURRENT")
+        .expect("final CURRENT should exist");
+    let latest_manifest =
+        current::find_latest_manifest(manifest_paths.as_ref()).expect("find latest manifest");
+    assert_eq!(
+        Some(current_name),
+        latest_manifest,
+        "CURRENT should keep tracking the latest MANIFEST after repeated rewrites"
+    );
+
+    let reopen = KvEngine::new_with_options(options).expect("reopen rewritten engine");
+    for round in 0..3 {
+        let key = format!("k{round}");
+        let value = format!("v{round}");
+        assert_eq!(
+            reopen.get(key.as_bytes()).unwrap(),
+            Some(value.into_bytes()),
+            "reopen should preserve data after repeated manifest rewrites"
+        );
     }
 }
