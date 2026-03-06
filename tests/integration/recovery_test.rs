@@ -3,12 +3,14 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use goat_db::goatkv::core::kv_engine::KvEngine;
 use goat_db::goatkv::error::ErrorKind;
 use goat_db::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
 use goat_db::goatkv::metadata::current;
 use goat_db::goatkv::metadata::manifest::{ManifestWriter, INIT_MANIFEST_FILE_NAME};
 use goat_db::goatkv::metadata::version_edit::VersionEdit;
+use goat_db::goatkv::storage::wal::WalCodec;
 use goat_db::goatkv::storage::wal::WalPaths;
 use goat_db::goatkv::storage::wal::WalWriter;
 use goat_db::goatkv::storage::wal::WalWriterConfig;
@@ -97,6 +99,59 @@ fn recovery_handles_truncated_wal_tail() {
     )
     .expect("truncated WAL should be openable");
 
+    drop(engine);
+}
+
+#[test]
+fn recovery_discards_incomplete_atomic_batch_instead_of_partial_replay() {
+    let rt = test_runtime();
+    let _guard = rt.enter();
+    let tmp = temp_dir();
+
+    let (wal_paths, _sstable_paths, _manifest_paths) = KvEngine::init_db_paths(tmp.path()).unwrap();
+    let wal_file = wal_path(1, &wal_paths);
+
+    let records = vec![
+        (
+            InternalKey::new(b"order:1".to_vec(), 100, InternalKeyKind::Put),
+            Bytes::from_static(b"new-order"),
+        ),
+        (
+            InternalKey::new(b"stock:1".to_vec(), 101, InternalKeyKind::Put),
+            Bytes::from_static(b"updated-stock"),
+        ),
+    ];
+    let mut encoded = Vec::new();
+    WalCodec::encode_atomic_batch_into(&mut encoded, &records).expect("encode atomic batch");
+    let marker = InternalKey::new(Vec::new(), 100, InternalKeyKind::TxnBatchBegin);
+    let marker_value = WalCodec::encode_batch_begin_value(records.len()).expect("marker");
+    let marker_len = WalCodec::record_size(&marker, &marker_value);
+    let first_record_len = WalCodec::record_size(&records[0].0, records[0].1.as_ref());
+    let truncated_len = marker_len + first_record_len + 3;
+    fs::write(&wal_file, &encoded[..truncated_len]).expect("write truncated wal");
+
+    let options = KvEngineOptions::default()
+        .with_data_dir(tmp.path())
+        .with_mem_table_size(64 * 1024)
+        .with_wal_sync(false)
+        .with_recover_from_wal(true);
+
+    let engine = KvEngine::new_with_options(options).unwrap();
+    assert_eq!(
+        engine.get(b"order:1").unwrap(),
+        None,
+        "truncated batch must not partially recover the first key"
+    );
+    assert_eq!(
+        engine.get(b"stock:1").unwrap(),
+        None,
+        "truncated batch must not partially recover the second key"
+    );
+    assert_eq!(
+        fs::metadata(&wal_file).unwrap().len(),
+        0,
+        "recovery should roll back the incomplete batch from WAL"
+    );
     drop(engine);
 }
 

@@ -3,7 +3,7 @@ use std::io;
 use std::path::PathBuf;
 
 use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
-use crate::goatkv::format::internal_key::InternalKey;
+use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
 
 use super::error::WalError;
 use super::format::{read_record, PartialStage, RecordRead};
@@ -29,22 +29,29 @@ impl Iterator for WalReader {
     type Item = GoatResult<(InternalKey, Vec<u8>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match read_record(&mut self.reader) {
-            Ok(RecordRead::Eof) => None,
-            Ok(RecordRead::Partial(PartialStage::Checksum)) => None,
-            Ok(RecordRead::Partial(PartialStage::Body)) => {
-                Some(Err(GoatError::from(WalError::UnexpectedEof)))
-            }
-            Ok(RecordRead::InvalidKeyLen) => Some(Err(GoatError::from(WalError::InvalidKeyLen))),
-            Ok(RecordRead::Record(record)) => {
-                if !record.checksum_matches() {
-                    return Some(Err(GoatError::from(WalError::ChecksumMismatch {
-                        key: record.key.user_key().to_vec(),
-                    })));
+        loop {
+            match read_record(&mut self.reader) {
+                Ok(RecordRead::Eof) => return None,
+                Ok(RecordRead::Partial(PartialStage::Checksum)) => return None,
+                Ok(RecordRead::Partial(PartialStage::Body)) => {
+                    return Some(Err(GoatError::from(WalError::UnexpectedEof)));
                 }
-                Some(Ok(record.into_parts()))
+                Ok(RecordRead::InvalidKeyLen) => {
+                    return Some(Err(GoatError::from(WalError::InvalidKeyLen)));
+                }
+                Ok(RecordRead::Record(record)) => {
+                    if !record.checksum_matches() {
+                        return Some(Err(GoatError::from(WalError::ChecksumMismatch {
+                            key: record.key.user_key().to_vec(),
+                        })));
+                    }
+                    if matches!(record.key.kind(), Ok(InternalKeyKind::TxnBatchBegin)) {
+                        continue;
+                    }
+                    return Some(Ok(record.into_parts()));
+                }
+                Err(e) => return Some(Err(e)),
             }
-            Err(e) => Some(Err(e)),
         }
     }
 }

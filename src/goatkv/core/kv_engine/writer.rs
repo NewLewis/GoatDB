@@ -638,7 +638,7 @@ impl KvWriter {
 
         // 阶段 B：为整个 group 分配连续序列号，并将
         // WriteOp 转为 WAL/Mem 阶段共用的 (InternalKey, value)。
-        let mut wal_records = Vec::with_capacity(total_ops as usize);
+        let mut wal_batches = Vec::with_capacity(group.len());
         let mut seq = self
             .sequence_number
             .try_allocate_range(total_ops, SEQUENCE_NUMBER_MAX)
@@ -660,12 +660,13 @@ impl KvWriter {
                     ),
                 };
                 req_max_seq = Some(seq);
-                wal_records.push(record.clone());
                 req_records.push(record);
                 seq = seq.checked_add(1).ok_or_else(|| {
                     GoatError::unavailable("sequence_number", "sequence overflow")
                 })?;
             }
+
+            wal_batches.push(req_records.clone());
 
             // 保存每个请求的 Mem 阶段载荷。
             req.set_mem_payload(MemApplyPayload {
@@ -676,7 +677,7 @@ impl KvWriter {
 
         // 与 flush 轮转协调：flush 持写锁，普通写持读锁。
         let _gate = self.write_gate.read().unwrap();
-        self.wal_writer.append_batch(&wal_records)?;
+        self.wal_writer.append_grouped_batches(&wal_batches)?;
         Ok(())
     }
 

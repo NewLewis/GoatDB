@@ -78,8 +78,25 @@ impl WalWriter {
         }
 
         let mut encoded = Vec::new();
-        for (key, value) in records {
-            WalCodec::encode_record_into(&mut encoded, key, value.as_ref());
+        WalCodec::encode_atomic_batch_into(&mut encoded, records)?;
+        self.append_raw(&encoded)
+    }
+
+    /// 批量追加多个原子请求批次到 WAL，并保留每个请求自己的提交边界。
+    pub fn append_grouped_batches(&self, batches: &[Vec<(InternalKey, Bytes)>]) -> GoatResult<()> {
+        if batches.is_empty() {
+            return Ok(());
+        }
+
+        let mut encoded = Vec::new();
+        for batch in batches {
+            if batch.is_empty() {
+                continue;
+            }
+            WalCodec::encode_atomic_batch_into(&mut encoded, batch)?;
+        }
+        if encoded.is_empty() {
+            return Ok(());
         }
         self.append_raw(&encoded)
     }

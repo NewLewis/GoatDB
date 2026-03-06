@@ -15,7 +15,7 @@ use bytes::Bytes;
 ///   - kind = (encoded & 0xFF) as u8
 ///
 /// Sequence number range: 0 to 2^56 - 1 (≈7.2e16)
-/// Kind values: 0 = Put, 1 = Delete
+/// Kind values: 0 = Put, 1 = Delete, 2 = TxnBatchBegin
 const SEQUENCE_NUMBER_BITS: u32 = 56;
 const KIND_BITS: u32 = 8;
 pub const SEQUENCE_NUMBER_MAX: u64 = (1 << SEQUENCE_NUMBER_BITS) - 1;
@@ -25,6 +25,7 @@ const KIND_MASK: u64 = 0xFF;
 pub enum InternalKeyKind {
     Put,
     Delete,
+    TxnBatchBegin,
 }
 
 impl TryFrom<u8> for InternalKeyKind {
@@ -34,6 +35,7 @@ impl TryFrom<u8> for InternalKeyKind {
         match value {
             0 => Ok(InternalKeyKind::Put),
             1 => Ok(InternalKeyKind::Delete),
+            2 => Ok(InternalKeyKind::TxnBatchBegin),
             _ => Err(GoatError::corruption(
                 "internal_key_kind",
                 format!("invalid internal key kind {}", value),
@@ -47,6 +49,7 @@ impl From<InternalKeyKind> for u8 {
         match kind {
             InternalKeyKind::Put => 0,
             InternalKeyKind::Delete => 1,
+            InternalKeyKind::TxnBatchBegin => 2,
         }
     }
 }
@@ -56,6 +59,7 @@ impl std::fmt::Display for InternalKeyKind {
         match self {
             InternalKeyKind::Put => write!(f, "Put"),
             InternalKeyKind::Delete => write!(f, "Delete"),
+            InternalKeyKind::TxnBatchBegin => write!(f, "TxnBatchBegin"),
         }
     }
 }
@@ -265,23 +269,28 @@ mod tests {
     fn test_kind_conversions() {
         assert_eq!(u8::from(InternalKeyKind::Put), 0);
         assert_eq!(u8::from(InternalKeyKind::Delete), 1);
+        assert_eq!(u8::from(InternalKeyKind::TxnBatchBegin), 2);
 
         assert_eq!(InternalKeyKind::try_from(0).unwrap(), InternalKeyKind::Put);
         assert_eq!(
             InternalKeyKind::try_from(1).unwrap(),
             InternalKeyKind::Delete
         );
+        assert_eq!(
+            InternalKeyKind::try_from(2).unwrap(),
+            InternalKeyKind::TxnBatchBegin
+        );
     }
 
     #[test]
     fn test_invalid_kind_conversion() {
-        let invalid = InternalKeyKind::try_from(2);
+        let invalid = InternalKeyKind::try_from(3);
         assert!(invalid.is_err());
     }
 
     #[test]
     fn test_internal_key_kind_reports_corruption_for_invalid_tag() {
-        let key = InternalKey::from_encoded(b"key".to_vec(), (1 << 8) | 2);
+        let key = InternalKey::from_encoded(b"key".to_vec(), (1 << 8) | 3);
         let err = key.kind().expect_err("invalid kind should return error");
         assert!(matches!(
             err.kind(),

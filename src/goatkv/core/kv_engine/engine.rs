@@ -45,6 +45,12 @@ pub struct EngineRuntimeMetrics {
     pub read_cache_metrics: Option<ReadCacheMetrics>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchWriteOp {
+    Put(Vec<u8>, Vec<u8>),
+    Delete(Vec<u8>),
+}
+
 struct BuildEngineInput {
     wal_writer: WalWriter,
     sequence_number: Arc<SequenceNumber>,
@@ -278,15 +284,26 @@ impl KvEngine {
         self.submit_write(vec![WriteOp::Put(key, value)])
     }
 
-    pub fn put_batch(&self, entries: Vec<(Vec<u8>, Vec<u8>)>) -> GoatResult<()> {
-        if entries.is_empty() {
+    pub fn commit_batch(&self, ops: Vec<BatchWriteOp>) -> GoatResult<()> {
+        if ops.is_empty() {
             return Ok(());
         }
-        let ops = entries
+        let ops = ops
             .into_iter()
-            .map(|(key, value)| WriteOp::Put(key, value))
+            .map(|op| match op {
+                BatchWriteOp::Put(key, value) => WriteOp::Put(key, value),
+                BatchWriteOp::Delete(key) => WriteOp::Delete(key),
+            })
             .collect();
         self.submit_write(ops)
+    }
+
+    pub fn put_batch(&self, entries: Vec<(Vec<u8>, Vec<u8>)>) -> GoatResult<()> {
+        let ops = entries
+            .into_iter()
+            .map(|(key, value)| BatchWriteOp::Put(key, value))
+            .collect();
+        self.commit_batch(ops)
     }
 
     pub fn delete(&self, key: Vec<u8>) -> GoatResult<()> {
@@ -874,7 +891,7 @@ impl KvEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::KvEngine;
+    use super::{BatchWriteOp, KvEngine};
     use crate::goatkv::error::ErrorKind;
     use crate::goatkv::storage::sstable::{SSTableReader, SstableBlockCompression};
     use crate::goatkv::utils::options::KvEngineOptions;
@@ -928,6 +945,28 @@ mod tests {
         assert_eq!(engine.get(b"key2").unwrap(), Some(b"value2".to_vec()));
 
         assert_eq!(engine.get(b"nonexistent").unwrap(), None);
+    }
+
+    #[test]
+    fn test_commit_batch_mixes_put_and_delete_atomically() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"k1".to_vec(), b"old1".to_vec()).unwrap();
+        engine.put(b"k2".to_vec(), b"old2".to_vec()).unwrap();
+
+        engine
+            .commit_batch(vec![
+                BatchWriteOp::Put(b"k1".to_vec(), b"new1".to_vec()),
+                BatchWriteOp::Delete(b"k2".to_vec()),
+                BatchWriteOp::Put(b"k3".to_vec(), b"new3".to_vec()),
+            ])
+            .unwrap();
+
+        assert_eq!(engine.get(b"k1").unwrap(), Some(b"new1".to_vec()));
+        assert_eq!(engine.get(b"k2").unwrap(), None);
+        assert_eq!(engine.get(b"k3").unwrap(), Some(b"new3".to_vec()));
     }
 
     #[test]

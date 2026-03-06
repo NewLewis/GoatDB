@@ -18,9 +18,10 @@ pub use writer::{WalWriter, WalWriterConfig};
 #[cfg(test)]
 mod tests {
     use super::format::checksum_for;
-    use super::{replay_wal_file, WalReader, WalWriter, WalWriterConfig};
+    use super::{replay_wal_file, WalCodec, WalReader, WalWriter, WalWriterConfig};
     use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
     use crate::goatkv::ErrorKind;
+    use bytes::Bytes;
     use std::fs;
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
@@ -152,6 +153,36 @@ mod tests {
     }
 
     #[test]
+    fn test_wal_reader_skips_atomic_batch_markers() {
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let path = temp_file.path().to_path_buf();
+
+        {
+            let wal = WalWriter::new(path.clone(), WalWriterConfig::default()).expect("open wal");
+            let records = vec![
+                (
+                    InternalKey::new(b"key1".to_vec(), 10, InternalKeyKind::Put),
+                    Bytes::from_static(b"value1"),
+                ),
+                (
+                    InternalKey::new(b"key2".to_vec(), 11, InternalKeyKind::Delete),
+                    Bytes::new(),
+                ),
+            ];
+            wal.append_batch(&records).expect("append atomic batch");
+        }
+
+        let mut reader = WalReader::new(&path).expect("open wal reader");
+        let entry1 = reader.next().expect("entry1").expect("entry1 ok");
+        let entry2 = reader.next().expect("entry2").expect("entry2 ok");
+        assert_eq!(entry1.0.user_key(), b"key1");
+        assert_eq!(entry1.1, b"value1");
+        assert_eq!(entry2.0.user_key(), b"key2");
+        assert!(entry2.1.is_empty());
+        assert!(reader.next().is_none());
+    }
+
+    #[test]
     fn test_wal_checksum_validation() {
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
         let path = temp_file.path().to_path_buf();
@@ -198,7 +229,7 @@ mod tests {
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
         let path = temp_file.path().to_path_buf();
 
-        let key = InternalKey::from_encoded(b"bad_kind".to_vec(), (7 << 8) | 2);
+        let key = InternalKey::from_encoded(b"bad_kind".to_vec(), (7 << 8) | 3);
         let value = b"value".to_vec();
         let key_len = key.serialized_size() as u32;
         let value_len = value.len() as u32;
@@ -227,7 +258,7 @@ mod tests {
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
         let path = temp_file.path().to_path_buf();
 
-        let key = InternalKey::from_encoded(b"bad_kind".to_vec(), (11 << 8) | 2);
+        let key = InternalKey::from_encoded(b"bad_kind".to_vec(), (11 << 8) | 3);
         let value = b"v".to_vec();
         let key_len = key.serialized_size() as u32;
         let value_len = value.len() as u32;
@@ -282,6 +313,54 @@ mod tests {
         assert_eq!(
             fs::metadata(&path).expect("metadata after replay").len(),
             good_len
+        );
+    }
+
+    #[test]
+    fn test_wal_replay_discards_incomplete_atomic_batch() {
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let path = temp_file.path().to_path_buf();
+
+        let records = vec![
+            (
+                InternalKey::new(b"k1".to_vec(), 21, InternalKeyKind::Put),
+                Bytes::from_static(b"v1"),
+            ),
+            (
+                InternalKey::new(b"k2".to_vec(), 22, InternalKeyKind::Put),
+                Bytes::from_static(b"v2"),
+            ),
+        ];
+
+        let mut encoded = Vec::new();
+        WalCodec::encode_atomic_batch_into(&mut encoded, &records).expect("encode batch");
+
+        let marker = InternalKey::new(Vec::new(), 21, InternalKeyKind::TxnBatchBegin);
+        let marker_value = WalCodec::encode_batch_begin_value(records.len()).expect("marker");
+        let marker_len = WalCodec::record_size(&marker, &marker_value);
+        let first_record_len = WalCodec::record_size(&records[0].0, records[0].1.as_ref());
+        let second_record_prefix_len =
+            WalCodec::record_size(&records[1].0, records[1].1.as_ref()) / 2;
+        let truncated_len = marker_len + first_record_len + second_record_prefix_len;
+        fs::write(&path, &encoded[..truncated_len]).expect("write truncated batch");
+
+        let mut replayed = Vec::new();
+        let stats =
+            replay_wal_file(&path, |key, value| replayed.push((key, value))).expect("replay");
+        assert!(
+            replayed.is_empty(),
+            "incomplete batch must not partially replay"
+        );
+        assert_eq!(stats.entries, 0);
+        assert_eq!(stats.max_sequence, 0);
+        assert!(
+            stats.truncated,
+            "incomplete batch should trigger truncation"
+        );
+        assert_eq!(
+            fs::metadata(&path).expect("metadata after replay").len(),
+            0,
+            "recovery should roll back the whole incomplete batch"
         );
     }
 

@@ -31,6 +31,7 @@
 - 2026-03-06：完成 `SM6-03` 长稳压测作业骨架，新增 ignored `e2e_soak`、标准化 JSON 报告、失败样本归档脚本与复盘模板。
 - 2026-03-06：完成 `SM0-02` 基线 benchmark 模板与阈值登记，`goatkv_bench` 输出已标准化（吞吐/p95/p99/样本规模/执行时间戳）并支持 10% 默认回退门禁。
 - 2026-03-06：完成 `SM1-04` MultiGet API 链路打通（proto/server/client/e2e），并接入 `multiget` RPC 指标维度。
+- 2026-03-06：完成“面向关系型/TPC-C 第一阶段”差距评审，新增 2 个待修复项：`P0-TRANSACTION-ATOMIC-COMMIT-RECOVERY-MISSING`、`P1-TRANSACTION-CONCURRENCY-CONTROL-MISSING`，并补充关系型/TPC-C 补充计划。
 
 ## 读路径差异记录（2026-03-05）
 
@@ -215,6 +216,25 @@
     - 2026-03-04：`Cargo.toml` 启用 `tonic` `tls-ring` feature；README 增加 TLS/mTLS 与 token 鉴权启动示例。
     - 2026-03-04：新增单测 `authorize_request_*` 与 `load_tls_config_*`，并通过 `cargo test --bin goatkv_server`。
     - 2026-03-04：当前 mTLS 采用 CA 信任链校验客户端证书，尚未引入证书主体到租户/账号的细粒度映射（如有多租户需求可拆分后续 issue）。
+
+- [ ] `P0-TRANSACTION-ATOMIC-COMMIT-RECOVERY-MISSING`
+  - 现象：引擎当前仅提供点查/批量写/删除/快照读接口，缺少多 key 事务的 begin/commit/rollback 语义，也没有事务提交记录或崩溃恢复规则。
+  - 影响：无法为关系型上层提供“多行/多索引原子提交”保证；TPC-C 的 `NewOrder/Payment/Delivery` 等事务在崩溃或并发下可能出现部分提交、索引与主记录不一致。
+  - 代码定位：
+    - `src/goatkv/core/kv_engine/engine.rs:213`
+    - `src/goatkv/core/kv_engine/engine.rs:277`
+    - `src/goatkv/core/kv_engine/engine.rs:281`
+    - `proto/goatkv.proto:4`
+  - 验收标准：
+    - 提供单机事务原语（至少 `begin/commit/rollback` 或等价的事务提交接口），支持多 key 原子可见性。
+    - WAL/恢复链路能区分“已提交/未提交”事务，崩溃恢复后不出现半提交结果。
+    - 增加回归：事务内多 key 写入 all-or-nothing、提交前 crash/replay、一主多索引一致性校验。
+  - 实施建议：
+    - v1 可接受保守实现：单机串行化提交（全局 commit gate）优先换正确性，再逐步放宽并发。
+    - 事务 WAL 建议显式引入 `txn_id + commit marker`（或 intent + commit record），避免恢复时依赖猜测。
+  - 进展记录：
+    - 2026-03-06：已落地 v1 原子批量提交闭环：新增 `KvEngine::commit_batch`（支持混合 put/delete）、WAL 原子批次标记、恢复时整批回滚未完成尾批。
+    - 2026-03-06：该项暂不关闭；长事务 `begin/rollback`、事务 ID、并发冲突检测仍未实现。
 
 ### P1（核心能力缺口）
 
@@ -458,7 +478,7 @@
 
 - [ ] `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
   - 现象：对外 API 仅覆盖点查点写；缺少范围扫描、快照读、条件写（CAS）等关键能力。
-  - 影响：上层业务需要自行拼装，易引入一致性窗口和性能问题，接口可用性不足。
+  - 影响：上层业务需要自行拼装，易引入一致性窗口和性能问题，接口可用性不足；对关系型上层而言，缺少有序扫描和条件写会直接阻塞二级索引访问、热点计数器更新和 TPC-C 事务过程实现。
   - 代码定位：
     - `proto/goatkv.proto:5`
     - `proto/goatkv.proto:9`
@@ -477,6 +497,23 @@
     - 2026-03-05：Phase 2 已落地：`proto` 新增 `CreateSnapshot/ReleaseSnapshot`，`GetRequest` 增加 `snapshot_id`（`0`=最新读）；server/client 已接入快照 API；新增 e2e `tests/e2e/snapshot_test.rs` 覆盖“快照读旧值”和“释放后 NotFound”。
     - 2026-03-05：Phase 3 第一阶段已落地：row cache 键从 `(version_seqno, user_key)` 扩展为 `(version_seqno, read_seq, user_key)`，显式快照读启用 row cache 且按可见性序列隔离；新增 `test_snapshot_row_cache_respects_read_seq_visibility` 与 `row_cache_distinguishes_visibility_sequence`。
     - 2026-03-05：Phase 3 第二阶段已落地：`BlockReader` 增加 `get_by_user_key_with_value_range_at_seq`，`SSTableReader::get_pinned_at_seq` 改为块内按 seq 命中并返回 pinned value（避免全块线扫+value 拷贝）；`Version` 增加 `read_seq >= largest_seqno` 快路径复用普通点查；新增 `test_block_reader_get_by_user_key_at_seq_with_versions`、`test_block_reader_get_by_user_key_at_seq_cross_restart_boundary`、`test_sstable_reader_get_pinned_at_seq_returns_visible_version`、`test_sstable_reader_get_pinned_at_seq_crosses_blocks`。
+    - 2026-03-06：`MultiGet` 已落地，但 `Scan(snapshot_id)` 与 `CompareAndSet` 仍未完成；就“关系型/TPC-C 第一阶段”而言，该 issue 仍保持 open。
+
+- [ ] `P1-TRANSACTION-CONCURRENCY-CONTROL-MISSING`
+  - 现象：当前引擎没有事务级冲突检测、锁管理、读写集校验或提交时版本验证；`Conflict` 错误类型已存在，但尚无成体系的事务并发控制路径。
+  - 影响：即使补上事务提交接口，若没有并发控制，TPC-C 在热点键（如 `D_NEXT_O_ID`、`STOCK`、`CUSTOMER`）上仍无法保证隔离级别与冲突可观测，容易退化为隐式丢更新。
+  - 代码定位：
+    - `src/goatkv/core/kv_engine/engine.rs:239`
+    - `src/bin/goatkv_server.rs:159`
+    - `src/goatkv/error.rs:15`
+    - `src/goatkv/error.rs:88`
+  - 验收标准：
+    - 提供事务级冲突检测（保守方案可先做串行化提交或 OCC read/write set 校验）。
+    - 冲突统一返回 `Conflict`，并补并发回归：同仓库/同 district 热点更新、订单号分配、余额更新等场景。
+    - 明确隔离级别目标（建议 v1 先做单机 serializable 或至少 repeatable-read + write-write conflict detect）。
+  - 实施建议：
+    - v1 不必一开始实现复杂锁管理；先用“快照读 + 提交验证 + 全局 commit gate”跑通 correctness。
+    - 在 TPC-C 进入压测前，必须先把冲突统计与 abort rate 暴露到 metrics/bench 输出。
 
 - [ ] `P1-ONDISK-FORMAT-VERSIONING-GAP`
   - 现象：SSTable/MANIFEST 缺少明确的格式版本演进策略与兼容矩阵定义。
@@ -740,6 +777,23 @@
 ## 单机 KV 补全计划（2026-03-05）
 
 目标：在不引入分布式复制/事务协调前，完成“可作为关系型上层存储引擎的单机 KV 能力闭环”。
+
+## 面向关系型 / TPC-C 第一阶段补充计划（2026-03-06）
+
+目标：让 GoatKV 能作为“行记录 + 二级索引”上层的单机事务 KV 底座，先把 TPC-C 跑通，再讨论 SQL 层和分布式扩展。
+
+- 直接阻塞项：
+  - `P0-TRANSACTION-ATOMIC-COMMIT-RECOVERY-MISSING`：没有多 key 原子提交与事务恢复，TPC-C 五个事务都无法正确落地。
+  - `P1-API-SCAN-SNAPSHOT-CAS-MISSING`：没有快照一致 `Scan` 与条件写，关系型二级索引访问和热点行更新无法稳态实现。
+  - `P1-TRANSACTION-CONCURRENCY-CONTROL-MISSING`：没有事务级冲突检测与隔离语义，热点键会出现丢更新或不可观测 abort。
+- 第一阶段建议交付顺序：
+  - Phase A：补 `Scan(snapshot_id)`、`CompareAndSet`，让“索引读 + 条件改写”有可靠原语。
+  - Phase B：补单机事务提交层（可先做保守串行化提交），同时接入 WAL 提交记录与恢复规则。
+  - Phase C：补事务冲突检测、abort/冲突指标与 TPC-C 热点场景回归。
+- 不属于 KV 核心、但 TPC-C 上层必须同步规划：
+  - 行编码与主键/二级索引 key codec（前缀有序、支持范围/反向扫描）。
+  - 二级索引维护策略（主记录与索引项同事务提交）。
+  - 最小执行层：把 TPC-C 五个事务过程映射到 KV API，而不是先做完整 SQL parser/planner。
 
 ### 里程碑 0：基线冻结（0.5 周）
 
@@ -1281,15 +1335,17 @@
 
 ## 建议修复顺序
 
-1. `P1-ONDISK-FORMAT-VERSIONING-GAP`
+1. `P0-TRANSACTION-ATOMIC-COMMIT-RECOVERY-MISSING`
 2. `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
-3. `P1-PREFIX-BLOOM-PARTITIONED-FILTER`
-4. `P1-READAHEAD-ITERATOR-OPT`
-5. `P1-MULTIGET-BATCH-READ-PATH`
-6. `P1-PARALLEL-COMPACTION-SUBCOMPACTION`
-7. `P1-PER-LEVEL-COMPRESSION`
-8. `P2-WAL-PREALLOC-BYTES-PER-SYNC`
-9. `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
+3. `P1-TRANSACTION-CONCURRENCY-CONTROL-MISSING`
+4. `P1-ONDISK-FORMAT-VERSIONING-GAP`
+5. `P1-PREFIX-BLOOM-PARTITIONED-FILTER`
+6. `P1-READAHEAD-ITERATOR-OPT`
+7. `P1-MULTIGET-BATCH-READ-PATH`
+8. `P1-PARALLEL-COMPACTION-SUBCOMPACTION`
+9. `P1-PER-LEVEL-COMPRESSION`
+10. `P2-WAL-PREALLOC-BYTES-PER-SYNC`
+11. `P2-UNSAFE-VALIDATION-COVERAGE-GAP`
 
 ## 逐项关闭记录（执行时填写）
 

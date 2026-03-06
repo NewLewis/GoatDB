@@ -8,4 +8,4 @@ pub mod mem_table;
 pub mod sequence_number;
 pub mod skip_list;
 pub mod snapshot_manager;
-pub use kv_engine::KvEngine;
+pub use kv_engine::{BatchWriteOp, KvEngine};

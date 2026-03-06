@@ -9,6 +9,6 @@ pub mod storage;
 pub mod utils;
 
 // 重新导出公共接口
-pub use core::KvEngine;
+pub use core::{BatchWriteOp, KvEngine};
 pub use error::{Error, ErrorKind, Result};
 pub use utils::KvEngineOptions;
