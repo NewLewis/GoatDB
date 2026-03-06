@@ -12,8 +12,9 @@ use goat_db::goatkv::{Error as GoatError, Result as GoatResult};
 use goatkv::{
     goat_kv_service_server::{GoatKvService, GoatKvServiceServer},
     CreateSnapshotRequest, CreateSnapshotResponse, DeleteRequest, DeleteResponse, FlushRequest,
-    FlushResponse, GetRequest, GetResponse, ReleaseSnapshotRequest, ReleaseSnapshotResponse,
-    UpdateRequest, UpdateResponse, WriteRequest, WriteResponse,
+    FlushResponse, GetRequest, GetResponse, MultiGetItem, MultiGetRequest, MultiGetResponse,
+    ReleaseSnapshotRequest, ReleaseSnapshotResponse, UpdateRequest, UpdateResponse, WriteRequest,
+    WriteResponse,
 };
 use std::time::Instant;
 use tokio::{signal, sync::watch, time::sleep};
@@ -153,6 +154,85 @@ impl GoatKvService for GoatKVServiceImpl {
                 self.ok_response(RpcMethod::Get, started_at, reply)
             }
         }
+    }
+
+    async fn multi_get(
+        &self,
+        request: Request<MultiGetRequest>,
+    ) -> Result<Response<MultiGetResponse>, Status> {
+        let started_at = Instant::now();
+        let req = request.into_inner();
+        debug!(
+            "Received multiget request - key_count: {}, snapshot_id: {}",
+            req.keys.len(),
+            req.snapshot_id
+        );
+
+        if req.keys.is_empty() {
+            return self.err_response(
+                RpcMethod::MultiGet,
+                started_at,
+                Status::invalid_argument("Keys cannot be empty"),
+            );
+        }
+        if req.keys.iter().any(|key| key.is_empty()) {
+            return self.err_response(
+                RpcMethod::MultiGet,
+                started_at,
+                Status::invalid_argument("Key in keys cannot be empty"),
+            );
+        }
+        if req.snapshot_id != 0 {
+            return self.err_response(
+                RpcMethod::MultiGet,
+                started_at,
+                Status::invalid_argument("snapshot_id is not supported for MultiGet yet"),
+            );
+        }
+
+        let values = match self
+            .engine
+            .multi_get(&req.keys)
+            .map_err(Self::map_engine_err)
+        {
+            Ok(values) => values,
+            Err(status) => return self.err_response(RpcMethod::MultiGet, started_at, status),
+        };
+
+        let mut found_count = 0usize;
+        let mut entries = Vec::with_capacity(values.len());
+        for (key, value_opt) in req.keys.into_iter().zip(values.into_iter()) {
+            match value_opt {
+                Some(value) => {
+                    found_count += 1;
+                    entries.push(MultiGetItem {
+                        key,
+                        found: true,
+                        value,
+                        message: "Found".to_string(),
+                    });
+                }
+                None => {
+                    entries.push(MultiGetItem {
+                        key,
+                        found: false,
+                        value: Vec::new(),
+                        message: "Key not found".to_string(),
+                    });
+                }
+            }
+        }
+
+        let reply = MultiGetResponse {
+            success: true,
+            message: format!(
+                "MultiGet completed - found {}/{} keys",
+                found_count,
+                entries.len()
+            ),
+            entries,
+        };
+        self.ok_response(RpcMethod::MultiGet, started_at, reply)
     }
 
     async fn update(

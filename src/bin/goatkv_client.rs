@@ -95,6 +95,15 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         snapshot_id: u64,
     },
+    /// 批量获取值
+    MultiGet {
+        /// 键列表（至少 1 个）
+        #[arg(required = true, num_args = 1..)]
+        keys: Vec<String>,
+        /// 快照 ID（当前仅支持 0）
+        #[arg(long, default_value_t = 0)]
+        snapshot_id: u64,
+    },
     /// 更新键的值
     Update {
         /// 键
@@ -123,7 +132,7 @@ async fn run_interactive(mut client: GoatKvServiceClient<Channel>) -> GoatResult
     println!("GoatDB Interactive Client");
     println!("Connected to server successfully!");
     println!(
-        "Commands: put <key> <value>, get <key> [snapshot_id], update <key> <value>, delete <key>, flush, snapshot-create, snapshot-release <id>, exit"
+        "Commands: put <key> <value>, get <key> [snapshot_id], multiget <key1> <key2>..., update <key> <value>, delete <key>, flush, snapshot-create, snapshot-release <id>, exit"
     );
     println!("Use Tab for auto-completion, ↑↓ for history, Ctrl+C to exit");
 
@@ -176,6 +185,9 @@ async fn run_interactive(mut client: GoatKvServiceClient<Channel>) -> GoatResult
                         let result = match args_refs[0] {
                             "put" => handle_put(&mut client, &args_refs[1..]).await,
                             "get" => handle_get(&mut client, &args_refs[1..]).await,
+                            "multiget" | "multi-get" | "multi_get" => {
+                                handle_multiget(&mut client, &args_refs[1..]).await
+                            }
                             "update" => handle_update(&mut client, &args_refs[1..]).await,
                             "delete" => handle_delete(&mut client, &args_refs[1..]).await,
                             "flush" => handle_flush(&mut client).await,
@@ -227,6 +239,7 @@ fn print_help() {
     println!("Available commands:");
     println!("  put <key> <value>   - Insert or update a key-value pair");
     println!("  get <key> [snapshot_id] - Get the value of a key");
+    println!("  multiget <key1> <key2>... - Batch get values by keys");
     println!("  update <key> <value> - Update an existing key's value");
     println!("  delete <key>        - Delete a key-value pair");
     println!("  flush               - Manually trigger flush");
@@ -239,6 +252,7 @@ fn print_help() {
     println!("  put \"key with spaces\" \"value with spaces\"");
     println!("  get my_key");
     println!("  get my_key 42");
+    println!("  multiget key1 key2 key3");
     println!("  snapshot-create");
     println!("  snapshot-release 42");
     println!("  delete \"key with spaces\"");
@@ -315,6 +329,50 @@ async fn handle_get(client: &mut GoatKvServiceClient<Channel>, args: &[&str]) ->
         println!("✗ Key not found: {}", resp_data.message);
     }
 
+    Ok(())
+}
+
+/// 处理 multiget 命令
+async fn handle_multiget(
+    client: &mut GoatKvServiceClient<Channel>,
+    args: &[&str],
+) -> GoatResult<()> {
+    if args.is_empty() {
+        return Err(GoatError::invalid_argument(
+            "multiget",
+            "Usage: multiget <key1> <key2> ...",
+        ));
+    }
+
+    let keys = args
+        .iter()
+        .map(|key| key.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    let request = tonic::Request::new(goatkv::MultiGetRequest {
+        keys,
+        snapshot_id: 0,
+    });
+    let response = client
+        .multi_get(request)
+        .await
+        .map_err(|e| GoatError::unavailable("grpc_multiget", e.to_string()))?;
+    let resp_data = response.into_inner();
+
+    if !resp_data.success {
+        println!("✗ Failed: {}", resp_data.message);
+        return Ok(());
+    }
+
+    println!("✓ Success: {}", resp_data.message);
+    for item in resp_data.entries {
+        let key = String::from_utf8_lossy(&item.key);
+        if item.found {
+            let value = String::from_utf8_lossy(&item.value);
+            println!("  {} => {}", key, value);
+        } else {
+            println!("  {} => <not found>", key);
+        }
+    }
     Ok(())
 }
 
@@ -460,6 +518,16 @@ async fn execute_command(
                 vec![key.as_str(), snapshot_id_string.as_str()]
             };
             handle_get(&mut client, &args).await
+        }
+        Commands::MultiGet { keys, snapshot_id } => {
+            if snapshot_id != 0 {
+                return Err(GoatError::invalid_argument(
+                    "snapshot_id",
+                    "multiget currently only supports snapshot_id=0",
+                ));
+            }
+            let args = keys.iter().map(String::as_str).collect::<Vec<_>>();
+            handle_multiget(&mut client, &args).await
         }
         Commands::Update { key, value } => {
             let args = vec![key.as_str(), value.as_str()];

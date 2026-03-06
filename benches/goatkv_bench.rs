@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use rand::rngs::SmallRng;
@@ -79,6 +79,18 @@ struct Cli {
     /// L2 block compression for GoatKV
     #[arg(long, value_enum, default_value_t = BlockCompressionCli::None)]
     l2_compression: BlockCompressionCli,
+
+    /// Optional baseline ms_per_iter for regression gate
+    #[arg(long)]
+    baseline_ms_per_iter: Option<f64>,
+
+    /// Optional baseline throughput (ops/s) for regression gate
+    #[arg(long)]
+    baseline_throughput_ops_per_sec: Option<f64>,
+
+    /// Allowed regression percentage for baseline gate
+    #[arg(long, default_value_t = 10.0)]
+    regression_threshold_pct: f64,
 
     #[command(subcommand)]
     command: Commands,
@@ -206,7 +218,13 @@ struct BenchResult {
     workload: &'static str,
     total_ms: u128,
     iters: u64,
+    ops: u64,
     ms_per_iter: f64,
+    throughput_ops_per_sec: f64,
+    latency_samples: u64,
+    p95_ms: f64,
+    p99_ms: f64,
+    run_unix_ms: u128,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -294,9 +312,9 @@ fn populate_goatkv(
     value_size: usize,
     seq: bool,
     threads: usize,
-) -> GoatkvWriteStats {
+) -> (GoatkvWriteStats, Vec<u64>) {
     if key_nums == 0 || threads == 0 {
-        return GoatkvWriteStats::default();
+        return (GoatkvWriteStats::default(), Vec::new());
     }
     let batch_size = batch_size.max(1);
     let mut handles = Vec::with_capacity(threads);
@@ -309,6 +327,7 @@ fn populate_goatkv(
             let mut rng = SmallRng::seed_from_u64(seed);
             let total = end.saturating_sub(start);
             let mut stats = GoatkvWriteStats::default();
+            let mut latencies_us = Vec::new();
             if seq {
                 let mut processed = 0u64;
                 while processed < total {
@@ -321,6 +340,7 @@ fn populate_goatkv(
                         entries.push((key, value));
                     }
                     stats.submitted = stats.submitted.saturating_add(batch);
+                    let begin = Instant::now();
                     match engine.put_batch(entries) {
                         Ok(()) => {
                             stats.successful = stats.successful.saturating_add(batch);
@@ -333,6 +353,7 @@ fn populate_goatkv(
                             }
                         }
                     }
+                    latencies_us.push(begin.elapsed().as_micros().min(u64::MAX as u128) as u64);
                     processed += batch;
                 }
             } else {
@@ -347,6 +368,7 @@ fn populate_goatkv(
                         entries.push((key, value));
                     }
                     stats.submitted = stats.submitted.saturating_add(batch);
+                    let begin = Instant::now();
                     match engine.put_batch(entries) {
                         Ok(()) => {
                             stats.successful = stats.successful.saturating_add(batch);
@@ -359,22 +381,27 @@ fn populate_goatkv(
                             }
                         }
                     }
+                    latencies_us.push(begin.elapsed().as_micros().min(u64::MAX as u128) as u64);
                     remaining = remaining.saturating_sub(batch);
                 }
             }
-            stats
+            (stats, latencies_us)
         });
         handles.push(handle);
     }
 
     let mut aggregate = GoatkvWriteStats::default();
+    let mut aggregate_latencies = Vec::new();
     for handle in handles {
         match handle.join() {
-            Ok(stats) => aggregate.add(stats),
+            Ok((stats, latencies_us)) => {
+                aggregate.add(stats);
+                aggregate_latencies.extend(latencies_us);
+            }
             Err(_) => aggregate.thread_panics = aggregate.thread_panics.saturating_add(1),
         }
     }
-    aggregate
+    (aggregate, aggregate_latencies)
 }
 
 fn singleput_goatkv(
@@ -460,9 +487,9 @@ fn populate_rocksdb(
     seq: bool,
     threads: usize,
     wal_sync: bool,
-) -> RocksdbWriteStats {
+) -> (RocksdbWriteStats, Vec<u64>) {
     if key_nums == 0 || threads == 0 {
-        return RocksdbWriteStats::default();
+        return (RocksdbWriteStats::default(), Vec::new());
     }
     let batch_size = batch_size.max(1);
     let mut handles = Vec::with_capacity(threads);
@@ -477,6 +504,7 @@ fn populate_rocksdb(
             write_opts.set_sync(wal_sync);
             let total = end.saturating_sub(start);
             let mut stats = RocksdbWriteStats::default();
+            let mut latencies_us = Vec::new();
             if seq {
                 let mut processed = 0u64;
                 while processed < total {
@@ -489,6 +517,7 @@ fn populate_rocksdb(
                         batch.put(key, value);
                     }
                     stats.submitted = stats.submitted.saturating_add(batch_count);
+                    let begin = Instant::now();
                     match db.write_opt(batch, &write_opts) {
                         Ok(()) => {
                             stats.successful = stats.successful.saturating_add(batch_count);
@@ -497,6 +526,7 @@ fn populate_rocksdb(
                             stats.failed = stats.failed.saturating_add(batch_count);
                         }
                     }
+                    latencies_us.push(begin.elapsed().as_micros().min(u64::MAX as u128) as u64);
                     processed += batch_count;
                 }
             } else {
@@ -511,6 +541,7 @@ fn populate_rocksdb(
                         batch.put(key, value);
                     }
                     stats.submitted = stats.submitted.saturating_add(batch_count);
+                    let begin = Instant::now();
                     match db.write_opt(batch, &write_opts) {
                         Ok(()) => {
                             stats.successful = stats.successful.saturating_add(batch_count);
@@ -519,22 +550,27 @@ fn populate_rocksdb(
                             stats.failed = stats.failed.saturating_add(batch_count);
                         }
                     }
+                    latencies_us.push(begin.elapsed().as_micros().min(u64::MAX as u128) as u64);
                     remaining = remaining.saturating_sub(batch_count);
                 }
             }
-            stats
+            (stats, latencies_us)
         });
         handles.push(handle);
     }
 
     let mut aggregate = RocksdbWriteStats::default();
+    let mut aggregate_latencies = Vec::new();
     for handle in handles {
         match handle.join() {
-            Ok(stats) => aggregate.add(stats),
+            Ok((stats, latencies_us)) => {
+                aggregate.add(stats);
+                aggregate_latencies.extend(latencies_us);
+            }
             Err(_) => aggregate.thread_panics = aggregate.thread_panics.saturating_add(1),
         }
     }
-    aggregate
+    (aggregate, aggregate_latencies)
 }
 
 #[cfg(feature = "rocksdb")]
@@ -607,11 +643,13 @@ fn singleput_rocksdb(
     aggregate
 }
 
-fn randread_goatkv(engine: Arc<KvEngine>, times: u64, key_nums: u64, threads: usize) {
+fn randread_goatkv(engine: Arc<KvEngine>, times: u64, key_nums: u64, threads: usize) -> Vec<u64> {
     if key_nums == 0 || times == 0 || threads == 0 {
-        return;
+        return Vec::new();
     }
+    let mut round_latencies_us = Vec::with_capacity(times as usize);
     for round in 0..times {
+        let round_begin = Instant::now();
         let mut handles = Vec::with_capacity(threads);
         for index in 0..threads {
             let engine = engine.clone();
@@ -634,15 +672,25 @@ fn randread_goatkv(engine: Arc<KvEngine>, times: u64, key_nums: u64, threads: us
         for handle in handles {
             let _ = handle.join();
         }
+        round_latencies_us.push(round_begin.elapsed().as_micros().min(u64::MAX as u128) as u64);
     }
+    round_latencies_us
 }
 
-fn hotread_goatkv(engine: Arc<KvEngine>, times: u64, key_nums: u64, hotset: u64, threads: usize) {
+fn hotread_goatkv(
+    engine: Arc<KvEngine>,
+    times: u64,
+    key_nums: u64,
+    hotset: u64,
+    threads: usize,
+) -> Vec<u64> {
     if key_nums == 0 || times == 0 || threads == 0 {
-        return;
+        return Vec::new();
     }
     let hotset = hotset.max(1).min(key_nums);
+    let mut round_latencies_us = Vec::with_capacity(times as usize);
     for round in 0..times {
+        let round_begin = Instant::now();
         let mut handles = Vec::with_capacity(threads);
         for index in 0..threads {
             let engine = engine.clone();
@@ -664,7 +712,9 @@ fn hotread_goatkv(engine: Arc<KvEngine>, times: u64, key_nums: u64, hotset: u64,
         for handle in handles {
             let _ = handle.join();
         }
+        round_latencies_us.push(round_begin.elapsed().as_micros().min(u64::MAX as u128) as u64);
     }
+    round_latencies_us
 }
 
 fn sample_multiget_key_id(rng: &mut SmallRng, key_nums: u64, miss_ratio: u64) -> u64 {
@@ -801,11 +851,13 @@ fn scanread_goatkv(engine: Arc<KvEngine>, times: u64, mode: ScanMode) -> u64 {
 }
 
 #[cfg(feature = "rocksdb")]
-fn randread_rocksdb(db: Arc<DB>, times: u64, key_nums: u64, threads: usize) {
+fn randread_rocksdb(db: Arc<DB>, times: u64, key_nums: u64, threads: usize) -> Vec<u64> {
     if key_nums == 0 || times == 0 || threads == 0 {
-        return;
+        return Vec::new();
     }
+    let mut round_latencies_us = Vec::with_capacity(times as usize);
     for round in 0..times {
+        let round_begin = Instant::now();
         let mut handles = Vec::with_capacity(threads);
         for index in 0..threads {
             let db = db.clone();
@@ -828,16 +880,26 @@ fn randread_rocksdb(db: Arc<DB>, times: u64, key_nums: u64, threads: usize) {
         for handle in handles {
             let _ = handle.join();
         }
+        round_latencies_us.push(round_begin.elapsed().as_micros().min(u64::MAX as u128) as u64);
     }
+    round_latencies_us
 }
 
 #[cfg(feature = "rocksdb")]
-fn hotread_rocksdb(db: Arc<DB>, times: u64, key_nums: u64, hotset: u64, threads: usize) {
+fn hotread_rocksdb(
+    db: Arc<DB>,
+    times: u64,
+    key_nums: u64,
+    hotset: u64,
+    threads: usize,
+) -> Vec<u64> {
     if key_nums == 0 || times == 0 || threads == 0 {
-        return;
+        return Vec::new();
     }
     let hotset = hotset.max(1).min(key_nums);
+    let mut round_latencies_us = Vec::with_capacity(times as usize);
     for round in 0..times {
+        let round_begin = Instant::now();
         let mut handles = Vec::with_capacity(threads);
         for index in 0..threads {
             let db = db.clone();
@@ -859,7 +921,9 @@ fn hotread_rocksdb(db: Arc<DB>, times: u64, key_nums: u64, hotset: u64, threads:
         for handle in handles {
             let _ = handle.join();
         }
+        round_latencies_us.push(round_begin.elapsed().as_micros().min(u64::MAX as u128) as u64);
     }
+    round_latencies_us
 }
 
 #[cfg(feature = "rocksdb")]
@@ -927,11 +991,123 @@ fn ms_per_iter(total_ms: u128, iters: u64) -> f64 {
     }
 }
 
+fn throughput_ops_per_sec(total_ms: u128, ops: u64) -> f64 {
+    if total_ms == 0 {
+        return ops as f64;
+    }
+    (ops as f64) / (total_ms as f64 / 1000.0)
+}
+
+fn unix_now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn percentile_ms_from_samples(samples_us: &[u64], quantile: f64) -> f64 {
+    if samples_us.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = samples_us.to_vec();
+    sorted.sort_unstable();
+    let target = (sorted.len() as f64 * quantile).ceil() as usize;
+    let index = target.saturating_sub(1).min(sorted.len() - 1);
+    sorted[index] as f64 / 1000.0
+}
+
+fn bench_result_with_samples(
+    engine: &'static str,
+    workload: &'static str,
+    total_ms: u128,
+    iters: u64,
+    ops: u64,
+    latency_samples_us: &[u64],
+) -> BenchResult {
+    let samples = latency_samples_us.len() as u64;
+    let fallback = ms_per_iter(total_ms, iters);
+    let p95_ms = if samples == 0 {
+        fallback
+    } else {
+        percentile_ms_from_samples(latency_samples_us, 0.95)
+    };
+    let p99_ms = if samples == 0 {
+        fallback
+    } else {
+        percentile_ms_from_samples(latency_samples_us, 0.99)
+    };
+
+    BenchResult {
+        engine,
+        workload,
+        total_ms,
+        iters,
+        ops,
+        ms_per_iter: fallback,
+        throughput_ops_per_sec: throughput_ops_per_sec(total_ms, ops),
+        latency_samples: samples,
+        p95_ms,
+        p99_ms,
+        run_unix_ms: unix_now_ms(),
+    }
+}
+
+fn bench_result_basic(
+    engine: &'static str,
+    workload: &'static str,
+    total_ms: u128,
+    iters: u64,
+    ops: u64,
+) -> BenchResult {
+    bench_result_with_samples(engine, workload, total_ms, iters, ops, &[])
+}
+
 fn print_result(result: &BenchResult) {
     println!(
-        "engine={} workload={} total_ms={} iters={} ms_per_iter={:.3}",
-        result.engine, result.workload, result.total_ms, result.iters, result.ms_per_iter
+        "bench_result engine={} workload={} total_ms={} iters={} ops={} ms_per_iter={:.3} throughput_ops_per_sec={:.3} latency_samples={} p95_ms={:.3} p99_ms={:.3} run_unix_ms={}",
+        result.engine,
+        result.workload,
+        result.total_ms,
+        result.iters,
+        result.ops,
+        result.ms_per_iter,
+        result.throughput_ops_per_sec,
+        result.latency_samples,
+        result.p95_ms,
+        result.p99_ms,
+        result.run_unix_ms
     );
+}
+
+fn evaluate_benchmark_gate(cli: &Cli, result: &BenchResult) -> bool {
+    let tolerance = (cli.regression_threshold_pct.max(0.0)) / 100.0;
+    let mut pass = true;
+
+    if let Some(baseline_ms_per_iter) = cli.baseline_ms_per_iter {
+        if baseline_ms_per_iter.is_finite() && baseline_ms_per_iter > 0.0 {
+            let upper_limit = baseline_ms_per_iter * (1.0 + tolerance);
+            let metric_pass = result.ms_per_iter <= upper_limit;
+            println!(
+                "bench_gate metric=ms_per_iter baseline={:.3} observed={:.3} upper_limit={:.3} pass={}",
+                baseline_ms_per_iter, result.ms_per_iter, upper_limit, metric_pass
+            );
+            pass &= metric_pass;
+        }
+    }
+
+    if let Some(baseline_throughput) = cli.baseline_throughput_ops_per_sec {
+        if baseline_throughput.is_finite() && baseline_throughput > 0.0 {
+            let lower_limit = baseline_throughput * (1.0 - tolerance);
+            let metric_pass = result.throughput_ops_per_sec >= lower_limit;
+            println!(
+                "bench_gate metric=throughput_ops_per_sec baseline={:.3} observed={:.3} lower_limit={:.3} pass={}",
+                baseline_throughput, result.throughput_ops_per_sec, lower_limit, metric_pass
+            );
+            pass &= metric_pass;
+        }
+    }
+
+    pass
 }
 
 fn print_goatkv_write_stats(workload: &str, stats: GoatkvWriteStats) {
@@ -1070,7 +1246,7 @@ fn main() {
                         let engine =
                             Arc::new(KvEngine::new_with_options(options).expect("open engine"));
                         let begin = Instant::now();
-                        let stats = populate_goatkv(
+                        let (stats, latency_samples_us) = populate_goatkv(
                             engine.clone(),
                             key_nums,
                             batch_size,
@@ -1079,14 +1255,18 @@ fn main() {
                             cli.threads,
                         );
                         let total_ms = begin.elapsed().as_millis();
-                        let result = BenchResult {
-                            engine: "goatkv",
-                            workload: "populate",
+                        let result = bench_result_with_samples(
+                            "goatkv",
+                            "populate",
                             total_ms,
                             iters,
-                            ms_per_iter: ms_per_iter(total_ms, iters),
-                        };
+                            stats.submitted,
+                            &latency_samples_us,
+                        );
                         print_result(&result);
+                        if !evaluate_benchmark_gate(&cli, &result) {
+                            std::process::exit(3);
+                        }
                         print_goatkv_write_stats("populate", stats);
                         print_runtime_metrics(&engine, "post_write");
                         let idle = wait_for_goatkv_background_idle(&engine, Duration::from_secs(5));
@@ -1103,7 +1283,7 @@ fn main() {
                             let db =
                                 Arc::new(DB::open(&rocks_opts, &base_dir).expect("open rocksdb"));
                             let begin = Instant::now();
-                            let stats = populate_rocksdb(
+                            let (stats, latency_samples_us) = populate_rocksdb(
                                 db,
                                 key_nums,
                                 batch_size,
@@ -1113,14 +1293,18 @@ fn main() {
                                 cli.wal_sync,
                             );
                             let total_ms = begin.elapsed().as_millis();
-                            let result = BenchResult {
-                                engine: "rocksdb",
-                                workload: "populate",
+                            let result = bench_result_with_samples(
+                                "rocksdb",
+                                "populate",
                                 total_ms,
                                 iters,
-                                ms_per_iter: ms_per_iter(total_ms, iters),
-                            };
+                                stats.submitted,
+                                &latency_samples_us,
+                            );
                             print_result(&result);
+                            if !evaluate_benchmark_gate(&cli, &result) {
+                                std::process::exit(3);
+                            }
                             print_rocksdb_write_stats("populate", stats);
                         }
                     }
@@ -1147,14 +1331,17 @@ fn main() {
                             cli.threads,
                         );
                         let total_ms = begin.elapsed().as_millis();
-                        let result = BenchResult {
-                            engine: "goatkv",
-                            workload: "singleput",
+                        let result = bench_result_basic(
+                            "goatkv",
+                            "singleput",
                             total_ms,
                             iters,
-                            ms_per_iter: ms_per_iter(total_ms, iters),
-                        };
+                            stats.submitted,
+                        );
                         print_result(&result);
+                        if !evaluate_benchmark_gate(&cli, &result) {
+                            std::process::exit(3);
+                        }
                         print_goatkv_write_stats("singleput", stats);
                         print_runtime_metrics(&engine, "post_write");
                     }
@@ -1177,14 +1364,17 @@ fn main() {
                                 cli.wal_sync,
                             );
                             let total_ms = begin.elapsed().as_millis();
-                            let result = BenchResult {
-                                engine: "rocksdb",
-                                workload: "singleput",
+                            let result = bench_result_basic(
+                                "rocksdb",
+                                "singleput",
                                 total_ms,
                                 iters,
-                                ms_per_iter: ms_per_iter(total_ms, iters),
-                            };
+                                stats.submitted,
+                            );
                             print_result(&result);
+                            if !evaluate_benchmark_gate(&cli, &result) {
+                                std::process::exit(3);
+                            }
                             print_rocksdb_write_stats("singleput", stats);
                         }
                     }
@@ -1203,16 +1393,21 @@ fn main() {
                         let engine =
                             Arc::new(KvEngine::new_with_options(options).expect("open engine"));
                         let begin = Instant::now();
-                        randread_goatkv(engine.clone(), times, key_nums, cli.threads);
+                        let latency_samples_us =
+                            randread_goatkv(engine.clone(), times, key_nums, cli.threads);
                         let total_ms = begin.elapsed().as_millis();
-                        let result = BenchResult {
-                            engine: "goatkv",
-                            workload: "randread",
+                        let result = bench_result_with_samples(
+                            "goatkv",
+                            "randread",
                             total_ms,
                             iters,
-                            ms_per_iter: ms_per_iter(total_ms, iters),
-                        };
+                            times.saturating_mul(key_nums),
+                            &latency_samples_us,
+                        );
                         print_result(&result);
+                        if !evaluate_benchmark_gate(&cli, &result) {
+                            std::process::exit(3);
+                        }
                         print_cache_metrics(&engine);
                     }
                     EngineKind::Rocksdb => {
@@ -1225,16 +1420,21 @@ fn main() {
                             let db =
                                 Arc::new(DB::open(&rocks_opts, &base_dir).expect("open rocksdb"));
                             let begin = Instant::now();
-                            randread_rocksdb(db, times, key_nums, cli.threads);
+                            let latency_samples_us =
+                                randread_rocksdb(db, times, key_nums, cli.threads);
                             let total_ms = begin.elapsed().as_millis();
-                            let result = BenchResult {
-                                engine: "rocksdb",
-                                workload: "randread",
+                            let result = bench_result_with_samples(
+                                "rocksdb",
+                                "randread",
                                 total_ms,
                                 iters,
-                                ms_per_iter: ms_per_iter(total_ms, iters),
-                            };
+                                times.saturating_mul(key_nums),
+                                &latency_samples_us,
+                            );
                             print_result(&result);
+                            if !evaluate_benchmark_gate(&cli, &result) {
+                                std::process::exit(3);
+                            }
                         }
                     }
                     EngineKind::Both => {}
@@ -1252,16 +1452,21 @@ fn main() {
                         let engine =
                             Arc::new(KvEngine::new_with_options(options).expect("open engine"));
                         let begin = Instant::now();
-                        hotread_goatkv(engine.clone(), times, key_nums, hotset, cli.threads);
+                        let latency_samples_us =
+                            hotread_goatkv(engine.clone(), times, key_nums, hotset, cli.threads);
                         let total_ms = begin.elapsed().as_millis();
-                        let result = BenchResult {
-                            engine: "goatkv",
-                            workload: "hotread",
+                        let result = bench_result_with_samples(
+                            "goatkv",
+                            "hotread",
                             total_ms,
                             iters,
-                            ms_per_iter: ms_per_iter(total_ms, iters),
-                        };
+                            times.saturating_mul(key_nums),
+                            &latency_samples_us,
+                        );
                         print_result(&result);
+                        if !evaluate_benchmark_gate(&cli, &result) {
+                            std::process::exit(3);
+                        }
                         print_cache_metrics(&engine);
                     }
                     EngineKind::Rocksdb => {
@@ -1274,16 +1479,21 @@ fn main() {
                             let db =
                                 Arc::new(DB::open(&rocks_opts, &base_dir).expect("open rocksdb"));
                             let begin = Instant::now();
-                            hotread_rocksdb(db, times, key_nums, hotset, cli.threads);
+                            let latency_samples_us =
+                                hotread_rocksdb(db, times, key_nums, hotset, cli.threads);
                             let total_ms = begin.elapsed().as_millis();
-                            let result = BenchResult {
-                                engine: "rocksdb",
-                                workload: "hotread",
+                            let result = bench_result_with_samples(
+                                "rocksdb",
+                                "hotread",
                                 total_ms,
                                 iters,
-                                ms_per_iter: ms_per_iter(total_ms, iters),
-                            };
+                                times.saturating_mul(key_nums),
+                                &latency_samples_us,
+                            );
                             print_result(&result);
+                            if !evaluate_benchmark_gate(&cli, &result) {
+                                std::process::exit(3);
+                            }
                         }
                     }
                     EngineKind::Both => {}
@@ -1311,14 +1521,12 @@ fn main() {
                             cli.threads,
                         );
                         let total_ms = begin.elapsed().as_millis();
-                        let result = BenchResult {
-                            engine: "goatkv",
-                            workload: "multiget",
-                            total_ms,
-                            iters,
-                            ms_per_iter: ms_per_iter(total_ms, iters),
-                        };
+                        let result =
+                            bench_result_basic("goatkv", "multiget", total_ms, iters, iters);
                         print_result(&result);
+                        if !evaluate_benchmark_gate(&cli, &result) {
+                            std::process::exit(3);
+                        }
                         print_cache_metrics(&engine);
                     }
                     EngineKind::Rocksdb => {
@@ -1340,14 +1548,12 @@ fn main() {
                                 cli.threads,
                             );
                             let total_ms = begin.elapsed().as_millis();
-                            let result = BenchResult {
-                                engine: "rocksdb",
-                                workload: "multiget",
-                                total_ms,
-                                iters,
-                                ms_per_iter: ms_per_iter(total_ms, iters),
-                            };
+                            let result =
+                                bench_result_basic("rocksdb", "multiget", total_ms, iters, iters);
                             print_result(&result);
+                            if !evaluate_benchmark_gate(&cli, &result) {
+                                std::process::exit(3);
+                            }
                         }
                     }
                     EngineKind::Both => {}
@@ -1361,17 +1567,20 @@ fn main() {
                     let begin = Instant::now();
                     let scanned = scanread_goatkv(engine, times, mode);
                     let total_ms = begin.elapsed().as_millis();
-                    let result = BenchResult {
-                        engine: "goatkv",
-                        workload: match mode {
+                    let result = bench_result_basic(
+                        "goatkv",
+                        match mode {
                             ScanMode::Iterator => "scanread_iterator",
                             ScanMode::ScanAll => "scanread_scan_all",
                         },
                         total_ms,
-                        iters: scanned,
-                        ms_per_iter: ms_per_iter(total_ms, scanned),
-                    };
+                        scanned,
+                        scanned,
+                    );
                     print_result(&result);
+                    if !evaluate_benchmark_gate(&cli, &result) {
+                        std::process::exit(3);
+                    }
                 }
                 EngineKind::Rocksdb => {
                     ensure_rocksdb_available();
@@ -1384,14 +1593,12 @@ fn main() {
                         let begin = Instant::now();
                         let scanned = scanread_rocksdb(db, times);
                         let total_ms = begin.elapsed().as_millis();
-                        let result = BenchResult {
-                            engine: "rocksdb",
-                            workload: "scanread",
-                            total_ms,
-                            iters: scanned,
-                            ms_per_iter: ms_per_iter(total_ms, scanned),
-                        };
+                        let result =
+                            bench_result_basic("rocksdb", "scanread", total_ms, scanned, scanned);
                         print_result(&result);
+                        if !evaluate_benchmark_gate(&cli, &result) {
+                            std::process::exit(3);
+                        }
                     }
                 }
                 EngineKind::Both => {}

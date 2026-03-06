@@ -29,6 +29,8 @@
 - 2026-03-05：完成快照能力设计草案（参考 RocksDB `ReadOptions::snapshot` / `SnapshotList` / `CompactionIterator` 规则），新增文档 `docs/goatkv/snapshot_design.md`。
 - 2026-03-06：完成 `SM5-01/SM5-02`，subcompaction 已支持按 key-range 并行执行与线程上限控制（`max_subcompactions`）；补充并行/串行结果一致性回归与高写入基准对照（含 debt 收敛观测）。
 - 2026-03-06：完成 `SM6-03` 长稳压测作业骨架，新增 ignored `e2e_soak`、标准化 JSON 报告、失败样本归档脚本与复盘模板。
+- 2026-03-06：完成 `SM0-02` 基线 benchmark 模板与阈值登记，`goatkv_bench` 输出已标准化（吞吐/p95/p99/样本规模/执行时间戳）并支持 10% 默认回退门禁。
+- 2026-03-06：完成 `SM1-04` MultiGet API 链路打通（proto/server/client/e2e），并接入 `multiget` RPC 指标维度。
 
 ## 读路径差异记录（2026-03-05）
 
@@ -855,18 +857,27 @@
     - 脚本顺序执行：`cargo test --lib --tests`、`cargo clippy --all-targets --all-features -- -D warnings`。
     - 任一子命令返回非零即立即退出，并阻断后续里程碑任务合并。
 
-- [ ] `TASK-SM0-02` 基线 benchmark 模板与阈值登记（status: planned）
+- [x] `TASK-SM0-02` 基线 benchmark 模板与阈值登记（status: done, 2026-03-06）
   - 目标：固定 `populate/randread/hotread` 的运行参数、结果格式、阈值。
   - 关键改动文件：
     - `benches/goatkv_bench.rs`
     - `docs/goatkv/kv_engine_issue_tracker.md`
   - 回归命令：
-    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine goatkv --wal-sync populate`
-    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine goatkv --wal-sync randread`
-    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine goatkv --wal-sync hotread`
+    - `cargo check --features rocksdb --bench goatkv_bench`
+    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_sm002_baseline --engine goatkv --threads 4 --wal-sync populate --key-nums 20000 --batch-size 128 --value-size 512 --seq`
+    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_sm002_baseline --engine goatkv --threads 4 --wal-sync randread --times 40 --key-nums 20000`
+    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_sm002_baseline --engine goatkv --threads 4 --wal-sync hotread --times 60 --key-nums 20000 --hotset 512`
+    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_sm002_baseline --engine goatkv --threads 4 --wal-sync --baseline-ms-per-iter 10 --regression-threshold-pct 10 randread --times 40 --key-nums 20000`
   - DoD：
     - 结果包含吞吐、p95/p99、样本规模、执行日期。
     - 设定回退阈值（建议默认 5%~10%，按场景落盘）。
+  - 关闭记录：
+    - 2026-03-06：`goatkv_bench` 统一输出 `bench_result` 行，字段包含：`throughput_ops_per_sec`、`latency_samples`、`p95_ms`、`p99_ms`、`run_unix_ms`（执行时间戳）。
+    - 2026-03-06：新增可选基线门禁参数：`--baseline-ms-per-iter`、`--baseline-throughput-ops-per-sec`、`--regression-threshold-pct`（默认 `10%`）；超阈值时进程以非零码退出，支持 CI gate。
+    - 2026-03-06：基线参数模板（`threads=4,key_nums=20000,value=512,wal_sync`）登记：
+      - `populate`: `ms_per_iter=0.153`，`throughput_ops_per_sec=833333.333`，`p95_ms=0.842`，`p99_ms=2.443`，`latency_samples=160`。
+      - `randread`: `ms_per_iter=8.525`，`throughput_ops_per_sec=2346041.056`，`p95_ms=10.736`，`p99_ms=42.174`，`latency_samples=40`。
+      - `hotread`: `ms_per_iter=5.800`，`throughput_ops_per_sec=3448275.862`，`p95_ms=6.289`，`p99_ms=7.464`，`latency_samples=60`。
 
 #### Milestone 1（KV 语义补全）
 
@@ -906,17 +917,27 @@
     - 并发 CAS 冲突率与返回码符合预期。
     - 不引入写路径明显退化（以基线阈值判定）。
 
-- [ ] `TASK-SM1-04` `MultiGet` 批量读接口与基础复用（status: planned）
+- [x] `TASK-SM1-04` `MultiGet` 批量读接口与基础复用（status: done, 2026-03-06）
   - 目标：减少 RPC 往返和重复 probe，建立后续读优化基础。
   - 关键改动文件：
-    - `src/goatkv/engine.rs`
-    - `src/goatkv/storage/sstable/`
+    - `proto/goatkv.proto`
+    - `src/bin/goatkv_server.rs`
+    - `src/bin/goatkv_client.rs`
+    - `src/goatkv/metrics/mod.rs`
     - `tests/e2e/`
+    - `Cargo.toml`
   - 回归命令：
-    - `cargo test --test e2e_multiget`
+    - `cargo test --bin goatkv_server`
+    - `cargo test --bin goatkv_client`
+    - `cargo test --test e2e_multiget -- --nocapture`
   - DoD：
     - `MultiGet` 正确返回部分命中/全部 miss。
     - 比逐 key get 具备可测吞吐收益（同参数下对照）。
+  - 关闭记录：
+    - 2026-03-06：新增 gRPC `MultiGet`（`MultiGetRequest/MultiGetResponse/MultiGetItem`），服务端接入引擎 `multi_get` 并返回逐 key 命中状态与 value。
+    - 2026-03-06：客户端新增 `multiget` 命令（单次模式 + REPL），支持一次请求多个 key 并按输入顺序打印结果。
+    - 2026-03-06：新增 `e2e_multiget` 覆盖 mixed hit/miss、空 keys 非法参数、非零 `snapshot_id` 非法参数。
+    - 2026-03-06：`RpcMetricsCollector` 新增 `multiget` 方法维度计数。
 
 #### Milestone 2（持久化与格式演进）
 

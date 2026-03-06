@@ -14,18 +14,20 @@ const LATENCY_BUCKET_COUNT: usize = LATENCY_BUCKET_UPPER_US.len() + 1;
 pub enum RpcMethod {
     Write = 0,
     Get = 1,
-    Update = 2,
-    Delete = 3,
-    Flush = 4,
-    CreateSnapshot = 5,
-    ReleaseSnapshot = 6,
+    MultiGet = 2,
+    Update = 3,
+    Delete = 4,
+    Flush = 5,
+    CreateSnapshot = 6,
+    ReleaseSnapshot = 7,
 }
 
 impl RpcMethod {
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 8;
     pub const ALL: [RpcMethod; Self::COUNT] = [
         RpcMethod::Write,
         RpcMethod::Get,
+        RpcMethod::MultiGet,
         RpcMethod::Update,
         RpcMethod::Delete,
         RpcMethod::Flush,
@@ -37,6 +39,7 @@ impl RpcMethod {
         match self {
             RpcMethod::Write => "write",
             RpcMethod::Get => "get",
+            RpcMethod::MultiGet => "multiget",
             RpcMethod::Update => "update",
             RpcMethod::Delete => "delete",
             RpcMethod::Flush => "flush",

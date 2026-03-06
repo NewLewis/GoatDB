@@ -4,6 +4,7 @@ package goatkv;
 service GoatKVService {
   rpc Write(WriteRequest) returns (WriteResponse);
   rpc Get(GetRequest) returns (GetResponse);
+  rpc MultiGet(MultiGetRequest) returns (MultiGetResponse);
   rpc Update(UpdateRequest) returns (UpdateResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
   rpc Flush(FlushRequest) returns (FlushResponse);
@@ -30,6 +31,24 @@ message GetResponse {
   bool success = 1;
   string message = 2;
   bytes value = 3;
+}
+
+message MultiGetRequest {
+  repeated bytes keys = 1;
+  uint64 snapshot_id = 2;
+}
+
+message MultiGetItem {
+  bytes key = 1;
+  bool found = 2;
+  bytes value = 3;
+  string message = 4;
+}
+
+message MultiGetResponse {
+  bool success = 1;
+  string message = 2;
+  repeated MultiGetItem entries = 3;
 }
 
 message UpdateRequest {
