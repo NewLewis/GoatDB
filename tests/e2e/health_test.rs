@@ -62,6 +62,7 @@ async fn test_health_liveness_and_readiness_transition_on_shutdown() {
         port: None,
         health_port: Some(health_port),
         data_dir: None,
+        auth_tokens: Vec::new(),
         show_logs: false,
         capture_stderr: true,
     })
@@ -114,6 +115,7 @@ async fn test_metrics_endpoint_exposes_core_metrics() {
         port: None,
         health_port: Some(health_port),
         data_dir: None,
+        auth_tokens: Vec::new(),
         show_logs: false,
         capture_stderr: true,
     })
@@ -153,6 +155,7 @@ async fn test_metrics_endpoint_tracks_success_and_error_requests() {
         port: None,
         health_port: Some(health_port),
         data_dir: None,
+        auth_tokens: Vec::new(),
         show_logs: false,
         capture_stderr: true,
     })

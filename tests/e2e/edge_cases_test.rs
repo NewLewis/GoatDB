@@ -262,6 +262,7 @@ async fn test_persistence_across_restart() {
         port: None,
         health_port: None,
         data_dir: Some(data_dir.clone()),
+        auth_tokens: Vec::new(),
         show_logs: false,
         capture_stderr: true,
     })
@@ -287,6 +288,7 @@ async fn test_persistence_across_restart() {
         port: None,
         health_port: None,
         data_dir: Some(data_dir),
+        auth_tokens: Vec::new(),
         show_logs: false,
         capture_stderr: true,
     })
@@ -316,6 +318,7 @@ async fn test_delete_nonexistent_key_is_idempotent() {
         port: None,
         health_port: None,
         data_dir: Some(data_dir.clone()),
+        auth_tokens: Vec::new(),
         show_logs: false,
         capture_stderr: true,
     })
@@ -370,6 +373,7 @@ async fn test_delete_nonexistent_key_is_idempotent() {
         port: None,
         health_port: None,
         data_dir: Some(data_dir),
+        auth_tokens: Vec::new(),
         show_logs: false,
         capture_stderr: true,
     })
@@ -442,6 +446,7 @@ async fn test_flush_reports_trigger_semantics_and_preserves_logical_state() {
         port: None,
         health_port: None,
         data_dir: Some(data_dir.clone()),
+        auth_tokens: Vec::new(),
         show_logs: false,
         capture_stderr: true,
     })

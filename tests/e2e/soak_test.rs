@@ -206,6 +206,7 @@ async fn test_e2e_soak_read_write_stability() {
         port: None,
         health_port: Some(health_port),
         data_dir: None,
+        auth_tokens: Vec::new(),
         show_logs: false,
         capture_stderr: true,
     })

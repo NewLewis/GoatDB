@@ -27,6 +27,7 @@ pub struct TestServerOptions {
     pub port: Option<u16>,
     pub health_port: Option<u16>,
     pub data_dir: Option<PathBuf>,
+    pub auth_tokens: Vec<String>,
     pub show_logs: bool,
     pub capture_stderr: bool,
 }
@@ -37,6 +38,7 @@ impl Default for TestServerOptions {
             port: None,
             health_port: None,
             data_dir: None,
+            auth_tokens: Vec::new(),
             show_logs: true, // 临时启用日志以便调试
             capture_stderr: true,
         }
@@ -70,6 +72,7 @@ impl TestServer {
             port: None,
             health_port: None,
             data_dir: Some(data_dir_path),
+            auth_tokens: Vec::new(),
             show_logs: false,
             capture_stderr: true,
         };
@@ -83,6 +86,7 @@ impl TestServer {
             port,
             health_port,
             data_dir,
+            auth_tokens,
             show_logs,
             capture_stderr,
         } = opts;
@@ -116,6 +120,10 @@ impl TestServer {
         if let Some(health_addr) = health_bind_addr.as_ref() {
             args.push("--health-address".to_string());
             args.push(health_addr.clone());
+        }
+        for token in auth_tokens {
+            args.push("--auth-token".to_string());
+            args.push(token);
         }
 
         // 决定stderr的处理方式
