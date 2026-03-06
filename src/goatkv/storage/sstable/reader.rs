@@ -186,6 +186,19 @@ impl SSTableReader {
         GoatError::corruption("sstable_reader", message.into())
     }
 
+    fn validate_sstable_internal_key_kind(internal_key: &InternalKey) -> GoatResult<()> {
+        match internal_key.kind() {
+            Ok(InternalKeyKind::Put | InternalKeyKind::Delete) => Ok(()),
+            Ok(InternalKeyKind::TxnBatchBegin) => Err(Self::corruption(
+                "invalid internal key kind for sstable: TxnBatchBegin",
+            )),
+            Err(e) => Err(Self::corruption(format!(
+                "invalid internal key kind: {}",
+                e
+            ))),
+        }
+    }
+
     fn decode_internal_key(raw_key: &[u8]) -> GoatResult<InternalKey> {
         if raw_key.len() < 8 {
             return Err(Self::corruption(
@@ -205,8 +218,7 @@ impl SSTableReader {
         ]);
         let encoded = !inverted;
         let key = InternalKey::from_encoded(raw_key[..n - 8].to_vec(), encoded);
-        key.kind()
-            .map_err(|e| Self::corruption(format!("invalid internal key kind: {}", e)))?;
+        Self::validate_sstable_internal_key_kind(&key)?;
         Ok(key)
     }
 
@@ -767,9 +779,7 @@ impl SSTableReader {
         if let Some((internal_key, value_offset, value_len)) =
             block_reader.get_by_user_key_with_value_range(key)
         {
-            internal_key
-                .kind()
-                .map_err(|e| Self::corruption(format!("invalid internal key kind: {}", e)))?;
+            Self::validate_sstable_internal_key_kind(&internal_key)?;
             let end = value_offset.saturating_add(value_len);
             if end > block_payload.len() {
                 return Err(Self::corruption(format!(
@@ -820,9 +830,7 @@ impl SSTableReader {
             if let Some((internal_key, value_offset, value_len)) =
                 block_reader.get_by_user_key_with_value_range_at_seq(key, read_seq)
             {
-                internal_key
-                    .kind()
-                    .map_err(|e| Self::corruption(format!("invalid internal key kind: {}", e)))?;
+                Self::validate_sstable_internal_key_kind(&internal_key)?;
                 let pinned =
                     PinnedValue::from_block(block_payload.clone(), value_offset, value_len)
                         .ok_or_else(|| {

@@ -327,6 +327,7 @@ pub fn find_free_port() -> u16 {
         .expect("Failed to allocate an ephemeral port")
 }
 
+#[allow(dead_code)]
 pub fn total_wal_bytes(data_dir: &Path) -> u64 {
     let wal_dir = data_dir.join("wal");
     fs::read_dir(wal_dir)
