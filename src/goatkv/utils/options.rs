@@ -1,6 +1,8 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+use crate::goatkv::storage::sstable::SstableBlockCompression;
+
 /// Configuration options for creating a KvEngine
 ///
 /// # Examples
@@ -159,6 +161,10 @@ pub struct KvEngineOptions {
     /// Default: 1
     pub max_subcompactions: usize,
 
+    /// Per-level SSTable block compression policy.
+    /// Empty means all levels use `None`.
+    pub per_level_compression: Vec<SstableBlockCompression>,
+
     /// L0 文件数达到该阈值时进入写入减速（slowdown）
     /// Default: 20
     pub l0_slowdown_writes_trigger: usize,
@@ -223,6 +229,7 @@ impl Default for KvEngineOptions {
             compaction_max_bytes_for_level_multiplier: 10,
             compaction_max_grandparent_overlap_bytes_factor: 10,
             max_subcompactions: 1,
+            per_level_compression: Vec::new(),
             l0_slowdown_writes_trigger: 20,
             l0_stop_writes_trigger: 36,
             soft_pending_compaction_bytes_limit: 64 * 1024 * 1024,
@@ -425,6 +432,38 @@ impl KvEngineOptions {
         self
     }
 
+    /// Sets per-level compression policy.
+    pub fn with_per_level_compression(
+        mut self,
+        per_level_compression: Vec<SstableBlockCompression>,
+    ) -> Self {
+        self.per_level_compression = per_level_compression;
+        self
+    }
+
+    /// Sets compression policy for one level, expanding vector if needed.
+    pub fn with_level_compression(
+        mut self,
+        level: usize,
+        compression: SstableBlockCompression,
+    ) -> Self {
+        if self.per_level_compression.len() <= level {
+            self.per_level_compression
+                .resize(level + 1, SstableBlockCompression::None);
+        }
+        self.per_level_compression[level] = compression;
+        self
+    }
+
+    /// Returns compression policy for level.
+    /// Defaults to `None` when level is out of configured range.
+    pub fn compression_for_level(&self, level: usize) -> SstableBlockCompression {
+        self.per_level_compression
+            .get(level)
+            .copied()
+            .unwrap_or(SstableBlockCompression::None)
+    }
+
     /// Sets L0 slowdown trigger for writes.
     pub fn with_l0_slowdown_writes_trigger(mut self, trigger: usize) -> Self {
         self.l0_slowdown_writes_trigger = trigger.max(1);
@@ -515,6 +554,7 @@ impl KvEngineOptions {
             compaction_max_bytes_for_level_multiplier: 10,
             compaction_max_grandparent_overlap_bytes_factor: 10,
             max_subcompactions: 1,
+            per_level_compression: Vec::new(),
             l0_slowdown_writes_trigger: 20,
             l0_stop_writes_trigger: 36,
             soft_pending_compaction_bytes_limit: 64 * 1024 * 1024,
@@ -536,6 +576,10 @@ mod tests {
         assert_eq!(options.mem_table_size, 1024 * 1024);
         assert!(options.recover_from_wal);
         assert!(options.wal_sync);
+        assert_eq!(
+            options.compression_for_level(0),
+            SstableBlockCompression::None
+        );
     }
 
     #[test]
@@ -646,6 +690,45 @@ mod tests {
 
         let options = KvEngineOptions::default().with_max_subcompactions(0);
         assert_eq!(options.max_subcompactions, 1);
+    }
+
+    #[test]
+    fn test_with_per_level_compression() {
+        let options = KvEngineOptions::default().with_per_level_compression(vec![
+            SstableBlockCompression::None,
+            SstableBlockCompression::Rle,
+        ]);
+        assert_eq!(
+            options.compression_for_level(0),
+            SstableBlockCompression::None
+        );
+        assert_eq!(
+            options.compression_for_level(1),
+            SstableBlockCompression::Rle
+        );
+        assert_eq!(
+            options.compression_for_level(4),
+            SstableBlockCompression::None
+        );
+    }
+
+    #[test]
+    fn test_with_level_compression_expands_vector() {
+        let options = KvEngineOptions::default()
+            .with_level_compression(2, SstableBlockCompression::Rle)
+            .with_level_compression(0, SstableBlockCompression::None);
+        assert_eq!(
+            options.compression_for_level(0),
+            SstableBlockCompression::None
+        );
+        assert_eq!(
+            options.compression_for_level(1),
+            SstableBlockCompression::None
+        );
+        assert_eq!(
+            options.compression_for_level(2),
+            SstableBlockCompression::Rle
+        );
     }
 
     #[test]

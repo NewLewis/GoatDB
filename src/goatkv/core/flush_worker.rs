@@ -14,17 +14,20 @@ use crate::goatkv::metadata::version_edit::{NewFile, VersionEdit};
 use crate::goatkv::metadata::version_set::VersionSet;
 use crate::goatkv::storage::compaction::picker::build_subcompaction_ranges;
 use crate::goatkv::storage::compaction::plan::SubcompactionRange;
-use crate::goatkv::storage::sstable::{SSTableBuilder, SSTableReader, SSTableScanIterator};
+use crate::goatkv::storage::sstable::{
+    SSTableBuilder, SSTableReader, SSTableScanIterator, SstableBlockCompression,
+};
 use crate::goatkv::utils::paths::SstablePaths;
 use tracing::{error, warn};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CompactionConfig {
     pub l0_compaction_file_trigger: usize,
     pub max_bytes_for_level_base: u64,
     pub max_bytes_for_level_multiplier: u64,
     pub max_grandparent_overlap_bytes_factor: u64,
     pub max_subcompactions: usize,
+    pub per_level_compression: Vec<SstableBlockCompression>,
 }
 
 impl Default for CompactionConfig {
@@ -35,6 +38,7 @@ impl Default for CompactionConfig {
             max_bytes_for_level_multiplier: 10,
             max_grandparent_overlap_bytes_factor: 10,
             max_subcompactions: 1,
+            per_level_compression: Vec::new(),
         }
     }
 }
@@ -48,6 +52,13 @@ impl CompactionConfig {
             self.max_grandparent_overlap_bytes_factor.max(1);
         self.max_subcompactions = self.max_subcompactions.max(1);
         self
+    }
+
+    fn compression_for_level(&self, level: usize) -> SstableBlockCompression {
+        self.per_level_compression
+            .get(level)
+            .copied()
+            .unwrap_or(SstableBlockCompression::None)
     }
 }
 
@@ -84,6 +95,30 @@ struct CompactionPlan {
 struct OverlapBudget<'a> {
     grandparent_files: &'a [Arc<FileMetadata>],
     grandparent_overlap_bytes_limit: u64,
+}
+
+#[derive(Clone)]
+struct FlushLoopConfig {
+    compaction_sender: mpsc::Sender<()>,
+    flush_failure_streak_limit: usize,
+    compaction_config: CompactionConfig,
+    bloom_prefix_extractor_len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CompactionExecutionOptions {
+    max_subcompactions: usize,
+    block_compression: SstableBlockCompression,
+    bloom_prefix_extractor_len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CompactionBuildOptions<'a> {
+    snapshot_seqs: &'a [u64],
+    overlap_budget: OverlapBudget<'a>,
+    block_compression: SstableBlockCompression,
+    bloom_prefix_extractor_len: usize,
+    sub_range: Option<&'a SubcompactionRange>,
 }
 
 struct CompactionStream {
@@ -200,6 +235,7 @@ impl FlushWorker {
         let (compaction_tx, compaction_rx) = mpsc::channel();
         let flush_failure_streak_limit = flush_failure_streak_limit.max(1);
         let compaction_config = compaction_config.normalized();
+        let flush_compaction_config = compaction_config.clone();
         let bloom_prefix_extractor_len = bloom_prefix_extractor_len.min(u16::MAX as usize);
 
         let compaction_handle = {
@@ -221,16 +257,19 @@ impl FlushWorker {
         };
 
         let flush_handle = {
-            let compaction_tx_for_flush = compaction_tx.clone();
+            let flush_loop_config = FlushLoopConfig {
+                compaction_sender: compaction_tx.clone(),
+                flush_failure_streak_limit,
+                compaction_config: flush_compaction_config,
+                bloom_prefix_extractor_len,
+            };
             thread::spawn(move || {
                 Self::run_flush_loop(
                     flush_rx,
                     lsm_state,
                     version_set,
                     sstable_paths,
-                    compaction_tx_for_flush,
-                    flush_failure_streak_limit,
-                    bloom_prefix_extractor_len,
+                    flush_loop_config,
                 );
             })
         };
@@ -267,9 +306,7 @@ impl FlushWorker {
         lsm_state: Arc<RwLock<LSMState>>,
         version_set: Arc<RwLock<VersionSet>>,
         sstable_paths: Arc<SstablePaths>,
-        compaction_sender: mpsc::Sender<()>,
-        flush_failure_streak_limit: usize,
-        bloom_prefix_extractor_len: usize,
+        config: FlushLoopConfig,
     ) {
         while let Ok(task) = rx.recv() {
             // 从任务中获取要刷盘的 immutable memtable
@@ -295,7 +332,7 @@ impl FlushWorker {
                     if let Err(e) = vs.apply_edit(version_edit) {
                         Self::record_flush_failure(
                             &lsm_state,
-                            flush_failure_streak_limit,
+                            config.flush_failure_streak_limit,
                             &e.to_string(),
                         );
                         error!("Failed to apply VersionEdit: {}", e);
@@ -323,22 +360,24 @@ impl FlushWorker {
             };
 
             // 单次尝试：失败直接报错，不进行重试。
-            let mut sst_builder = match SSTableBuilder::new_with_bloom_prefix_extractor(
-                file_id,
-                &sstable_paths,
-                bloom_prefix_extractor_len,
-            ) {
-                Ok(builder) => builder,
-                Err(e) => {
-                    Self::record_flush_failure(
-                        &lsm_state,
-                        flush_failure_streak_limit,
-                        &e.to_string(),
-                    );
-                    error!("Failed to create SSTableBuilder: {}", e);
-                    continue;
-                }
-            };
+            let mut sst_builder =
+                match SSTableBuilder::new_with_bloom_prefix_extractor_and_compression(
+                    file_id,
+                    &sstable_paths,
+                    config.bloom_prefix_extractor_len,
+                    config.compaction_config.compression_for_level(0),
+                ) {
+                    Ok(builder) => builder,
+                    Err(e) => {
+                        Self::record_flush_failure(
+                            &lsm_state,
+                            config.flush_failure_streak_limit,
+                            &e.to_string(),
+                        );
+                        error!("Failed to create SSTableBuilder: {}", e);
+                        continue;
+                    }
+                };
 
             // 在不持有锁的情况下写入 SSTable
             let mut key_buf = Vec::new();
@@ -351,7 +390,7 @@ impl FlushWorker {
                 if let Err(e) = sst_builder.write(&key_buf, value.as_ref()) {
                     Self::record_flush_failure(
                         &lsm_state,
-                        flush_failure_streak_limit,
+                        config.flush_failure_streak_limit,
                         &e.to_string(),
                     );
                     error!("Failed to write entry to SSTable {}: {}", file_id, e);
@@ -369,7 +408,7 @@ impl FlushWorker {
                 Err(e) => {
                     Self::record_flush_failure(
                         &lsm_state,
-                        flush_failure_streak_limit,
+                        config.flush_failure_streak_limit,
                         &e.to_string(),
                     );
                     error!("Failed to finish SSTable {}: {}", file_id, e);
@@ -396,7 +435,7 @@ impl FlushWorker {
                 if let Err(e) = vs.apply_edit(version_edit) {
                     Self::record_flush_failure(
                         &lsm_state,
-                        flush_failure_streak_limit,
+                        config.flush_failure_streak_limit,
                         &e.to_string(),
                     );
                     error!("Failed to apply VersionEdit: {}", e);
@@ -410,7 +449,7 @@ impl FlushWorker {
             // 从 immutable_mem_tables 中精确移除当前任务对应的 memtable。
             // 不能无条件 pop_front：若前序任务失败并未出队，会导致错删队头。
             Self::update_version_and_remove_task_memtable(&lsm_state, current_version, &imm_table);
-            let _ = compaction_sender.send(());
+            let _ = config.compaction_sender.send(());
         }
     }
 
@@ -429,7 +468,7 @@ impl FlushWorker {
                 &version_set,
                 &sstable_paths,
                 &snapshot_manager,
-                compaction_config,
+                compaction_config.clone(),
                 bloom_prefix_extractor_len,
             );
         }
@@ -492,12 +531,17 @@ impl FlushWorker {
                 let vs = version_set.read().unwrap();
                 let current = vs.current();
                 let compact_pointers = vs.compact_pointers_snapshot();
-                Self::pick_compaction_plan(&current, &compact_pointers, compaction_config)
+                Self::pick_compaction_plan(&current, &compact_pointers, &compaction_config)
             };
             let Some(plan) = plan else {
                 break;
             };
             let snapshot_seqs = snapshot_manager.read().unwrap().snapshot_sequences_sorted();
+            let execution_options = CompactionExecutionOptions {
+                max_subcompactions: compaction_config.max_subcompactions,
+                block_compression: compaction_config.compression_for_level(plan.target_level),
+                bloom_prefix_extractor_len,
+            };
 
             if !Self::compact_one_level(
                 lsm_state,
@@ -505,8 +549,7 @@ impl FlushWorker {
                 sstable_paths,
                 &snapshot_seqs,
                 plan,
-                compaction_config.max_subcompactions,
-                bloom_prefix_extractor_len,
+                execution_options,
             ) {
                 break;
             }
@@ -516,7 +559,7 @@ impl FlushWorker {
     fn pick_compaction_plan(
         current: &Version,
         compact_pointers: &[Option<Vec<u8>>],
-        compaction_config: CompactionConfig,
+        compaction_config: &CompactionConfig,
     ) -> Option<CompactionPlan> {
         if current.num_levels() < 2 {
             return None;
@@ -538,7 +581,7 @@ impl FlushWorker {
 
     fn build_level_size_targets(
         num_levels: usize,
-        compaction_config: CompactionConfig,
+        compaction_config: &CompactionConfig,
     ) -> Vec<u64> {
         let mut targets = vec![0; num_levels];
         let mut target = compaction_config.max_bytes_for_level_base;
@@ -552,7 +595,7 @@ impl FlushWorker {
     fn pick_compaction_priority(
         current: &Version,
         level_targets: &[u64],
-        compaction_config: CompactionConfig,
+        compaction_config: &CompactionConfig,
     ) -> Option<(usize, usize)> {
         let mut best_level: Option<usize> = None;
         let mut best_score = 1.0f64;
@@ -603,7 +646,7 @@ impl FlushWorker {
     fn max_grandparent_overlap_bytes(
         level_targets: &[u64],
         target_level: usize,
-        compaction_config: CompactionConfig,
+        compaction_config: &CompactionConfig,
     ) -> u64 {
         let target = *level_targets
             .get(target_level)
@@ -638,7 +681,7 @@ impl FlushWorker {
         target_level: usize,
         seed_files: Vec<Arc<FileMetadata>>,
         level_targets: &[u64],
-        compaction_config: CompactionConfig,
+        compaction_config: &CompactionConfig,
     ) -> Option<CompactionPlan> {
         let source_level_files = current.get_files(source_level);
         let target_level_files = current.get_files(target_level);
@@ -749,13 +792,16 @@ impl FlushWorker {
         sstable_paths: &Arc<SstablePaths>,
         snapshot_seqs: &[u64],
         plan: CompactionPlan,
-        max_subcompactions: usize,
-        bloom_prefix_extractor_len: usize,
+        execution_options: CompactionExecutionOptions,
     ) -> bool {
         let mut planned_sub_ranges = if plan.source_level == 0 {
             vec![SubcompactionRange::full()]
         } else {
-            build_subcompaction_ranges(&plan.source_files, &plan.target_files, max_subcompactions)
+            build_subcompaction_ranges(
+                &plan.source_files,
+                &plan.target_files,
+                execution_options.max_subcompactions,
+            )
         };
         if planned_sub_ranges.is_empty() {
             planned_sub_ranges.push(SubcompactionRange::full());
@@ -822,13 +868,16 @@ impl FlushWorker {
                 version_set,
                 sstable_paths,
                 &mut stream,
-                snapshot_seqs,
-                OverlapBudget {
-                    grandparent_files: &plan.grandparent_files,
-                    grandparent_overlap_bytes_limit: plan.grandparent_overlap_bytes_limit,
+                CompactionBuildOptions {
+                    snapshot_seqs,
+                    overlap_budget: OverlapBudget {
+                        grandparent_files: &plan.grandparent_files,
+                        grandparent_overlap_bytes_limit: plan.grandparent_overlap_bytes_limit,
+                    },
+                    block_compression: execution_options.block_compression,
+                    bloom_prefix_extractor_len: execution_options.bloom_prefix_extractor_len,
+                    sub_range: planned_sub_ranges.first(),
                 },
-                bloom_prefix_extractor_len,
-                planned_sub_ranges.first(),
             ) {
                 Ok(result) => result,
                 Err(e) => {
@@ -845,7 +894,8 @@ impl FlushWorker {
                 sstable_paths,
                 &plan,
                 snapshot_seqs,
-                bloom_prefix_extractor_len,
+                execution_options.block_compression,
+                execution_options.bloom_prefix_extractor_len,
                 &planned_sub_ranges,
             ) {
                 Ok(result) => result,
@@ -894,10 +944,7 @@ impl FlushWorker {
         version_set: &Arc<RwLock<VersionSet>>,
         sstable_paths: &SstablePaths,
         stream: &mut CompactionStream,
-        snapshot_seqs: &[u64],
-        overlap_budget: OverlapBudget<'_>,
-        bloom_prefix_extractor_len: usize,
-        sub_range: Option<&SubcompactionRange>,
+        options: CompactionBuildOptions<'_>,
     ) -> GoatResult<(Vec<(u64, TableProperties)>, u64)> {
         let mut outputs = Vec::new();
         let mut current_file_id: Option<u64> = None;
@@ -909,14 +956,16 @@ impl FlushWorker {
         let mut last_emitted_snapshot_stripe: Option<u64> = None;
 
         while let Some((internal_key, value)) = stream.next_entry()? {
-            if let Some(range) = sub_range {
+            if let Some(range) = options.sub_range {
                 if !Self::user_key_in_sub_range(internal_key.user_key(), range) {
                     continue;
                 }
             }
             max_seq = max_seq.max(internal_key.sequence_number());
-            let snapshot_stripe =
-                Self::find_earliest_visible_snapshot(snapshot_seqs, internal_key.sequence_number());
+            let snapshot_stripe = Self::find_earliest_visible_snapshot(
+                options.snapshot_seqs,
+                internal_key.sequence_number(),
+            );
             let same_user_key = last_emitted_user_key
                 .as_ref()
                 .map(|k| k.as_slice() == internal_key.user_key())
@@ -929,11 +978,11 @@ impl FlushWorker {
             if current_entries > 0 {
                 if let Some(current_smallest) = current_smallest_user.as_ref() {
                     let overlap_bytes = Self::overlap_bytes(
-                        overlap_budget.grandparent_files,
+                        options.overlap_budget.grandparent_files,
                         current_smallest.as_slice(),
                         internal_key.user_key(),
                     );
-                    if overlap_bytes > overlap_budget.grandparent_overlap_bytes_limit {
+                    if overlap_bytes > options.overlap_budget.grandparent_overlap_bytes_limit {
                         if let (Some(mut current_builder), Some(file_id)) =
                             (builder.take(), current_file_id.take())
                         {
@@ -962,10 +1011,11 @@ impl FlushWorker {
                     vs.allocate_file_number()
                 };
                 builder = Some(
-                    match SSTableBuilder::new_with_bloom_prefix_extractor(
+                    match SSTableBuilder::new_with_bloom_prefix_extractor_and_compression(
                         file_id,
                         sstable_paths,
-                        bloom_prefix_extractor_len,
+                        options.bloom_prefix_extractor_len,
+                        options.block_compression,
                     ) {
                         Ok(builder) => builder,
                         Err(e) => {
@@ -1036,6 +1086,7 @@ impl FlushWorker {
         sstable_paths: &Arc<SstablePaths>,
         plan: &CompactionPlan,
         snapshot_seqs: &[u64],
+        block_compression: SstableBlockCompression,
         bloom_prefix_extractor_len: usize,
         sub_ranges: &[SubcompactionRange],
     ) -> GoatResult<(Vec<(u64, TableProperties)>, u64)> {
@@ -1061,13 +1112,16 @@ impl FlushWorker {
                     &version_set,
                     &sstable_paths,
                     &mut stream,
-                    &snapshot_seqs,
-                    OverlapBudget {
-                        grandparent_files: &grandparent_files,
-                        grandparent_overlap_bytes_limit: overlap_limit,
+                    CompactionBuildOptions {
+                        snapshot_seqs: &snapshot_seqs,
+                        overlap_budget: OverlapBudget {
+                            grandparent_files: &grandparent_files,
+                            grandparent_overlap_bytes_limit: overlap_limit,
+                        },
+                        block_compression,
+                        bloom_prefix_extractor_len,
+                        sub_range: Some(&sub_range),
                     },
-                    bloom_prefix_extractor_len,
-                    Some(&sub_range),
                 )
             });
             handles.push(handle);
@@ -1399,8 +1453,11 @@ mod tests {
             &sstable_paths,
             &[],
             plan,
-            1,
-            0,
+            CompactionExecutionOptions {
+                max_subcompactions: 1,
+                block_compression: SstableBlockCompression::None,
+                bloom_prefix_extractor_len: 0,
+            },
         );
         assert!(!ok, "compaction should fail when apply_edit fails");
         assert!(
@@ -1468,13 +1525,16 @@ mod tests {
             &version_set,
             &sstable_paths,
             &mut stream_without_snapshot,
-            &[],
-            OverlapBudget {
-                grandparent_files: &[],
-                grandparent_overlap_bytes_limit: u64::MAX,
+            CompactionBuildOptions {
+                snapshot_seqs: &[],
+                overlap_budget: OverlapBudget {
+                    grandparent_files: &[],
+                    grandparent_overlap_bytes_limit: u64::MAX,
+                },
+                block_compression: SstableBlockCompression::None,
+                bloom_prefix_extractor_len: 0,
+                sub_range: None,
             },
-            0,
-            None,
         )
         .expect("build compacted sstable without snapshot");
         assert_eq!(outputs_without_snapshot.len(), 1);
@@ -1498,13 +1558,16 @@ mod tests {
             &version_set,
             &sstable_paths,
             &mut stream_with_snapshot,
-            &[15],
-            OverlapBudget {
-                grandparent_files: &[],
-                grandparent_overlap_bytes_limit: u64::MAX,
+            CompactionBuildOptions {
+                snapshot_seqs: &[15],
+                overlap_budget: OverlapBudget {
+                    grandparent_files: &[],
+                    grandparent_overlap_bytes_limit: u64::MAX,
+                },
+                block_compression: SstableBlockCompression::None,
+                bloom_prefix_extractor_len: 0,
+                sub_range: None,
             },
-            0,
-            None,
         )
         .expect("build compacted sstable with snapshot");
         assert_eq!(outputs_with_snapshot.len(), 1);
@@ -1539,13 +1602,16 @@ mod tests {
             &version_set,
             &sstable_paths,
             &mut stream_after_release,
-            &[],
-            OverlapBudget {
-                grandparent_files: &[],
-                grandparent_overlap_bytes_limit: u64::MAX,
+            CompactionBuildOptions {
+                snapshot_seqs: &[],
+                overlap_budget: OverlapBudget {
+                    grandparent_files: &[],
+                    grandparent_overlap_bytes_limit: u64::MAX,
+                },
+                block_compression: SstableBlockCompression::None,
+                bloom_prefix_extractor_len: 0,
+                sub_range: None,
             },
-            0,
-            None,
         )
         .expect("build compacted sstable after snapshot release");
         assert_eq!(outputs_after_release.len(), 1);
@@ -1632,13 +1698,16 @@ mod tests {
             &version_set,
             &sstable_paths,
             &mut single_stream,
-            &[],
-            OverlapBudget {
-                grandparent_files: &[],
-                grandparent_overlap_bytes_limit: u64::MAX,
+            CompactionBuildOptions {
+                snapshot_seqs: &[],
+                overlap_budget: OverlapBudget {
+                    grandparent_files: &[],
+                    grandparent_overlap_bytes_limit: u64::MAX,
+                },
+                block_compression: SstableBlockCompression::None,
+                bloom_prefix_extractor_len: 0,
+                sub_range: None,
             },
-            0,
-            None,
         )
         .expect("build single outputs");
 
@@ -1660,6 +1729,7 @@ mod tests {
             &sstable_paths,
             &plan,
             &[],
+            SstableBlockCompression::None,
             0,
             &ranges,
         )

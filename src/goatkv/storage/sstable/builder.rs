@@ -9,6 +9,7 @@ use super::bloom::{
     bloom_lookup_key, BloomBuilder, PARTITIONED_BLOOM_HEADER_SIZE,
     PARTITIONED_BLOOM_INDEX_ENTRY_SIZE, PARTITIONED_BLOOM_MAGIC, PARTITIONED_BLOOM_VERSION,
 };
+use super::compression::SstableBlockCompression;
 use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::format::coding;
 use crate::goatkv::format::internal_key::InternalKey;
@@ -24,7 +25,10 @@ const FOOTER_SIZE: usize = 48;
 const FOOTER_PADDING_BYTES: usize = 40;
 const FOOTER_FORMAT_MARKER: [u8; 4] = *b"GKFV";
 const FOOTER_FORMAT_METADATA_SIZE: usize = 8;
-const SSTABLE_FORMAT_VERSION_CURRENT: u8 = 1;
+const SSTABLE_FORMAT_VERSION_BASELINE: u8 = 1;
+const SSTABLE_FORMAT_VERSION_BLOCK_COMPRESSION: u8 = 2;
+const SSTABLE_FORMAT_VERSION_CURRENT: u8 = SSTABLE_FORMAT_VERSION_BLOCK_COMPRESSION;
+const BLOCK_COMPRESSION_HEADER_SIZE: usize = 5;
 
 /// SSTableBuilder用于构建SSTable文件
 ///
@@ -115,6 +119,9 @@ pub struct SSTableBuilder {
     /// Bloom 前缀提取长度。0 表示使用完整 user key。
     bloom_prefix_extractor_len: usize,
 
+    /// Data/index block 压缩策略。
+    block_compression: SstableBlockCompression,
+
     /// 当前文件写入偏移量
     /// 用于跟踪文件中的写入位置，记录数据块的偏移量
     offset: u64,
@@ -167,7 +174,12 @@ impl SSTableBuilder {
     /// # }
     /// ```
     pub fn new(id: u64, sstable_paths: &SstablePaths) -> GoatResult<Self> {
-        Self::new_with_bloom_prefix_extractor(id, sstable_paths, 0)
+        Self::new_with_bloom_prefix_extractor_and_compression(
+            id,
+            sstable_paths,
+            0,
+            SstableBlockCompression::None,
+        )
     }
 
     pub fn new_with_bloom_prefix_extractor(
@@ -175,7 +187,26 @@ impl SSTableBuilder {
         sstable_paths: &SstablePaths,
         bloom_prefix_extractor_len: usize,
     ) -> GoatResult<Self> {
-        Self::new_with_manager(id, sstable_paths, bloom_prefix_extractor_len)
+        Self::new_with_bloom_prefix_extractor_and_compression(
+            id,
+            sstable_paths,
+            bloom_prefix_extractor_len,
+            SstableBlockCompression::None,
+        )
+    }
+
+    pub fn new_with_bloom_prefix_extractor_and_compression(
+        id: u64,
+        sstable_paths: &SstablePaths,
+        bloom_prefix_extractor_len: usize,
+        block_compression: SstableBlockCompression,
+    ) -> GoatResult<Self> {
+        Self::new_with_manager_and_compression(
+            id,
+            sstable_paths,
+            bloom_prefix_extractor_len,
+            block_compression,
+        )
     }
 
     /// 创建一个新的SSTableBuilder，使用指定的 SSTablePaths
@@ -194,6 +225,20 @@ impl SSTableBuilder {
         sstable_paths: &SstablePaths,
         bloom_prefix_extractor_len: usize,
     ) -> GoatResult<Self> {
+        Self::new_with_manager_and_compression(
+            id,
+            sstable_paths,
+            bloom_prefix_extractor_len,
+            SstableBlockCompression::None,
+        )
+    }
+
+    pub fn new_with_manager_and_compression(
+        id: u64,
+        sstable_paths: &SstablePaths,
+        bloom_prefix_extractor_len: usize,
+        block_compression: SstableBlockCompression,
+    ) -> GoatResult<Self> {
         let sstable_path = sstable_paths.sstable_path_by_id(id);
         let tmp_path = sstable_paths.tmp_path(format!("sstable_{:06}.tmp", id));
 
@@ -211,6 +256,7 @@ impl SSTableBuilder {
             bloom_builder: BloomBuilder::new(),
             bloom_partitions: Vec::new(),
             bloom_prefix_extractor_len: bloom_prefix_extractor_len.min(u16::MAX as usize),
+            block_compression,
             offset: 0,
             id,
 
@@ -325,20 +371,18 @@ impl SSTableBuilder {
             Self::compute_separator(&last_key[0..last_key.len() - 8], &key[0..key.len() - 8]);
         let separator = InternalKey::new_separator(separator_user_key);
 
+        // 将数据块写入文件
+        let block_offset = self.offset;
+        let block_content = block_content.to_vec();
+        let block_size =
+            self.write_block_with_checksum(&block_content, "sstable_write_data_block")?;
         // 将separator和数据块信息添加到索引块
         // 索引格式：separator -> (block_offset, block_size)
         let mut separator_val = Vec::new();
-        coding::put_varint64(&mut separator_val, self.offset);
-        coding::put_varint64(
-            &mut separator_val,
-            (block_content.len() + BLOCK_CHECKSUM_SIZE) as u64,
-        );
+        coding::put_varint64(&mut separator_val, block_offset);
+        coding::put_varint64(&mut separator_val, block_size);
         self.index_block_builder
             .add(&separator.serialize(), &separator_val);
-
-        // 将数据块写入文件
-        let block_content = block_content.to_vec();
-        self.write_block_with_checksum(&block_content, "sstable_write_data_block")?;
         self.finalize_current_bloom_partition();
 
         // 重置数据块构建器，准备开始新的数据块
@@ -392,21 +436,20 @@ impl SSTableBuilder {
         // 如果有未完成的数据块，先完成它
         if !self.data_block_builder.empty() {
             let (block_content, last_key) = self.data_block_builder.finish();
+            let last_key = last_key.to_vec();
+
+            let block_offset = self.offset;
+            let block_content = block_content.to_vec();
+            let block_size =
+                self.write_block_with_checksum(&block_content, "sstable_write_last_data_block")?;
+            self.finalize_current_bloom_partition();
 
             // 将最后一个数据块的信息添加到索引
             // 注意：这里使用last_key作为separator（因为这是最后一个数据块）
             let mut separator_val = Vec::new();
-            coding::put_varint64(&mut separator_val, self.offset);
-            coding::put_varint64(
-                &mut separator_val,
-                (block_content.len() + BLOCK_CHECKSUM_SIZE) as u64,
-            );
-            self.index_block_builder.add(last_key, &separator_val);
-
-            // 写入最后一个数据块
-            let block_content = block_content.to_vec();
-            self.write_block_with_checksum(&block_content, "sstable_write_last_data_block")?;
-            self.finalize_current_bloom_partition();
+            coding::put_varint64(&mut separator_val, block_offset);
+            coding::put_varint64(&mut separator_val, block_size);
+            self.index_block_builder.add(&last_key, &separator_val);
 
             // 重置数据块构建器
             self.data_block_builder.reset();
@@ -428,7 +471,7 @@ impl SSTableBuilder {
         let (block_content, _) = self.index_block_builder.finish();
         let index_offset = self.offset;
         let block_content = block_content.to_vec();
-        self.write_block_with_checksum(&block_content, "sstable_write_index")?;
+        let _ = self.write_block_with_checksum(&block_content, "sstable_write_index")?;
 
         // 写入Footer
         // Footer包含BloomFilter和IndexBlock的偏移量，用于读取时定位
@@ -464,7 +507,7 @@ impl SSTableBuilder {
         let mut padding = vec![0; padding_len];
         if padding.len() >= FOOTER_FORMAT_METADATA_SIZE {
             padding[..4].copy_from_slice(&FOOTER_FORMAT_MARKER);
-            padding[4] = SSTABLE_FORMAT_VERSION_CURRENT;
+            padding[4] = self.footer_format_version();
         }
         self.writer
             .as_mut()
@@ -582,20 +625,59 @@ impl SSTableBuilder {
         &mut self,
         block_content: &[u8],
         io_stage: &'static str,
-    ) -> GoatResult<()> {
+    ) -> GoatResult<u64> {
+        let block_payload = self.encode_block_payload(block_content)?;
         let writer = self
             .writer
             .as_mut()
             .ok_or_else(|| GoatError::internal("sstable_builder", "SSTable writer missing"))?;
         writer
-            .write_all(block_content)
+            .write_all(&block_payload)
             .map_err(|e| GoatError::io(io_stage, e))?;
-        let checksum = Self::checksum_for_block(block_content);
+        let checksum = Self::checksum_for_block(&block_payload);
         writer
             .write_all(&checksum.to_le_bytes())
             .map_err(|e| GoatError::io("sstable_write_block_checksum", e))?;
-        self.offset += (block_content.len() + BLOCK_CHECKSUM_SIZE) as u64;
-        Ok(())
+        let written_bytes = (block_payload.len() + BLOCK_CHECKSUM_SIZE) as u64;
+        self.offset += written_bytes;
+        Ok(written_bytes)
+    }
+
+    fn footer_format_version(&self) -> u8 {
+        match self.block_compression {
+            SstableBlockCompression::None => SSTABLE_FORMAT_VERSION_BASELINE,
+            _ => SSTABLE_FORMAT_VERSION_CURRENT,
+        }
+    }
+
+    fn encode_block_payload(&self, block_content: &[u8]) -> GoatResult<Vec<u8>> {
+        if self.block_compression == SstableBlockCompression::None {
+            return Ok(block_content.to_vec());
+        }
+
+        let uncompressed_len = u32::try_from(block_content.len()).map_err(|_| {
+            GoatError::corruption(
+                "sstable_write_block_payload",
+                format!(
+                    "block size {} exceeds max encodable u32 length",
+                    block_content.len()
+                ),
+            )
+        })?;
+
+        let compressed = self.block_compression.compress(block_content);
+        let (compression, encoded) = if compressed.len() < block_content.len() {
+            (self.block_compression, compressed)
+        } else {
+            (SstableBlockCompression::None, block_content.to_vec())
+        };
+
+        let mut payload =
+            Vec::with_capacity(BLOCK_COMPRESSION_HEADER_SIZE.saturating_add(encoded.len()));
+        payload.push(compression.as_tag());
+        payload.extend_from_slice(&uncompressed_len.to_le_bytes());
+        payload.extend_from_slice(&encoded);
+        Ok(payload)
     }
 
     /// 计算索引中使用的分隔符（separator）

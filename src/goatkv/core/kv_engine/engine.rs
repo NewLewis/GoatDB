@@ -496,6 +496,7 @@ impl KvEngine {
                 max_grandparent_overlap_bytes_factor: options
                     .compaction_max_grandparent_overlap_bytes_factor,
                 max_subcompactions: options.max_subcompactions,
+                per_level_compression: options.per_level_compression.clone(),
             },
             options.bloom_prefix_extractor_len,
         );
@@ -875,9 +876,12 @@ impl KvEngine {
 mod tests {
     use super::KvEngine;
     use crate::goatkv::error::ErrorKind;
+    use crate::goatkv::storage::sstable::{SSTableReader, SstableBlockCompression};
+    use crate::goatkv::utils::options::KvEngineOptions;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
+    use tempfile::TempDir;
 
     fn test_runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
@@ -1311,6 +1315,77 @@ mod tests {
         }
 
         wait_for_base_level_compaction(&engine, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn test_l0_flush_uses_configured_block_compression() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = KvEngineOptions::for_test()
+            .with_data_dir(temp_dir.path())
+            .with_level_compression(0, SstableBlockCompression::Rle);
+        let engine = KvEngine::new_with_options(options).expect("open engine");
+
+        engine
+            .put(b"compress_l0".to_vec(), vec![b'x'; 2048])
+            .expect("put");
+        engine.flush();
+        engine
+            .wait_for_immutable_memtables(Duration::from_secs(3))
+            .expect("wait flush");
+
+        let l0_files = {
+            let vs = engine.version_set.read().expect("lock version_set");
+            vs.current().get_files(0).to_vec()
+        };
+        assert!(!l0_files.is_empty(), "expected flushed l0 sstable");
+
+        let reader = SSTableReader::open(l0_files[0].sstable_path()).expect("open l0 table");
+        assert_eq!(reader.format_version(), 2);
+        assert_eq!(
+            engine.get(b"compress_l0").expect("get"),
+            Some(vec![b'x'; 2048])
+        );
+    }
+
+    #[test]
+    fn test_compaction_uses_target_level_compression_policy() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = KvEngineOptions::for_test()
+            .with_data_dir(temp_dir.path())
+            .with_level_compression(0, SstableBlockCompression::None)
+            .with_level_compression(1, SstableBlockCompression::Rle);
+        let engine = KvEngine::new_with_options(options).expect("open engine");
+
+        for i in 0..6usize {
+            engine
+                .put(b"shared-key".to_vec(), format!("value-{}", i).into_bytes())
+                .expect("put shared");
+            engine
+                .put(format!("k{:02}", i).into_bytes(), vec![b'y'; 1024])
+                .expect("put unique");
+            engine.flush();
+        }
+
+        wait_for_base_level_compaction(&engine, Duration::from_secs(5));
+
+        let l1_files = {
+            let vs = engine.version_set.read().expect("lock version_set");
+            vs.current().get_files(1).to_vec()
+        };
+        assert!(!l1_files.is_empty(), "expected compaction output in l1");
+
+        for file in l1_files {
+            let reader = SSTableReader::open(file.sstable_path()).expect("open l1 table");
+            assert_eq!(reader.format_version(), 2);
+        }
+        assert_eq!(
+            engine.get(b"shared-key").expect("get latest"),
+            Some(b"value-5".to_vec())
+        );
     }
 
     #[test]

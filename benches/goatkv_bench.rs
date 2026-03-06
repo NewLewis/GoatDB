@@ -9,6 +9,7 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
 use goat_db::goatkv::storage::sstable::SSTableReader;
+use goat_db::goatkv::storage::sstable::SstableBlockCompression;
 use goat_db::goatkv::utils::init_logging;
 use goat_db::goatkv::{ErrorKind, KvEngine, KvEngineOptions};
 #[cfg(feature = "rocksdb")]
@@ -67,6 +68,18 @@ struct Cli {
     #[arg(long, default_value_t = 1)]
     max_subcompactions: usize,
 
+    /// L0 block compression for GoatKV
+    #[arg(long, value_enum, default_value_t = BlockCompressionCli::None)]
+    l0_compression: BlockCompressionCli,
+
+    /// L1 block compression for GoatKV
+    #[arg(long, value_enum, default_value_t = BlockCompressionCli::None)]
+    l1_compression: BlockCompressionCli,
+
+    /// L2 block compression for GoatKV
+    #[arg(long, value_enum, default_value_t = BlockCompressionCli::None)]
+    l2_compression: BlockCompressionCli,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -92,6 +105,21 @@ impl EngineKind {
 enum ScanMode {
     Iterator,
     ScanAll,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockCompressionCli {
+    None,
+    Rle,
+}
+
+impl BlockCompressionCli {
+    fn into_engine(self) -> SstableBlockCompression {
+        match self {
+            Self::None => SstableBlockCompression::None,
+            Self::Rle => SstableBlockCompression::Rle,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -893,6 +921,9 @@ fn goatkv_options_from_cli(cli: &Cli, base_dir: &Path) -> KvEngineOptions {
         .with_row_cache_capacity_bytes(cli.row_cache_capacity_mb.saturating_mul(1024 * 1024))
         .with_filter_cache_capacity_bytes(cli.filter_cache_capacity_mb.saturating_mul(1024 * 1024))
         .with_max_subcompactions(cli.max_subcompactions)
+        .with_level_compression(0, cli.l0_compression.into_engine())
+        .with_level_compression(1, cli.l1_compression.into_engine())
+        .with_level_compression(2, cli.l2_compression.into_engine())
 }
 
 fn print_cache_metrics(engine: &KvEngine) {

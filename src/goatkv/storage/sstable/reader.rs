@@ -18,6 +18,7 @@ use super::bloom::{
     PARTITIONED_BLOOM_INDEX_ENTRY_SIZE, PARTITIONED_BLOOM_MAGIC, PARTITIONED_BLOOM_VERSION,
 };
 use super::cache::{BlockCache, BlockCacheKey, FilterPartitionCache, FilterPartitionCacheKey};
+use super::compression::SstableBlockCompression;
 use crate::goatkv::error::{Error as GoatError, Result as GoatResult};
 use crate::goatkv::format::coding;
 use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind, SEQUENCE_NUMBER_MAX};
@@ -31,7 +32,9 @@ const BLOCK_CHECKSUM_SIZE: usize = 4;
 const FOOTER_FORMAT_MARKER: [u8; 4] = *b"GKFV";
 const FOOTER_FORMAT_METADATA_SIZE: usize = 8;
 const SSTABLE_FORMAT_VERSION_LEGACY: u8 = 0;
-const SSTABLE_FORMAT_VERSION_CURRENT: u8 = 1;
+const SSTABLE_FORMAT_VERSION_BLOCK_COMPRESSION: u8 = 2;
+const SSTABLE_FORMAT_VERSION_CURRENT: u8 = SSTABLE_FORMAT_VERSION_BLOCK_COMPRESSION;
+const BLOCK_COMPRESSION_HEADER_SIZE: usize = 5;
 const SCAN_ITERATOR_DEFAULT_READAHEAD_BLOCKS: usize = 2;
 
 /// SSTable 文件的索引条目
@@ -242,6 +245,35 @@ impl SSTableReader {
         }
 
         Ok(payload)
+    }
+
+    fn decode_block_payload_with_format(
+        format_version: u8,
+        payload: &[u8],
+        block_kind: &str,
+    ) -> GoatResult<Vec<u8>> {
+        if format_version < SSTABLE_FORMAT_VERSION_BLOCK_COMPRESSION {
+            return Ok(payload.to_vec());
+        }
+
+        if payload.len() < BLOCK_COMPRESSION_HEADER_SIZE {
+            return Err(Self::corruption(format!(
+                "{} payload too small for compression header: {}",
+                block_kind,
+                payload.len()
+            )));
+        }
+
+        let compression = SstableBlockCompression::from_tag(payload[0]).map_err(|e| {
+            Self::corruption(format!("{} has invalid compression tag: {}", block_kind, e))
+        })?;
+        let uncompressed_len =
+            u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize;
+        let encoded = &payload[BLOCK_COMPRESSION_HEADER_SIZE..];
+
+        compression
+            .decompress(encoded, uncompressed_len)
+            .map_err(|e| Self::corruption(format!("{} decompression failed: {}", block_kind, e)))
     }
 
     fn read_legacy_bloom_filter(
@@ -516,11 +548,16 @@ impl SSTableReader {
             &mut index_block_data_with_checksum,
             "sstable_read_index",
         )?;
-        let index_block_data =
+        let index_block_payload =
             Self::verify_block_checksum(&index_block_data_with_checksum, "index block")?;
+        let index_block_data = Self::decode_block_payload_with_format(
+            format_version,
+            index_block_payload,
+            "index block",
+        )?;
 
         // 解析索引块
-        let index_reader = match BlockReader::new(index_block_data) {
+        let index_reader = match BlockReader::new(&index_block_data) {
             Ok(reader) => reader,
             Err(e) => {
                 return Err(Self::corruption(format!(
@@ -646,13 +683,23 @@ impl SSTableReader {
                 return Ok(payload);
             }
             let block_data = self.read_block_from_file(block_offset, block_size)?;
-            let block_payload = Self::verify_block_checksum(&block_data, "data block")?.to_vec();
-            return Ok(block_cache.insert(cache_key, block_payload));
+            let block_payload = Self::verify_block_checksum(&block_data, "data block")?;
+            let decoded = Self::decode_block_payload_with_format(
+                self.format_version,
+                block_payload,
+                "data block",
+            )?;
+            return Ok(block_cache.insert(cache_key, decoded));
         }
 
         let block_data = self.read_block_from_file(block_offset, block_size)?;
         let block_payload = Self::verify_block_checksum(&block_data, "data block")?;
-        Ok(Arc::from(block_payload.to_vec().into_boxed_slice()))
+        let decoded = Self::decode_block_payload_with_format(
+            self.format_version,
+            block_payload,
+            "data block",
+        )?;
+        Ok(Arc::from(decoded.into_boxed_slice()))
     }
 
     fn load_block_search_index(
@@ -1054,7 +1101,7 @@ mod tests {
     use crate::goatkv::core::kv_engine::KvEngine;
     use crate::goatkv::format::coding;
     use crate::goatkv::format::internal_key::{InternalKey, InternalKeyKind};
-    use crate::goatkv::storage::sstable::SSTableBuilder;
+    use crate::goatkv::storage::sstable::{SSTableBuilder, SstableBlockCompression};
     use crate::goatkv::ErrorKind;
     use std::fs;
     use std::io::Write;
@@ -1248,7 +1295,46 @@ mod tests {
             "Reader created successfully with {} index entries",
             reader.index_entry_count()
         );
-        assert_eq!(reader.format_version(), SSTABLE_FORMAT_VERSION_CURRENT);
+        assert_eq!(reader.format_version(), 1);
+    }
+
+    #[test]
+    fn test_sstable_reader_open_with_compressed_blocks() {
+        let temp_dir = TempDir::new().unwrap();
+        let (_, sstable_paths, _) = KvEngine::init_db_paths(temp_dir.path()).unwrap();
+
+        let mut builder = SSTableBuilder::new_with_bloom_prefix_extractor_and_compression(
+            1,
+            &sstable_paths,
+            0,
+            SstableBlockCompression::Rle,
+        )
+        .expect("create compressed builder");
+
+        let rows = vec![
+            (b"apple".to_vec(), vec![b'a'; 512]),
+            (b"banana".to_vec(), vec![b'b'; 512]),
+            (b"cherry".to_vec(), vec![b'c'; 512]),
+        ];
+        let mut seq = 100u64;
+        for (user_key, value) in rows {
+            let internal_key = InternalKey::new(user_key, seq, InternalKeyKind::Put);
+            builder
+                .write(&internal_key.serialize(), &value)
+                .expect("write row");
+            seq = seq.saturating_sub(1);
+        }
+        builder.finish().expect("finish compressed sstable");
+
+        let sst_path = sstable_paths.sstable_path_by_id(1);
+        let reader = SSTableReader::open(&sst_path).expect("open compressed sstable");
+        assert_eq!(
+            reader.format_version(),
+            SSTABLE_FORMAT_VERSION_BLOCK_COMPRESSION
+        );
+
+        let (_, value) = reader.get(b"banana").expect("get").expect("found");
+        assert_eq!(value, vec![b'b'; 512]);
     }
 
     #[test]

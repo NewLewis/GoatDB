@@ -1144,17 +1144,29 @@
       - `max_subcompactions=4`：`total_ms=204/121/107`（avg `144.0ms`）。
       - 两组均 `failed=0`；`post_wait` 阶段 `pending_compaction_bytes` 与 `immutable_memtable_backlog` 均回落到 0，满足 debt 追赶目标。
 
-- [ ] `TASK-SM5-03` per-level compression 配置与读兼容（status: planned）
+- [x] `TASK-SM5-03` per-level compression 配置与读兼容（status: done, 2026-03-06）
   - 目标：按层配置压缩策略，平衡 CPU 与空间放大。
   - 关键改动文件：
-    - `src/goatkv/storage/sstable/`
-    - `src/goatkv/storage/compaction/`
-    - `src/goatkv/options.rs`
+    - `src/goatkv/storage/sstable/compression.rs`
+    - `src/goatkv/storage/sstable/builder.rs`
+    - `src/goatkv/storage/sstable/reader.rs`
+    - `src/goatkv/storage/sstable/mod.rs`
+    - `src/goatkv/core/flush_worker.rs`
+    - `src/goatkv/core/kv_engine/engine.rs`
+    - `src/goatkv/utils/options.rs`
+    - `benches/goatkv_bench.rs`
+    - `tests/integration/compat_test.rs`
   - 回归命令：
-    - `cargo test --lib --tests`
+    - `cargo test --lib`
+    - `cargo test --test integration_compat`
+    - `cargo clippy --all-targets --all-features -- -D warnings`
   - DoD：
     - 各层压缩策略可配置且默认值安全。
     - 读取路径对混合压缩文件兼容。
+  - 关闭记录：
+    - 2026-03-06：新增 `SstableBlockCompression`（`None`/`Rle`）并将 SSTable block 编码扩展到 format v2；v2 block payload 带压缩 tag 与原始长度，v0/v1 读路径保持兼容。
+    - 2026-03-06：新增 `KvEngineOptions::per_level_compression` 与 `with_level_compression`，flush(L0) 与 compaction(目标层)按层选择压缩策略；bench CLI 新增 `--l0-compression/--l1-compression/--l2-compression`。
+    - 2026-03-06：收敛负载对照（`threads=16,key_nums=40000,value_size=1024,wal_sync`）中，`l1/l2=rle` 相比 `none`：磁盘占用 `50M -> 13M`（约 `-74%`），populate `73ms -> 92ms`（约 `+26%`），randread `2330ms -> 2115ms`（约 `-9%`）。
 
 - [ ] `TASK-SM5-04` 空间占用与 compaction backlog 基准（status: planned）
   - 目标：量化空间效率和后台追赶效果，形成回归阈值。

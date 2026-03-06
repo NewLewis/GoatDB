@@ -16,7 +16,7 @@ const FOOTER_SIZE: usize = 48;
 const FOOTER_MAGIC_SIZE: usize = 8;
 const FOOTER_FORMAT_MARKER: [u8; 4] = *b"GKFV";
 const FOOTER_FORMAT_METADATA_SIZE: usize = 8;
-const SSTABLE_FORMAT_VERSION_CURRENT: u8 = 1;
+const SSTABLE_FORMAT_VERSION_CURRENT: u8 = 2;
 
 #[derive(Clone, Copy)]
 enum ManifestMutation {
