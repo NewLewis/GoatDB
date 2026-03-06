@@ -2,7 +2,7 @@ use std::cmp::max;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
@@ -88,6 +88,8 @@ pub struct KvEngine {
     lsm_state: Arc<RwLock<LSMState>>,
     /// 写入与 flush 的全局门闩，确保 WAL 与 memtable 边界一致
     write_gate: Arc<RwLock<()>>,
+    /// 保守串行化提交闸门：v1 先保证批量提交与 CAS 的正确性。
+    commit_lock: Mutex<()>,
     /// VersionSet 管理 manifest 与版本演进
     version_set: Arc<RwLock<VersionSet>>,
     /// 配置选项
@@ -323,6 +325,7 @@ impl KvEngine {
     }
 
     pub fn put(&self, key: Vec<u8>, value: Vec<u8>) -> GoatResult<()> {
+        let _commit_guard = self.commit_lock.lock().unwrap();
         self.submit_write(vec![WriteOp::Put(key, value)])
     }
 
@@ -330,6 +333,7 @@ impl KvEngine {
         if ops.is_empty() {
             return Ok(());
         }
+        let _commit_guard = self.commit_lock.lock().unwrap();
         let ops = ops
             .into_iter()
             .map(|op| match op {
@@ -349,7 +353,29 @@ impl KvEngine {
     }
 
     pub fn delete(&self, key: Vec<u8>) -> GoatResult<()> {
+        let _commit_guard = self.commit_lock.lock().unwrap();
         self.submit_write(vec![WriteOp::Delete(key)])
+    }
+
+    pub fn compare_and_set(
+        &self,
+        key: Vec<u8>,
+        expected_value: Option<Vec<u8>>,
+        new_value: Option<Vec<u8>>,
+    ) -> GoatResult<()> {
+        let _commit_guard = self.commit_lock.lock().unwrap();
+        let current = self.reader.get(&key)?;
+        if current != expected_value {
+            return Err(GoatError::conflict(
+                "compare_and_set",
+                "expected value does not match current value",
+            ));
+        }
+
+        match new_value {
+            Some(value) => self.submit_write(vec![WriteOp::Put(key, value)]),
+            None => self.submit_write(vec![WriteOp::Delete(key)]),
+        }
     }
 
     pub fn flush(&self) {
@@ -579,6 +605,7 @@ impl KvEngine {
             cleanup_sender: cleanup_sender.clone(),
             cleanup_enabled: cleanup_enabled.clone(),
             write_gate,
+            commit_lock: Mutex::new(()),
             options,
             flush_worker,
             snapshot_manager,
@@ -1125,6 +1152,54 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows, vec![(b"k3".to_vec(), b"k3".to_vec())]);
+    }
+
+    #[test]
+    fn test_compare_and_set_updates_when_expected_matches() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"cas".to_vec(), b"v1".to_vec()).unwrap();
+        engine
+            .compare_and_set(b"cas".to_vec(), Some(b"v1".to_vec()), Some(b"v2".to_vec()))
+            .unwrap();
+        assert_eq!(engine.get(b"cas").unwrap(), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn test_compare_and_set_returns_conflict_on_mismatch() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine.put(b"cas".to_vec(), b"v1".to_vec()).unwrap();
+        let err = engine
+            .compare_and_set(
+                b"cas".to_vec(),
+                Some(b"wrong".to_vec()),
+                Some(b"v2".to_vec()),
+            )
+            .expect_err("cas mismatch should fail");
+        assert_eq!(err.kind(), ErrorKind::Conflict);
+        assert_eq!(engine.get(b"cas").unwrap(), Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn test_compare_and_set_supports_insert_and_delete() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let engine = KvEngine::new_for_test();
+
+        engine
+            .compare_and_set(b"cas_new".to_vec(), None, Some(b"v1".to_vec()))
+            .unwrap();
+        assert_eq!(engine.get(b"cas_new").unwrap(), Some(b"v1".to_vec()));
+
+        engine
+            .compare_and_set(b"cas_new".to_vec(), Some(b"v1".to_vec()), None)
+            .unwrap();
+        assert_eq!(engine.get(b"cas_new").unwrap(), None);
     }
 
     #[test]

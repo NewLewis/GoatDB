@@ -6,6 +6,7 @@ service GoatKVService {
   rpc Get(GetRequest) returns (GetResponse);
   rpc MultiGet(MultiGetRequest) returns (MultiGetResponse);
   rpc Scan(ScanRequest) returns (ScanResponse);
+  rpc CompareAndSet(CompareAndSetRequest) returns (CompareAndSetResponse);
   rpc Update(UpdateRequest) returns (UpdateResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
   rpc Flush(FlushRequest) returns (FlushResponse);
@@ -70,6 +71,19 @@ message ScanResponse {
   bool success = 1;
   string message = 2;
   repeated ScanItem entries = 3;
+}
+
+message CompareAndSetRequest {
+  bytes key = 1;
+  bool expect_exists = 2;
+  bytes expected_value = 3;
+  bytes new_value = 4;
+  bool delete_on_match = 5;
+}
+
+message CompareAndSetResponse {
+  bool success = 1;
+  string message = 2;
 }
 
 message UpdateRequest {

@@ -476,7 +476,7 @@
     - 2026-03-04：`KvEngine` 初始化将 options 映射到 `CompactionConfig`，默认行为保持与改动前一致。
     - 2026-03-04：回归通过 `test_l0_compacts_to_base_level_when_l0_exceeds_threshold`、`test_compaction_cascades_to_l2_when_l1_exceeds_threshold`、`test_with_l0_compaction_file_trigger`、`test_with_compaction_level_targets`。
 
-- [ ] `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
+- [x] `P1-API-SCAN-SNAPSHOT-CAS-MISSING`
   - 现象：对外 API 仅覆盖点查点写；缺少范围扫描、快照读、条件写（CAS）等关键能力。
   - 影响：上层业务需要自行拼装，易引入一致性窗口和性能问题，接口可用性不足；对关系型上层而言，缺少有序扫描和条件写会直接阻塞二级索引访问、热点计数器更新和 TPC-C 事务过程实现。
   - 代码定位：
@@ -499,7 +499,9 @@
     - 2026-03-05：Phase 3 第二阶段已落地：`BlockReader` 增加 `get_by_user_key_with_value_range_at_seq`，`SSTableReader::get_pinned_at_seq` 改为块内按 seq 命中并返回 pinned value（避免全块线扫+value 拷贝）；`Version` 增加 `read_seq >= largest_seqno` 快路径复用普通点查；新增 `test_block_reader_get_by_user_key_at_seq_with_versions`、`test_block_reader_get_by_user_key_at_seq_cross_restart_boundary`、`test_sstable_reader_get_pinned_at_seq_returns_visible_version`、`test_sstable_reader_get_pinned_at_seq_crosses_blocks`。
     - 2026-03-06：`MultiGet` 已落地。
     - 2026-03-06：`Scan(snapshot_id)` 已落地：engine 增加 `ScanOptions + scan/scan_with_snapshot`，proto/server/client 新增 `Scan` RPC，e2e `tests/e2e/scan_test.rs` 覆盖前缀/边界/倒序/limit 与快照视图。
-    - 2026-03-06：`CompareAndSet` 仍未完成；就“关系型/TPC-C 第一阶段”而言，该 issue 仍保持 open。
+    - 2026-03-06：`CompareAndSet` 已落地：engine 增加 `compare_and_set`，proto/server/client 新增 `CompareAndSet` RPC，冲突统一映射到 `Conflict/FailedPrecondition`，e2e `tests/e2e/cas_test.rs` 覆盖更新/插入/删除/冲突。
+  - 关闭记录：
+    - 2026-03-06：`Scan + SnapshotGet + CompareAndSet + MultiGet` 已全部接入 engine/proto/server/client/e2e；该项关闭。
 
 - [ ] `P1-TRANSACTION-CONCURRENCY-CONTROL-MISSING`
   - 现象：当前引擎没有事务级冲突检测、锁管理、读写集校验或提交时版本验证；`Conflict` 错误类型已存在，但尚无成体系的事务并发控制路径。
@@ -516,6 +518,9 @@
   - 实施建议：
     - v1 不必一开始实现复杂锁管理；先用“快照读 + 提交验证 + 全局 commit gate”跑通 correctness。
     - 在 TPC-C 进入压测前，必须先把冲突统计与 abort rate 暴露到 metrics/bench 输出。
+  - 进展记录：
+    - 2026-03-06：为保证 `compare_and_set` correctness，engine 写入入口新增保守型全局 `commit_lock`，普通 `put/delete/commit_batch/CAS` 已串行化提交。
+    - 2026-03-06：该项暂不关闭；当前只解决了单条 CAS 与写写互斥，尚未提供事务级 read set / write set 校验、abort 语义或热点冲突指标。
 
 - [ ] `P1-ONDISK-FORMAT-VERSIONING-GAP`
   - 现象：SSTable/MANIFEST 缺少明确的格式版本演进策略与兼容矩阵定义。
@@ -786,12 +791,11 @@
 
 - 直接阻塞项：
   - `P0-TRANSACTION-ATOMIC-COMMIT-RECOVERY-MISSING`：没有多 key 原子提交与事务恢复，TPC-C 五个事务都无法正确落地。
-  - `P1-API-SCAN-SNAPSHOT-CAS-MISSING`：没有快照一致 `Scan` 与条件写，关系型二级索引访问和热点行更新无法稳态实现。
   - `P1-TRANSACTION-CONCURRENCY-CONTROL-MISSING`：没有事务级冲突检测与隔离语义，热点键会出现丢更新或不可观测 abort。
 - 第一阶段建议交付顺序：
-  - Phase A：补 `Scan(snapshot_id)`、`CompareAndSet`，让“索引读 + 条件改写”有可靠原语。
-  - Phase B：补单机事务提交层（可先做保守串行化提交），同时接入 WAL 提交记录与恢复规则。
-  - Phase C：补事务冲突检测、abort/冲突指标与 TPC-C 热点场景回归。
+  - Phase A：补单机事务提交层（可先做保守串行化提交），同时接入 WAL 提交记录与恢复规则。
+  - Phase B：补事务冲突检测、abort/冲突指标与 TPC-C 热点场景回归。
+  - Phase C：在事务层之上补 TPC-C row/index codec 与过程映射。
 - 不属于 KV 核心、但 TPC-C 上层必须同步规划：
   - 行编码与主键/二级索引 key codec（前缀有序、支持范围/反向扫描）。
   - 二级索引维护策略（主记录与索引项同事务提交）。

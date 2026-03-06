@@ -11,10 +11,11 @@ use goat_db::goatkv::utils::{init_logging, KvEngineOptions};
 use goat_db::goatkv::{Error as GoatError, Result as GoatResult};
 use goatkv::{
     goat_kv_service_server::{GoatKvService, GoatKvServiceServer},
-    CreateSnapshotRequest, CreateSnapshotResponse, DeleteRequest, DeleteResponse, FlushRequest,
-    FlushResponse, GetRequest, GetResponse, MultiGetItem, MultiGetRequest, MultiGetResponse,
-    ReleaseSnapshotRequest, ReleaseSnapshotResponse, ScanItem, ScanRequest, ScanResponse,
-    UpdateRequest, UpdateResponse, WriteRequest, WriteResponse,
+    CompareAndSetRequest, CompareAndSetResponse, CreateSnapshotRequest, CreateSnapshotResponse,
+    DeleteRequest, DeleteResponse, FlushRequest, FlushResponse, GetRequest, GetResponse,
+    MultiGetItem, MultiGetRequest, MultiGetResponse, ReleaseSnapshotRequest,
+    ReleaseSnapshotResponse, ScanItem, ScanRequest, ScanResponse, UpdateRequest, UpdateResponse,
+    WriteRequest, WriteResponse,
 };
 use std::time::Instant;
 use tokio::{signal, sync::watch, time::sleep};
@@ -275,6 +276,48 @@ impl GoatKvService for GoatKVServiceImpl {
             entries,
         };
         self.ok_response(RpcMethod::Scan, started_at, reply)
+    }
+
+    async fn compare_and_set(
+        &self,
+        request: Request<CompareAndSetRequest>,
+    ) -> Result<Response<CompareAndSetResponse>, Status> {
+        let started_at = Instant::now();
+        let req = request.into_inner();
+        debug!(
+            "Received compare_and_set request - key_len: {}, expect_exists: {}, delete_on_match: {}",
+            req.key.len(),
+            req.expect_exists,
+            req.delete_on_match
+        );
+
+        if req.key.is_empty() {
+            return self.err_response(
+                RpcMethod::CompareAndSet,
+                started_at,
+                Status::invalid_argument("Key cannot be empty"),
+            );
+        }
+
+        let expected_value = req.expect_exists.then_some(req.expected_value);
+        let new_value = if req.delete_on_match {
+            None
+        } else {
+            Some(req.new_value)
+        };
+        if let Err(status) = self
+            .engine
+            .compare_and_set(req.key, expected_value, new_value)
+            .map_err(Self::map_engine_err)
+        {
+            return self.err_response(RpcMethod::CompareAndSet, started_at, status);
+        }
+
+        let reply = CompareAndSetResponse {
+            success: true,
+            message: "CompareAndSet applied successfully".to_string(),
+        };
+        self.ok_response(RpcMethod::CompareAndSet, started_at, reply)
     }
 
     async fn update(

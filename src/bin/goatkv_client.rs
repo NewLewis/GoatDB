@@ -125,6 +125,20 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         snapshot_id: u64,
     },
+    /// 条件写入（CAS）
+    CompareAndSet {
+        /// 键
+        key: String,
+        /// 期望值；若省略，则要求当前 key 不存在
+        #[arg(long)]
+        expected: Option<String>,
+        /// 新值；若省略且指定 --delete，则匹配后删除
+        #[arg(long)]
+        new_value: Option<String>,
+        /// 匹配后删除 key
+        #[arg(long, default_value_t = false)]
+        delete: bool,
+    },
     /// 更新键的值
     Update {
         /// 键
@@ -153,7 +167,7 @@ async fn run_interactive(mut client: GoatKvServiceClient<Channel>) -> GoatResult
     println!("GoatDB Interactive Client");
     println!("Connected to server successfully!");
     println!(
-        "Commands: put <key> <value>, get <key> [snapshot_id], multiget <key1> <key2>..., scan [--start k] [--end k] [--prefix p] [--limit n] [--reverse] [--snapshot-id id], update <key> <value>, delete <key>, flush, snapshot-create, snapshot-release <id>, exit"
+        "Commands: put <key> <value>, get <key> [snapshot_id], multiget <key1> <key2>..., scan [--start k] [--end k] [--prefix p] [--limit n] [--reverse] [--snapshot-id id], cas <key> [--expected v] [--new-value v|--delete], update <key> <value>, delete <key>, flush, snapshot-create, snapshot-release <id>, exit"
     );
     println!("Use Tab for auto-completion, ↑↓ for history, Ctrl+C to exit");
 
@@ -210,6 +224,9 @@ async fn run_interactive(mut client: GoatKvServiceClient<Channel>) -> GoatResult
                                 handle_multiget(&mut client, &args_refs[1..]).await
                             }
                             "scan" => handle_scan(&mut client, &args_refs[1..]).await,
+                            "cas" | "compare-and-set" | "compare_and_set" => {
+                                handle_compare_and_set(&mut client, &args_refs[1..]).await
+                            }
                             "update" => handle_update(&mut client, &args_refs[1..]).await,
                             "delete" => handle_delete(&mut client, &args_refs[1..]).await,
                             "flush" => handle_flush(&mut client).await,
@@ -263,6 +280,7 @@ fn print_help() {
     println!("  get <key> [snapshot_id] - Get the value of a key");
     println!("  multiget <key1> <key2>... - Batch get values by keys");
     println!("  scan [--start k] [--end k] [--prefix p] [--limit n] [--reverse] [--snapshot-id id] - Scan visible keys");
+    println!("  cas <key> [--expected v] [--new-value v|--delete] - Compare and set");
     println!("  update <key> <value> - Update an existing key's value");
     println!("  delete <key>        - Delete a key-value pair");
     println!("  flush               - Manually trigger flush");
@@ -277,6 +295,7 @@ fn print_help() {
     println!("  get my_key 42");
     println!("  multiget key1 key2 key3");
     println!("  scan --prefix warehouse: --limit 10");
+    println!("  cas district:1 --expected old --new-value new");
     println!("  snapshot-create");
     println!("  snapshot-release 42");
     println!("  delete \"key with spaces\"");
@@ -504,6 +523,96 @@ async fn handle_scan_request(
     Ok(())
 }
 
+fn parse_compare_and_set_args(args: &[&str]) -> GoatResult<goatkv::CompareAndSetRequest> {
+    if args.is_empty() {
+        return Err(GoatError::invalid_argument(
+            "cas",
+            "Usage: cas <key> [--expected v] [--new-value v|--delete]",
+        ));
+    }
+
+    let key = args[0].as_bytes().to_vec();
+    let mut expected = None;
+    let mut new_value = None;
+    let mut delete_on_match = false;
+    let mut idx = 1usize;
+
+    while idx < args.len() {
+        match args[idx] {
+            "--expected" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    GoatError::invalid_argument(
+                        "cas",
+                        "Usage: cas <key> [--expected v] [--new-value v|--delete]",
+                    )
+                })?;
+                expected = Some(value.as_bytes().to_vec());
+            }
+            "--new-value" => {
+                idx += 1;
+                let value = args.get(idx).ok_or_else(|| {
+                    GoatError::invalid_argument(
+                        "cas",
+                        "Usage: cas <key> [--expected v] [--new-value v|--delete]",
+                    )
+                })?;
+                new_value = Some(value.as_bytes().to_vec());
+            }
+            "--delete" => {
+                delete_on_match = true;
+            }
+            other => {
+                return Err(GoatError::invalid_argument(
+                    "cas",
+                    format!("unknown cas option `{}`", other),
+                ));
+            }
+        }
+        idx += 1;
+    }
+
+    if delete_on_match && new_value.is_some() {
+        return Err(GoatError::invalid_argument(
+            "cas",
+            "--new-value and --delete cannot be used together",
+        ));
+    }
+    if !delete_on_match && new_value.is_none() {
+        return Err(GoatError::invalid_argument(
+            "cas",
+            "must provide either --new-value or --delete",
+        ));
+    }
+
+    Ok(goatkv::CompareAndSetRequest {
+        key,
+        expect_exists: expected.is_some(),
+        expected_value: expected.unwrap_or_default(),
+        new_value: new_value.unwrap_or_default(),
+        delete_on_match,
+    })
+}
+
+async fn handle_compare_and_set(
+    client: &mut GoatKvServiceClient<Channel>,
+    args: &[&str],
+) -> GoatResult<()> {
+    let request = tonic::Request::new(parse_compare_and_set_args(args)?);
+    let response = client
+        .compare_and_set(request)
+        .await
+        .map_err(|e| GoatError::unavailable("grpc_compare_and_set", e.to_string()))?;
+    let resp_data = response.into_inner();
+
+    if resp_data.success {
+        println!("✓ Success: {}", resp_data.message);
+    } else {
+        println!("✗ Failed: {}", resp_data.message);
+    }
+    Ok(())
+}
+
 /// 处理 update 命令
 async fn handle_update(client: &mut GoatKvServiceClient<Channel>, args: &[&str]) -> GoatResult<()> {
     if args.len() < 2 {
@@ -677,6 +786,26 @@ async fn execute_command(
                 },
             )
             .await
+        }
+        Commands::CompareAndSet {
+            key,
+            expected,
+            new_value,
+            delete,
+        } => {
+            let mut args = vec![key.as_str()];
+            if let Some(expected) = expected.as_ref() {
+                args.push("--expected");
+                args.push(expected.as_str());
+            }
+            if let Some(new_value) = new_value.as_ref() {
+                args.push("--new-value");
+                args.push(new_value.as_str());
+            }
+            if delete {
+                args.push("--delete");
+            }
+            handle_compare_and_set(&mut client, &args).await
         }
         Commands::Update { key, value } => {
             let args = vec![key.as_str(), value.as_str()];
