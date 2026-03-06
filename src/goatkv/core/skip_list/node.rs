@@ -21,6 +21,10 @@ where
     /// 获取 tower 数组（存储各层的下一个节点指针）
     #[inline]
     pub(crate) fn tower(&self) -> &[NodePtr<K>] {
+        // Safety:
+        // - `Node<K>` is allocated with extra trailing space for `height` tower entries.
+        // - The trailing area starts immediately after `Node<K>` due `#[repr(C)]`.
+        // - `self.height` is set once at allocation and never exceeds allocated tower length.
         unsafe {
             let tower_ptr = (self as *const Self).add(1) as *const NodePtr<K>;
             std::slice::from_raw_parts(tower_ptr, self.height)
@@ -29,6 +33,9 @@ where
 
     #[inline]
     pub(crate) fn tower_mut(&mut self) -> &mut [NodePtr<K>] {
+        // Safety:
+        // - Same allocation invariant as `tower()`.
+        // - `&mut self` guarantees exclusive access to the node while mutating tower pointers.
         unsafe {
             let tower_ptr = (self as *mut Self).add(1) as *mut NodePtr<K>;
             std::slice::from_raw_parts_mut(tower_ptr, self.height)

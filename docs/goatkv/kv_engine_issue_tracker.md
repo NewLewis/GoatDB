@@ -1194,17 +1194,24 @@
 
 #### Milestone 6（unsafe 稳定性封口）
 
-- [ ] `TASK-SM6-01` unsafe 不变量注释与审计清单（status: planned）
+- [x] `TASK-SM6-01` unsafe 不变量注释与审计清单（status: done, 2026-03-06）
   - 目标：显式化 unsafe 前提，降低维护误用风险。
   - 关键改动文件：
-    - `src/goatkv/storage/skiplist/`
-    - `src/goatkv/storage/arena/`
-    - `docs/goatkv/`
+    - `src/goatkv/core/skip_list/arena.rs`
+    - `src/goatkv/core/skip_list/node.rs`
+    - `src/goatkv/core/skip_list/list.rs`
+    - `src/goatkv/core/skip_list/iter.rs`
+    - `docs/goatkv/unsafe_audit_checklist.md`
+    - `docs/goatkv/kv_engine_issue_tracker.md`
   - 回归命令：
-    - `cargo test --lib --tests`
+    - `cargo test --lib goatkv::core::skip_list::tests`
+    - `cargo test --lib`
   - DoD：
     - 关键 unsafe 块均有不变量说明。
     - 审计清单可用于 code review 对照。
+  - 关闭记录：
+    - 2026-03-06：为 `skip_list`/`arena` 中所有 `unsafe` 读写与指针转换补充 `Safety:` 注释，覆盖指针来源、生命周期、别名约束与 head-node 特例。
+    - 2026-03-06：新增 `docs/goatkv/unsafe_audit_checklist.md`，建立“unsafe 点位 -> 不变量 -> review 检查项 -> 回归命令”的审计模板。
 
 - [ ] `TASK-SM6-02` Miri/Loom/Fuzz harness 建设（status: planned）
   - 目标：覆盖并发交错与内存安全高风险路径。

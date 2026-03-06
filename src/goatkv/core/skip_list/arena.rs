@@ -25,6 +25,10 @@ impl Arena {
     pub fn alloc<T>(&mut self, value: T) -> NonNull<T> {
         let layout = std::alloc::Layout::new::<T>();
         let ptr = self.alloc_bytes(layout);
+        // Safety:
+        // - `alloc_bytes(layout)` reserves at least `size_of::<T>()` bytes with `align_of::<T>()`.
+        // - The returned region is uniquely owned by this arena and not yet initialized as `T`.
+        // - Writing once with `ptr::write` is valid; drop is handled by skip list drop path.
         unsafe {
             let typed_ptr = ptr as *mut T;
             std::ptr::write(typed_ptr, value);
@@ -39,6 +43,10 @@ impl Arena {
 
         let layout = std::alloc::Layout::array::<T>(src.len()).unwrap();
         let ptr = self.alloc_bytes(layout) as *mut T;
+        // Safety:
+        // - `alloc_bytes(layout)` reserves enough contiguous bytes for `src.len()` elements of `T`.
+        // - Source and destination do not overlap (`src` is external input, dst is arena-owned).
+        // - `T: Copy` ensures bitwise copy is valid.
         unsafe {
             std::ptr::copy_nonoverlapping(src.as_ptr(), ptr, src.len());
             NonNull::new_unchecked(std::ptr::slice_from_raw_parts_mut(ptr, src.len()))
@@ -71,9 +79,15 @@ impl Arena {
         // 填充对齐字节
         self.current.resize(aligned_pos, 0);
 
+        // Safety:
+        // - `aligned_pos <= current.capacity()` is guaranteed by the capacity check above.
+        // - `as_mut_ptr().add(aligned_pos)` stays within the allocated chunk.
         let ptr = unsafe { self.current.as_mut_ptr().add(aligned_pos) };
 
         // 扩展长度
+        // Safety:
+        // - We just reserved `[aligned_pos, aligned_pos + size)` inside capacity.
+        // - Bytes in this range are considered initialized by callers before read.
         unsafe {
             self.current.set_len(aligned_pos + size);
         }

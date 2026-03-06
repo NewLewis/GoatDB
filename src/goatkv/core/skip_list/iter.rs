@@ -19,6 +19,9 @@ where
     type Item = (K, Bytes);
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Safety:
+        // - `current` pointers come from skip list links and remain valid while list lives.
+        // - Iterators are read-only; we clone key/value before advancing.
         self.current.map(|ptr| unsafe {
             let node = ptr.as_ref();
             self.current = node.next(0);
@@ -43,6 +46,9 @@ where
     type Item = (K, Bytes);
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Safety:
+        // - `current` pointers come from skip list links and remain valid while list lives.
+        // - We only read node fields and then move to level-0 successor.
         self.current.and_then(|ptr| unsafe {
             let node = ptr.as_ref();
             if node.key.cmp(self.end) == std::cmp::Ordering::Less {

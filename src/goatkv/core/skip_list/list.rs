@@ -54,6 +54,12 @@ where
         let layout = std::alloc::Layout::from_size_align(total_size, align).unwrap();
         let ptr = arena.alloc_bytes(layout) as *mut Node<K>;
 
+        // Safety:
+        // - `arena.alloc_bytes(layout)` reserves enough aligned bytes for `Node<K> + tower`.
+        // - For data nodes we fully initialize `Node { key, value, height }`.
+        // - For head node (`entry=None`) we intentionally leave key/value uninitialized and only
+        //   set `height`; drop path must never drop head as `Node<K>`.
+        // - Tower entries are initialized to `None` before publication.
         unsafe {
             if let Some((key, value)) = entry {
                 std::ptr::write(ptr, Node { key, value, height });
@@ -83,6 +89,9 @@ where
     pub fn insert(&mut self, key: K, value: Bytes) -> Option<&Bytes> {
         let (mut prev, existing) = self.find_predecessors(&key);
         if let Some(ptr) = existing {
+            // Safety:
+            // - `ptr` comes from traversal over valid skip list links.
+            // - Nodes stay valid for list lifetime (arena-backed, no free-on-delete).
             let node = unsafe { ptr.as_ref() };
             return Some(&node.value);
         }
@@ -97,12 +106,18 @@ where
 
     /// 查找 key
     pub fn get(&self, key: &[u8]) -> Option<&Bytes> {
+        // Safety:
+        // - `find_equal` only returns pointers reachable from valid links.
+        // - Returned reference is tied to `&self` and nodes are arena-backed.
         self.find_equal(key)
             .map(|ptr| unsafe { &ptr.as_ref().value })
     }
 
     /// 查找大于等于 key 的最小元素
     pub fn seek(&self, key: &[u8]) -> Option<(&K, &Bytes)> {
+        // Safety:
+        // - `find_ge` only returns pointers reachable from valid links.
+        // - Returned references are tied to `&self`.
         self.find_ge(key).map(|ptr| unsafe {
             let node = ptr.as_ref();
             (&node.key, &node.value)
@@ -129,6 +144,9 @@ where
 
     /// 返回迭代器
     pub fn iter(&self) -> Iter<'_, K> {
+        // Safety:
+        // - `head` is allocated at construction and always valid during `self` lifetime.
+        // - Level-0 link either points to first node or `None`.
         let first = unsafe { self.head.as_ref().next(0) };
         Iter {
             current: first,
@@ -160,9 +178,13 @@ where
 
         for i in (0..self.max_height).rev() {
             loop {
+                // Safety:
+                // - `current` starts from head and only advances through valid links.
                 let next = unsafe { current.as_ref().next(i) };
                 match next {
                     Some(next_ptr) => {
+                        // Safety:
+                        // - `next_ptr` came from a valid `next(i)` field.
                         let next_node = unsafe { next_ptr.as_ref() };
                         match next_node.key.cmp(key) {
                             Ordering::Less => current = next_ptr,
@@ -197,7 +219,12 @@ where
     ) {
         for (i, prev_item) in prev.iter().enumerate().take(height) {
             if let Some(mut prev_node) = prev_item {
+                // Safety:
+                // - `prev_node` entries come from `find_predecessors` and are valid.
                 let prev_next = unsafe { prev_node.as_ref().next(i) };
+                // Safety:
+                // - `new_node` is freshly allocated and not yet linked at this level.
+                // - `prev_node` is the predecessor at this level; rewiring preserves list order.
                 unsafe {
                     new_node.as_mut().set_next(i, prev_next);
                     prev_node.as_mut().set_next(i, Some(*new_node));
@@ -211,9 +238,13 @@ where
 
         for i in (0..self.max_height).rev() {
             loop {
+                // Safety:
+                // - `current` starts from head and only advances through valid links.
                 let next = unsafe { current.as_ref().next(i) };
                 match next {
                     Some(next_ptr) => {
+                        // Safety:
+                        // - `next_ptr` came from a valid `next(i)` field.
                         let next_node = unsafe { next_ptr.as_ref() };
                         match next_node.key.user_key().cmp(key) {
                             Ordering::Less => current = next_ptr,
@@ -233,9 +264,13 @@ where
 
         for i in (0..self.max_height).rev() {
             loop {
+                // Safety:
+                // - `current` starts from head and only advances through valid links.
                 let next = unsafe { current.as_ref().next(i) };
                 match next {
                     Some(next_ptr) => {
+                        // Safety:
+                        // - `next_ptr` came from a valid `next(i)` field.
                         let next_node = unsafe { next_ptr.as_ref() };
                         if next_node.key.user_key().cmp(key) == Ordering::Less {
                             current = next_ptr;
@@ -248,11 +283,19 @@ where
             }
         }
 
+        // Safety:
+        // - `current` is either head or an in-list node; reading its level-0 link is valid.
         unsafe { current.as_ref().next(0) }
     }
 }
 
+// Safety:
+// - SkipList nodes are arena-backed and never moved/freed until drop.
+// - Cross-thread sharing only exposes shared references; mutable access requires `&mut self`.
 unsafe impl<K> Send for SkipList<K> where K: UserKey + Send {}
+// Safety:
+// - Internal raw pointers are only manipulated behind `&mut self`.
+// - Read-only traversals through stable arena allocations are thread-safe when `K: Sync`.
 unsafe impl<K> Sync for SkipList<K> where K: UserKey + Sync {}
 
 impl<K> Default for SkipList<K>
