@@ -3027,6 +3027,44 @@ mod tests {
     }
 
     #[test]
+    fn test_flush_large_ordered_dataset_preserves_point_reads_across_blocks() {
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let options = KvEngineOptions::for_test()
+            .with_data_dir(temp_dir.path())
+            .with_mem_table_size(256 * 1024);
+        let engine = KvEngine::new_with_options(options).expect("open engine");
+
+        let entries = (0..128u32)
+            .map(|i| {
+                let key = format!("flush:key:{:03}", i).into_bytes();
+                let value = vec![b'a' + (i % 26) as u8; 128];
+                engine.put(key.clone(), value.clone()).unwrap();
+                (key, value)
+            })
+            .collect::<Vec<_>>();
+
+        engine.flush();
+        engine
+            .wait_for_immutable_memtables(Duration::from_secs(3))
+            .expect("wait flush");
+
+        assert!(
+            count_sstable_files(engine.sstable_paths().data_dir()) >= 1,
+            "flush should create at least one SSTable"
+        );
+        for (key, value) in &entries {
+            assert_eq!(
+                engine.get(key).unwrap(),
+                Some(value.clone()),
+                "flushed point read should stay correct for key {}",
+                String::from_utf8_lossy(key)
+            );
+        }
+    }
+
+    #[test]
     fn test_runtime_metrics_reflect_write_and_flush_lifecycle() {
         let rt = test_runtime();
         let _guard = rt.enter();

@@ -689,17 +689,16 @@ impl SSTableBuilder {
     /// - 查询时，如果目标key <= separator，则该数据块可能包含该key
     ///
     /// # 计算算法
-    /// 1. 如果两个key长度相同且最后一个字符相差1（递增序列），
-    ///    直接返回last_key作为separator
-    /// 2. 否则，逐字节比较，找到第一个不同的位置
-    /// 3. 返回last_key的共享部分 + 下一个字节值（如果<0xff）
+    /// 1. 逐字节比较，找到第一个不同的位置
+    /// 2. 只有在 `last_key[i] + 1 < key[i]` 时，才能安全地截断并递增该字节
+    /// 3. 否则回退为 `last_key`，避免生成越过 `key` 的 separator
     ///
     /// # 示例
     /// ```text
     /// last_key = b"apple"
     /// key = b"application"
     /// // 比较：a=a, p=p, p=p, l=l, e=i (不同)
-    /// // separator = b"appl" + b"m" = b"applm"
+    /// // separator = b"applf"
     ///
     /// last_key = b"key001"
     /// key = b"key002"
@@ -714,35 +713,24 @@ impl SSTableBuilder {
     /// # 返回值
     /// 返回计算得到的separator
     fn compute_separator(last_key: &[u8], key: &[u8]) -> Vec<u8> {
-        let mut result = Vec::new();
-        let mut i = 0;
-
-        // 特殊情况：如果两个key长度相同且是递增序列
-        // 例如：key001 -> key002
-        if last_key.len() == key.len() && last_key[last_key.len() - 1] + 1 == key[key.len() - 1] {
-            // 检查前面的字符是否都相同
-            if last_key[..last_key.len() - 1] == key[..key.len() - 1] {
-                return last_key.to_vec();
-            }
+        let min_len = last_key.len().min(key.len());
+        let mut diff_index = 0usize;
+        while diff_index < min_len && last_key[diff_index] == key[diff_index] {
+            diff_index += 1;
         }
 
-        // 逐字节比较，找到第一个不同的位置
-        while i < last_key.len() && i < key.len() {
-            if last_key[i] != key[i] {
-                // 找到不同位置，如果last_key[i] < 0xff，可以加1
-                if last_key[i] < 0xff {
-                    result.push(last_key[i] + 1);
-                    return result;
-                }
-                // 如果是0xff，需要继续向后查找
-                return last_key.to_vec();
-            }
-            // 相同的字符加入结果
-            result.push(last_key[i]);
-            i += 1;
+        if diff_index >= min_len {
+            return last_key.to_vec();
         }
 
-        // 如果其中一个key是另一个的前缀，返回last_key
+        let last_byte = last_key[diff_index];
+        let next_byte = key[diff_index];
+        if last_byte < 0xff && last_byte.saturating_add(1) < next_byte {
+            let mut result = last_key[..=diff_index].to_vec();
+            result[diff_index] = last_byte + 1;
+            return result;
+        }
+
         last_key.to_vec()
     }
 }
@@ -751,4 +739,24 @@ fn sync_dir(path: &Path) -> GoatResult<()> {
     let dir = File::open(path).map_err(|e| GoatError::io("sstable_sync_dir_open", e))?;
     dir.sync_all()
         .map_err(|e| GoatError::io("sstable_sync_dir_sync_all", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SSTableBuilder;
+
+    #[test]
+    fn compute_separator_never_overshoots_next_key() {
+        let separator = SSTableBuilder::compute_separator(b"s00", b"s01");
+        assert_eq!(separator, b"s00".to_vec());
+        assert!(separator.as_slice() < b"s01".as_ref());
+
+        let separator = SSTableBuilder::compute_separator(b"apple", b"application");
+        assert!(separator.as_slice() >= b"apple".as_ref());
+        assert!(separator.as_slice() < b"application".as_ref());
+
+        let separator = SSTableBuilder::compute_separator(b"abc1", b"abc9");
+        assert!(separator.as_slice() >= b"abc1".as_ref());
+        assert!(separator.as_slice() < b"abc9".as_ref());
+    }
 }
