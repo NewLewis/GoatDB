@@ -230,6 +230,25 @@ impl GoatkvWriteStats {
     }
 }
 
+#[cfg(feature = "rocksdb")]
+#[derive(Debug, Clone, Copy, Default)]
+struct RocksdbWriteStats {
+    submitted: u64,
+    successful: u64,
+    failed: u64,
+    thread_panics: u64,
+}
+
+#[cfg(feature = "rocksdb")]
+impl RocksdbWriteStats {
+    fn add(&mut self, other: Self) {
+        self.submitted = self.submitted.saturating_add(other.submitted);
+        self.successful = self.successful.saturating_add(other.successful);
+        self.failed = self.failed.saturating_add(other.failed);
+        self.thread_panics = self.thread_panics.saturating_add(other.thread_panics);
+    }
+}
+
 #[cfg(not(feature = "rocksdb"))]
 fn ensure_rocksdb_available() -> ! {
     tracing::error!("rocksdb support is disabled; rebuild with --features rocksdb");
@@ -441,9 +460,9 @@ fn populate_rocksdb(
     seq: bool,
     threads: usize,
     wal_sync: bool,
-) {
+) -> RocksdbWriteStats {
     if key_nums == 0 || threads == 0 {
-        return;
+        return RocksdbWriteStats::default();
     }
     let batch_size = batch_size.max(1);
     let mut handles = Vec::with_capacity(threads);
@@ -457,6 +476,7 @@ fn populate_rocksdb(
             let mut write_opts = WriteOptions::default();
             write_opts.set_sync(wal_sync);
             let total = end.saturating_sub(start);
+            let mut stats = RocksdbWriteStats::default();
             if seq {
                 let mut processed = 0u64;
                 while processed < total {
@@ -468,7 +488,15 @@ fn populate_rocksdb(
                         let value = make_value(value_size, key_id);
                         batch.put(key, value);
                     }
-                    let _ = db.write_opt(batch, &write_opts);
+                    stats.submitted = stats.submitted.saturating_add(batch_count);
+                    match db.write_opt(batch, &write_opts) {
+                        Ok(()) => {
+                            stats.successful = stats.successful.saturating_add(batch_count);
+                        }
+                        Err(_) => {
+                            stats.failed = stats.failed.saturating_add(batch_count);
+                        }
+                    }
                     processed += batch_count;
                 }
             } else {
@@ -482,17 +510,31 @@ fn populate_rocksdb(
                         let value = make_value(value_size, key_id);
                         batch.put(key, value);
                     }
-                    let _ = db.write_opt(batch, &write_opts);
+                    stats.submitted = stats.submitted.saturating_add(batch_count);
+                    match db.write_opt(batch, &write_opts) {
+                        Ok(()) => {
+                            stats.successful = stats.successful.saturating_add(batch_count);
+                        }
+                        Err(_) => {
+                            stats.failed = stats.failed.saturating_add(batch_count);
+                        }
+                    }
                     remaining = remaining.saturating_sub(batch_count);
                 }
             }
+            stats
         });
         handles.push(handle);
     }
 
+    let mut aggregate = RocksdbWriteStats::default();
     for handle in handles {
-        let _ = handle.join();
+        match handle.join() {
+            Ok(stats) => aggregate.add(stats),
+            Err(_) => aggregate.thread_panics = aggregate.thread_panics.saturating_add(1),
+        }
     }
+    aggregate
 }
 
 #[cfg(feature = "rocksdb")]
@@ -503,9 +545,9 @@ fn singleput_rocksdb(
     seq: bool,
     threads: usize,
     wal_sync: bool,
-) {
+) -> RocksdbWriteStats {
     if key_nums == 0 || threads == 0 {
-        return;
+        return RocksdbWriteStats::default();
     }
     let mut handles = Vec::with_capacity(threads);
 
@@ -517,11 +559,20 @@ fn singleput_rocksdb(
             let mut rng = SmallRng::seed_from_u64(seed);
             let mut write_opts = WriteOptions::default();
             write_opts.set_sync(wal_sync);
+            let mut stats = RocksdbWriteStats::default();
             if seq {
                 for key_id in start..end {
                     let key = make_key(key_id);
                     let value = make_value(value_size, key_id);
-                    let _ = db.put_opt(key, value, &write_opts);
+                    stats.submitted = stats.submitted.saturating_add(1);
+                    match db.put_opt(key, value, &write_opts) {
+                        Ok(()) => {
+                            stats.successful = stats.successful.saturating_add(1);
+                        }
+                        Err(_) => {
+                            stats.failed = stats.failed.saturating_add(1);
+                        }
+                    }
                 }
             } else {
                 let mut remaining = end.saturating_sub(start);
@@ -529,17 +580,31 @@ fn singleput_rocksdb(
                     let key_id = rng.gen_range(0..key_nums);
                     let key = make_key(key_id);
                     let value = make_value(value_size, key_id);
-                    let _ = db.put_opt(key, value, &write_opts);
+                    stats.submitted = stats.submitted.saturating_add(1);
+                    match db.put_opt(key, value, &write_opts) {
+                        Ok(()) => {
+                            stats.successful = stats.successful.saturating_add(1);
+                        }
+                        Err(_) => {
+                            stats.failed = stats.failed.saturating_add(1);
+                        }
+                    }
                     remaining = remaining.saturating_sub(1);
                 }
             }
+            stats
         });
         handles.push(handle);
     }
 
+    let mut aggregate = RocksdbWriteStats::default();
     for handle in handles {
-        let _ = handle.join();
+        match handle.join() {
+            Ok(stats) => aggregate.add(stats),
+            Err(_) => aggregate.thread_panics = aggregate.thread_panics.saturating_add(1),
+        }
     }
+    aggregate
 }
 
 fn randread_goatkv(engine: Arc<KvEngine>, times: u64, key_nums: u64, threads: usize) {
@@ -881,6 +946,14 @@ fn print_goatkv_write_stats(workload: &str, stats: GoatkvWriteStats) {
     );
 }
 
+#[cfg(feature = "rocksdb")]
+fn print_rocksdb_write_stats(workload: &str, stats: RocksdbWriteStats) {
+    println!(
+        "rocksdb_write_stats workload={} submitted={} successful={} failed={} thread_panics={}",
+        workload, stats.submitted, stats.successful, stats.failed, stats.thread_panics,
+    );
+}
+
 fn print_runtime_metrics(engine: &KvEngine, phase: &str) {
     let metrics = engine.runtime_metrics();
     println!(
@@ -1030,7 +1103,7 @@ fn main() {
                             let db =
                                 Arc::new(DB::open(&rocks_opts, &base_dir).expect("open rocksdb"));
                             let begin = Instant::now();
-                            populate_rocksdb(
+                            let stats = populate_rocksdb(
                                 db,
                                 key_nums,
                                 batch_size,
@@ -1048,6 +1121,7 @@ fn main() {
                                 ms_per_iter: ms_per_iter(total_ms, iters),
                             };
                             print_result(&result);
+                            print_rocksdb_write_stats("populate", stats);
                         }
                     }
                     EngineKind::Both => {}
@@ -1094,7 +1168,7 @@ fn main() {
                             let db =
                                 Arc::new(DB::open(&rocks_opts, &base_dir).expect("open rocksdb"));
                             let begin = Instant::now();
-                            singleput_rocksdb(
+                            let stats = singleput_rocksdb(
                                 db,
                                 key_nums,
                                 value_size,
@@ -1111,6 +1185,7 @@ fn main() {
                                 ms_per_iter: ms_per_iter(total_ms, iters),
                             };
                             print_result(&result);
+                            print_rocksdb_write_stats("singleput", stats);
                         }
                     }
                     EngineKind::Both => {}

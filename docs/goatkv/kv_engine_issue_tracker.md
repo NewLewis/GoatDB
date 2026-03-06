@@ -1168,16 +1168,29 @@
     - 2026-03-06：新增 `KvEngineOptions::per_level_compression` 与 `with_level_compression`，flush(L0) 与 compaction(目标层)按层选择压缩策略；bench CLI 新增 `--l0-compression/--l1-compression/--l2-compression`。
     - 2026-03-06：收敛负载对照（`threads=16,key_nums=40000,value_size=1024,wal_sync`）中，`l1/l2=rle` 相比 `none`：磁盘占用 `50M -> 13M`（约 `-74%`），populate `73ms -> 92ms`（约 `+26%`），randread `2330ms -> 2115ms`（约 `-9%`）。
 
-- [ ] `TASK-SM5-04` 空间占用与 compaction backlog 基准（status: planned）
+- [x] `TASK-SM5-04` 空间占用与 compaction backlog 基准（status: done, 2026-03-06）
   - 目标：量化空间效率和后台追赶效果，形成回归阈值。
   - 关键改动文件：
     - `benches/goatkv_bench.rs`
     - `docs/goatkv/kv_engine_issue_tracker.md`
   - 回归命令：
-    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_bench --engine goatkv --wal-sync populate --threads 16 --key-nums 10000`
+    - `cargo check --features rocksdb --bench goatkv_bench`
+    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_sm504_final/none_r1 --engine both --wal-sync --threads 16 --l0-compression none --l1-compression none --l2-compression none populate --key-nums 80000 --batch-size 128 --value-size 1024 --seq`
+    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_sm504_final/none_r1 --engine both --wal-sync --threads 16 --l0-compression none --l1-compression none --l2-compression none randread --times 80 --key-nums 80000 --value-size 1024`
+    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_sm504_final/allrle_r1 --engine goatkv --wal-sync --threads 16 --l0-compression rle --l1-compression rle --l2-compression rle populate --key-nums 80000 --batch-size 128 --value-size 1024 --seq`
+    - `cargo bench --features rocksdb --bench goatkv_bench -- --directory /tmp/goatkv_sm504_final/allrle_r1 --engine goatkv --wal-sync --threads 16 --l0-compression rle --l1-compression rle --l2-compression rle randread --times 80 --key-nums 80000 --value-size 1024`
   - DoD：
     - 输出空间放大、debt 曲线、吞吐/延迟对照。
     - 写入稳定期内 backlog 斜率可解释并可复现。
+  - 关闭记录：
+    - 2026-03-06：`goatkv_bench` 补充 `rocksdb_write_stats`（`submitted/successful/failed/thread_panics`），避免 RocksDB 写错误被静默吞掉；本轮 3 轮对照 `write_failed=0`。
+    - 2026-03-06：3 轮均值（`threads=16,key_nums=80000,value_size=1024,batch=128,wal_sync`）：
+      - populate：GoatKV-none `176.0ms`，GoatKV-allRLE `107.3ms`，RocksDB-none `168.3ms`。
+      - randread：GoatKV-none `6904.7ms`，GoatKV-allRLE `6921.7ms`，RocksDB-none `5160.0ms`。
+      - 磁盘占用：GoatKV-none `100MB`，GoatKV-allRLE `96MB`，RocksDB-none `81MB`。
+    - 2026-03-06：compaction debt 轨迹（populate 后）可复现并可解释：
+      - GoatKV-none：`pending_compaction_bytes` 平均 `11,948,976`（post_write）-> `0`（post_wait），`runtime_idle_reached=true`（3/3）。
+      - GoatKV-allRLE：`pending_compaction_bytes` 平均 `16,474,782`（post_write）-> `0`（post_wait），`runtime_idle_reached=true`（3/3）。
 
 #### Milestone 6（unsafe 稳定性封口）
 
