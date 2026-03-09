@@ -1082,7 +1082,10 @@ async fn main() -> GoatResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{client_auth_from_cli, load_client_tls_config, request_with_auth, Cli, ClientAuth};
+    use super::{
+        client_auth_from_cli, load_client_tls_config, parse_compare_and_set_args, parse_scan_args,
+        request_with_auth, Cli, ClientAuth,
+    };
     use clap::Parser;
     use goat_db::goatkv::ErrorKind;
     use std::path::Path;
@@ -1181,5 +1184,75 @@ mod tests {
         let api_key = request_with_auth((), &ClientAuth::ApiKey("key-123".to_string()))
             .expect("build api key request");
         assert_eq!(api_key.metadata().get("x-api-key").unwrap(), "key-123");
+    }
+
+    #[test]
+    fn parse_scan_args_supports_bounds_limit_reverse_and_snapshot() {
+        let request = parse_scan_args(&[
+            "--start",
+            "a",
+            "--end",
+            "z",
+            "--prefix",
+            "user:",
+            "--limit",
+            "2",
+            "--reverse",
+            "--snapshot-id",
+            "42",
+        ])
+        .expect("parse scan args");
+        assert_eq!(request.start_key, b"a".to_vec());
+        assert_eq!(request.end_key, b"z".to_vec());
+        assert_eq!(request.prefix, b"user:".to_vec());
+        assert_eq!(request.limit, 2);
+        assert!(request.reverse);
+        assert_eq!(request.snapshot_id, 42);
+    }
+
+    #[test]
+    fn parse_scan_args_rejects_unknown_option() {
+        let err = parse_scan_args(&["--bogus"]).expect_err("unknown option should fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidArgument);
+        assert!(err.to_string().contains("unknown scan option"));
+    }
+
+    #[test]
+    fn parse_compare_and_set_args_builds_insert_and_delete_variants() {
+        let insert = parse_compare_and_set_args(&["district:1", "--new-value", "new"])
+            .expect("parse insert cas");
+        assert_eq!(insert.key, b"district:1".to_vec());
+        assert!(!insert.expect_exists);
+        assert_eq!(insert.new_value, b"new".to_vec());
+        assert!(!insert.delete_on_match);
+
+        let delete = parse_compare_and_set_args(&["district:1", "--expected", "old", "--delete"])
+            .expect("parse delete cas");
+        assert!(delete.expect_exists);
+        assert_eq!(delete.expected_value, b"old".to_vec());
+        assert!(delete.delete_on_match);
+        assert!(delete.new_value.is_empty());
+    }
+
+    #[test]
+    fn parse_compare_and_set_args_rejects_invalid_combinations() {
+        let both = parse_compare_and_set_args(&[
+            "district:1",
+            "--expected",
+            "old",
+            "--new-value",
+            "new",
+            "--delete",
+        ])
+        .expect_err("new value and delete together should fail");
+        assert_eq!(both.kind(), ErrorKind::InvalidArgument);
+        assert!(both.to_string().contains("--new-value and --delete"));
+
+        let missing =
+            parse_compare_and_set_args(&["district:1"]).expect_err("missing action should fail");
+        assert_eq!(missing.kind(), ErrorKind::InvalidArgument);
+        assert!(missing
+            .to_string()
+            .contains("must provide either --new-value or --delete"));
     }
 }
