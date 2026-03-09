@@ -2,8 +2,10 @@ use clap::{Parser, Subcommand};
 use goat_db::goatkv::{Error as GoatError, Result as GoatResult};
 use goatkv::goat_kv_service_client::GoatKvServiceClient;
 use rustyline::{error::ReadlineError, DefaultEditor};
+use std::fs;
 use std::time::Duration;
-use tonic::transport::{Channel, Endpoint};
+use tonic::metadata::MetadataValue;
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 pub mod goatkv {
     tonic::include_proto!("goatkv");
@@ -63,7 +65,7 @@ fn parse_quoted_args(input: &str) -> Vec<String> {
 }
 
 /// GoatDB 客户端命令行工具
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(name = "goatkv_client")]
 #[command(about = "GoatDB Key-Value Store Client")]
 #[command(version = "0.1.0")]
@@ -72,13 +74,161 @@ struct Cli {
     #[arg(short, long, default_value = "http://127.0.0.1:50051")]
     address: String,
 
+    /// Send `authorization: Bearer <token>` on every request
+    #[arg(long, conflicts_with = "api_key")]
+    auth_token: Option<String>,
+
+    /// Send `x-api-key: <token>` on every request
+    #[arg(long, conflicts_with = "auth_token")]
+    api_key: Option<String>,
+
+    /// Custom CA certificate PEM path for TLS server verification
+    #[arg(long)]
+    ca_cert_path: Option<String>,
+
+    /// Override TLS domain name used for server certificate validation
+    #[arg(long)]
+    tls_domain_name: Option<String>,
+
+    /// Client certificate PEM path for mTLS
+    #[arg(long, requires = "client_key_path")]
+    client_cert_path: Option<String>,
+
+    /// Client private key PEM path for mTLS
+    #[arg(long, requires = "client_cert_path")]
+    client_key_path: Option<String>,
+
     /// 交互模式（默认）或单次命令模式
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ClientAuth {
+    None,
+    Bearer(String),
+    ApiKey(String),
+}
+
+fn client_auth_from_cli(cli: &Cli) -> ClientAuth {
+    if let Some(token) = cli.auth_token.as_ref() {
+        return ClientAuth::Bearer(token.clone());
+    }
+    if let Some(api_key) = cli.api_key.as_ref() {
+        return ClientAuth::ApiKey(api_key.clone());
+    }
+    ClientAuth::None
+}
+
+fn request_with_auth<T>(message: T, auth: &ClientAuth) -> GoatResult<tonic::Request<T>> {
+    let mut request = tonic::Request::new(message);
+    match auth {
+        ClientAuth::None => {}
+        ClientAuth::Bearer(token) => {
+            let header = MetadataValue::try_from(format!("Bearer {token}")).map_err(|e| {
+                GoatError::invalid_argument(
+                    "auth_token",
+                    format!("failed to encode bearer token as metadata: {}", e),
+                )
+            })?;
+            request.metadata_mut().insert("authorization", header);
+        }
+        ClientAuth::ApiKey(api_key) => {
+            let header = MetadataValue::try_from(api_key.as_str()).map_err(|e| {
+                GoatError::invalid_argument(
+                    "api_key",
+                    format!("failed to encode api key as metadata: {}", e),
+                )
+            })?;
+            request.metadata_mut().insert("x-api-key", header);
+        }
+    }
+    Ok(request)
+}
+
+fn load_client_tls_config(cli: &Cli) -> GoatResult<Option<ClientTlsConfig>> {
+    let wants_tls = cli.address.starts_with("https://")
+        || cli.ca_cert_path.is_some()
+        || cli.tls_domain_name.is_some()
+        || cli.client_cert_path.is_some()
+        || cli.client_key_path.is_some();
+    if !wants_tls {
+        return Ok(None);
+    }
+    if !cli.address.starts_with("https://") {
+        return Err(GoatError::invalid_argument(
+            "address",
+            "TLS options require an https:// server address",
+        ));
+    }
+
+    let mut tls = ClientTlsConfig::new();
+    if let Some(domain_name) = cli.tls_domain_name.as_ref() {
+        tls = tls.domain_name(domain_name.clone());
+    }
+    if let Some(ca_cert_path) = cli.ca_cert_path.as_ref() {
+        let cert_pem = fs::read(ca_cert_path).map_err(|e| {
+            GoatError::internal_with_source(
+                "client_tls_ca_read",
+                format!("failed to read CA cert file {}", ca_cert_path),
+                e,
+            )
+        })?;
+        tls = tls.ca_certificate(Certificate::from_pem(cert_pem));
+    }
+    match (&cli.client_cert_path, &cli.client_key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            let cert_pem = fs::read(cert_path).map_err(|e| {
+                GoatError::internal_with_source(
+                    "client_tls_cert_read",
+                    format!("failed to read client cert file {}", cert_path),
+                    e,
+                )
+            })?;
+            let key_pem = fs::read(key_path).map_err(|e| {
+                GoatError::internal_with_source(
+                    "client_tls_key_read",
+                    format!("failed to read client key file {}", key_path),
+                    e,
+                )
+            })?;
+            tls = tls.identity(Identity::from_pem(cert_pem, key_pem));
+        }
+        (None, None) => {}
+        _ => {
+            return Err(GoatError::invalid_argument(
+                "client_identity",
+                "both --client-cert-path and --client-key-path are required for mTLS",
+            ));
+        }
+    }
+
+    Ok(Some(tls))
+}
+
+fn build_endpoint(cli: &Cli) -> GoatResult<Endpoint> {
+    let mut endpoint = Endpoint::from_shared(cli.address.clone())
+        .map_err(|e| GoatError::invalid_argument("address", e.to_string()))?
+        .timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(3))
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .http2_keep_alive_interval(Duration::from_secs(30));
+
+    if let Some(tls) = load_client_tls_config(cli)? {
+        endpoint = endpoint.tls_config(tls).map_err(|e| {
+            GoatError::internal_with_source(
+                "client_tls_config",
+                "failed to configure client tls",
+                e,
+            )
+        })?;
+    }
+
+    Ok(endpoint)
+}
+
 /// 支持的子命令
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Commands {
     /// 插入键值对
     Put {
@@ -163,7 +313,10 @@ enum Commands {
 }
 
 /// 交互式 REPL 客户端
-async fn run_interactive(mut client: GoatKvServiceClient<Channel>) -> GoatResult<()> {
+async fn run_interactive(
+    mut client: GoatKvServiceClient<Channel>,
+    auth: &ClientAuth,
+) -> GoatResult<()> {
     println!("GoatDB Interactive Client");
     println!("Connected to server successfully!");
     println!(
@@ -218,23 +371,23 @@ async fn run_interactive(mut client: GoatKvServiceClient<Channel>) -> GoatResult
                         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
                         let result = match args_refs[0] {
-                            "put" => handle_put(&mut client, &args_refs[1..]).await,
-                            "get" => handle_get(&mut client, &args_refs[1..]).await,
+                            "put" => handle_put(&mut client, auth, &args_refs[1..]).await,
+                            "get" => handle_get(&mut client, auth, &args_refs[1..]).await,
                             "multiget" | "multi-get" | "multi_get" => {
-                                handle_multiget(&mut client, &args_refs[1..]).await
+                                handle_multiget(&mut client, auth, &args_refs[1..]).await
                             }
-                            "scan" => handle_scan(&mut client, &args_refs[1..]).await,
+                            "scan" => handle_scan(&mut client, auth, &args_refs[1..]).await,
                             "cas" | "compare-and-set" | "compare_and_set" => {
-                                handle_compare_and_set(&mut client, &args_refs[1..]).await
+                                handle_compare_and_set(&mut client, auth, &args_refs[1..]).await
                             }
-                            "update" => handle_update(&mut client, &args_refs[1..]).await,
-                            "delete" => handle_delete(&mut client, &args_refs[1..]).await,
-                            "flush" => handle_flush(&mut client).await,
+                            "update" => handle_update(&mut client, auth, &args_refs[1..]).await,
+                            "delete" => handle_delete(&mut client, auth, &args_refs[1..]).await,
+                            "flush" => handle_flush(&mut client, auth).await,
                             "snapshot-create" | "snapshot_create" => {
-                                handle_create_snapshot(&mut client).await
+                                handle_create_snapshot(&mut client, auth).await
                             }
                             "snapshot-release" | "snapshot_release" => {
-                                handle_release_snapshot(&mut client, &args_refs[1..]).await
+                                handle_release_snapshot(&mut client, auth, &args_refs[1..]).await
                             }
                             _ => {
                                 println!(
@@ -303,7 +456,11 @@ fn print_help() {
 }
 
 /// 处理 put 命令
-async fn handle_put(client: &mut GoatKvServiceClient<Channel>, args: &[&str]) -> GoatResult<()> {
+async fn handle_put(
+    client: &mut GoatKvServiceClient<Channel>,
+    auth: &ClientAuth,
+    args: &[&str],
+) -> GoatResult<()> {
     if args.len() < 2 {
         return Err(GoatError::invalid_argument(
             "put",
@@ -314,7 +471,7 @@ async fn handle_put(client: &mut GoatKvServiceClient<Channel>, args: &[&str]) ->
     let key = args[0].as_bytes().to_vec();
     let value = args[1].as_bytes().to_vec();
 
-    let request = tonic::Request::new(goatkv::WriteRequest { key, value });
+    let request = request_with_auth(goatkv::WriteRequest { key, value }, auth)?;
     let response = client
         .write(request)
         .await
@@ -331,7 +488,11 @@ async fn handle_put(client: &mut GoatKvServiceClient<Channel>, args: &[&str]) ->
 }
 
 /// 处理 get 命令
-async fn handle_get(client: &mut GoatKvServiceClient<Channel>, args: &[&str]) -> GoatResult<()> {
+async fn handle_get(
+    client: &mut GoatKvServiceClient<Channel>,
+    auth: &ClientAuth,
+    args: &[&str],
+) -> GoatResult<()> {
     if args.is_empty() {
         return Err(GoatError::invalid_argument(
             "get",
@@ -358,7 +519,7 @@ async fn handle_get(client: &mut GoatKvServiceClient<Channel>, args: &[&str]) ->
 
     let key = args[0].as_bytes().to_vec();
 
-    let request = tonic::Request::new(goatkv::GetRequest { key, snapshot_id });
+    let request = request_with_auth(goatkv::GetRequest { key, snapshot_id }, auth)?;
     let response = client
         .get(request)
         .await
@@ -378,6 +539,7 @@ async fn handle_get(client: &mut GoatKvServiceClient<Channel>, args: &[&str]) ->
 /// 处理 multiget 命令
 async fn handle_multiget(
     client: &mut GoatKvServiceClient<Channel>,
+    auth: &ClientAuth,
     args: &[&str],
 ) -> GoatResult<()> {
     if args.is_empty() {
@@ -391,10 +553,13 @@ async fn handle_multiget(
         .iter()
         .map(|key| key.as_bytes().to_vec())
         .collect::<Vec<_>>();
-    let request = tonic::Request::new(goatkv::MultiGetRequest {
-        keys,
-        snapshot_id: 0,
-    });
+    let request = request_with_auth(
+        goatkv::MultiGetRequest {
+            keys,
+            snapshot_id: 0,
+        },
+        auth,
+    )?;
     let response = client
         .multi_get(request)
         .await
@@ -493,16 +658,21 @@ fn parse_scan_args(args: &[&str]) -> GoatResult<goatkv::ScanRequest> {
     Ok(request)
 }
 
-async fn handle_scan(client: &mut GoatKvServiceClient<Channel>, args: &[&str]) -> GoatResult<()> {
+async fn handle_scan(
+    client: &mut GoatKvServiceClient<Channel>,
+    auth: &ClientAuth,
+    args: &[&str],
+) -> GoatResult<()> {
     let request = parse_scan_args(args)?;
-    handle_scan_request(client, request).await
+    handle_scan_request(client, auth, request).await
 }
 
 async fn handle_scan_request(
     client: &mut GoatKvServiceClient<Channel>,
+    auth: &ClientAuth,
     request: goatkv::ScanRequest,
 ) -> GoatResult<()> {
-    let request = tonic::Request::new(request);
+    let request = request_with_auth(request, auth)?;
     let response = client
         .scan(request)
         .await
@@ -596,9 +766,10 @@ fn parse_compare_and_set_args(args: &[&str]) -> GoatResult<goatkv::CompareAndSet
 
 async fn handle_compare_and_set(
     client: &mut GoatKvServiceClient<Channel>,
+    auth: &ClientAuth,
     args: &[&str],
 ) -> GoatResult<()> {
-    let request = tonic::Request::new(parse_compare_and_set_args(args)?);
+    let request = request_with_auth(parse_compare_and_set_args(args)?, auth)?;
     let response = client
         .compare_and_set(request)
         .await
@@ -614,7 +785,11 @@ async fn handle_compare_and_set(
 }
 
 /// 处理 update 命令
-async fn handle_update(client: &mut GoatKvServiceClient<Channel>, args: &[&str]) -> GoatResult<()> {
+async fn handle_update(
+    client: &mut GoatKvServiceClient<Channel>,
+    auth: &ClientAuth,
+    args: &[&str],
+) -> GoatResult<()> {
     if args.len() < 2 {
         return Err(GoatError::invalid_argument(
             "update",
@@ -625,7 +800,7 @@ async fn handle_update(client: &mut GoatKvServiceClient<Channel>, args: &[&str])
     let key = args[0].as_bytes().to_vec();
     let value = args[1].as_bytes().to_vec();
 
-    let request = tonic::Request::new(goatkv::UpdateRequest { key, value });
+    let request = request_with_auth(goatkv::UpdateRequest { key, value }, auth)?;
     let response = client
         .update(request)
         .await
@@ -642,14 +817,18 @@ async fn handle_update(client: &mut GoatKvServiceClient<Channel>, args: &[&str])
 }
 
 /// 处理 delete 命令
-async fn handle_delete(client: &mut GoatKvServiceClient<Channel>, args: &[&str]) -> GoatResult<()> {
+async fn handle_delete(
+    client: &mut GoatKvServiceClient<Channel>,
+    auth: &ClientAuth,
+    args: &[&str],
+) -> GoatResult<()> {
     if args.is_empty() {
         return Err(GoatError::invalid_argument("delete", "Usage: delete <key>"));
     }
 
     let key = args[0].as_bytes().to_vec();
 
-    let request = tonic::Request::new(goatkv::DeleteRequest { key });
+    let request = request_with_auth(goatkv::DeleteRequest { key }, auth)?;
     let response = client
         .delete(request)
         .await
@@ -666,8 +845,11 @@ async fn handle_delete(client: &mut GoatKvServiceClient<Channel>, args: &[&str])
 }
 
 /// 处理 flush 命令
-async fn handle_flush(client: &mut GoatKvServiceClient<Channel>) -> GoatResult<()> {
-    let request = tonic::Request::new(goatkv::FlushRequest {});
+async fn handle_flush(
+    client: &mut GoatKvServiceClient<Channel>,
+    auth: &ClientAuth,
+) -> GoatResult<()> {
+    let request = request_with_auth(goatkv::FlushRequest {}, auth)?;
     let response = client
         .flush(request)
         .await
@@ -683,8 +865,11 @@ async fn handle_flush(client: &mut GoatKvServiceClient<Channel>) -> GoatResult<(
     Ok(())
 }
 
-async fn handle_create_snapshot(client: &mut GoatKvServiceClient<Channel>) -> GoatResult<()> {
-    let request = tonic::Request::new(goatkv::CreateSnapshotRequest {});
+async fn handle_create_snapshot(
+    client: &mut GoatKvServiceClient<Channel>,
+    auth: &ClientAuth,
+) -> GoatResult<()> {
+    let request = request_with_auth(goatkv::CreateSnapshotRequest {}, auth)?;
     let response = client
         .create_snapshot(request)
         .await
@@ -705,6 +890,7 @@ async fn handle_create_snapshot(client: &mut GoatKvServiceClient<Channel>) -> Go
 
 async fn handle_release_snapshot(
     client: &mut GoatKvServiceClient<Channel>,
+    auth: &ClientAuth,
     args: &[&str],
 ) -> GoatResult<()> {
     if args.len() != 1 {
@@ -720,7 +906,7 @@ async fn handle_release_snapshot(
         )
     })?;
 
-    let request = tonic::Request::new(goatkv::ReleaseSnapshotRequest { snapshot_id });
+    let request = request_with_auth(goatkv::ReleaseSnapshotRequest { snapshot_id }, auth)?;
     let response = client
         .release_snapshot(request)
         .await
@@ -739,12 +925,13 @@ async fn handle_release_snapshot(
 /// 执行单次命令
 async fn execute_command(
     mut client: GoatKvServiceClient<Channel>,
+    auth: &ClientAuth,
     command: Commands,
 ) -> GoatResult<()> {
     match command {
         Commands::Put { key, value } => {
             let args = vec![key.as_str(), value.as_str()];
-            handle_put(&mut client, &args).await
+            handle_put(&mut client, auth, &args).await
         }
         Commands::Get { key, snapshot_id } => {
             let snapshot_id_string;
@@ -754,7 +941,7 @@ async fn execute_command(
                 snapshot_id_string = snapshot_id.to_string();
                 vec![key.as_str(), snapshot_id_string.as_str()]
             };
-            handle_get(&mut client, &args).await
+            handle_get(&mut client, auth, &args).await
         }
         Commands::MultiGet { keys, snapshot_id } => {
             if snapshot_id != 0 {
@@ -764,7 +951,7 @@ async fn execute_command(
                 ));
             }
             let args = keys.iter().map(String::as_str).collect::<Vec<_>>();
-            handle_multiget(&mut client, &args).await
+            handle_multiget(&mut client, auth, &args).await
         }
         Commands::Scan {
             start,
@@ -776,6 +963,7 @@ async fn execute_command(
         } => {
             handle_scan_request(
                 &mut client,
+                auth,
                 goatkv::ScanRequest {
                     start_key: start.map(|v| v.into_bytes()).unwrap_or_default(),
                     end_key: end.map(|v| v.into_bytes()).unwrap_or_default(),
@@ -805,22 +993,22 @@ async fn execute_command(
             if delete {
                 args.push("--delete");
             }
-            handle_compare_and_set(&mut client, &args).await
+            handle_compare_and_set(&mut client, auth, &args).await
         }
         Commands::Update { key, value } => {
             let args = vec![key.as_str(), value.as_str()];
-            handle_update(&mut client, &args).await
+            handle_update(&mut client, auth, &args).await
         }
         Commands::Delete { key } => {
             let args = vec![key.as_str()];
-            handle_delete(&mut client, &args).await
+            handle_delete(&mut client, auth, &args).await
         }
-        Commands::Flush => handle_flush(&mut client).await,
-        Commands::SnapshotCreate => handle_create_snapshot(&mut client).await,
+        Commands::Flush => handle_flush(&mut client, auth).await,
+        Commands::SnapshotCreate => handle_create_snapshot(&mut client, auth).await,
         Commands::SnapshotRelease { snapshot_id } => {
             let snapshot_id_string = snapshot_id.to_string();
             let args = vec![snapshot_id_string.as_str()];
-            handle_release_snapshot(&mut client, &args).await
+            handle_release_snapshot(&mut client, auth, &args).await
         }
     }
 }
@@ -859,16 +1047,11 @@ fn get_history_path() -> GoatResult<std::path::PathBuf> {
 #[tokio::main]
 async fn main() -> GoatResult<()> {
     let cli = Cli::parse();
+    let auth = client_auth_from_cli(&cli);
 
     // 创建带有超时的连接端点
     println!("Connecting to {}...", cli.address);
-
-    let endpoint = Endpoint::from_shared(cli.address)
-        .map_err(|e| GoatError::invalid_argument("address", e.to_string()))?
-        .timeout(Duration::from_secs(5)) // 连接和请求超时
-        .connect_timeout(Duration::from_secs(3)) // 连接建立超时
-        .tcp_keepalive(Some(Duration::from_secs(30))) // TCP keepalive
-        .http2_keep_alive_interval(Duration::from_secs(30)); // HTTP/2 keepalive
+    let endpoint = build_endpoint(&cli)?;
 
     let channel = match endpoint.connect().await {
         Ok(channel) => {
@@ -888,11 +1071,115 @@ async fn main() -> GoatResult<()> {
     match cli.command {
         Some(command) => {
             // 执行单次命令
-            execute_command(client, command).await
+            execute_command(client, &auth, command).await
         }
         None => {
             // 进入交互模式
-            run_interactive(client).await
+            run_interactive(client, &auth).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{client_auth_from_cli, load_client_tls_config, request_with_auth, Cli, ClientAuth};
+    use clap::Parser;
+    use goat_db::goatkv::ErrorKind;
+    use std::path::Path;
+
+    fn fixture_path(name: &str) -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("tls")
+            .join(name)
+            .display()
+            .to_string()
+    }
+
+    #[test]
+    fn cli_rejects_conflicting_auth_flags() {
+        let err = Cli::try_parse_from([
+            "goatkv_client",
+            "--auth-token",
+            "token-a",
+            "--api-key",
+            "token-b",
+            "flush",
+        ])
+        .expect_err("conflicting auth flags should be rejected by clap");
+        let rendered = err.to_string();
+        assert!(rendered.contains("--auth-token"));
+        assert!(rendered.contains("--api-key"));
+    }
+
+    #[test]
+    fn client_auth_from_cli_maps_bearer_and_api_key() {
+        let bearer = Cli::try_parse_from(["goatkv_client", "--auth-token", "secret", "flush"])
+            .expect("parse bearer cli");
+        assert_eq!(
+            client_auth_from_cli(&bearer),
+            ClientAuth::Bearer("secret".to_string())
+        );
+
+        let api_key = Cli::try_parse_from(["goatkv_client", "--api-key", "key-123", "flush"])
+            .expect("parse api key cli");
+        assert_eq!(
+            client_auth_from_cli(&api_key),
+            ClientAuth::ApiKey("key-123".to_string())
+        );
+    }
+
+    #[test]
+    fn load_client_tls_config_rejects_tls_flags_on_http_address() {
+        let cli = Cli::try_parse_from([
+            "goatkv_client",
+            "--address",
+            "http://127.0.0.1:50051",
+            "--ca-cert-path",
+            fixture_path("ca-cert.pem").as_str(),
+            "flush",
+        ])
+        .expect("parse cli");
+
+        let err = load_client_tls_config(&cli).expect_err("http address should reject tls flags");
+        assert_eq!(err.kind(), ErrorKind::InvalidArgument);
+        assert!(err.to_string().contains("https://"));
+    }
+
+    #[test]
+    fn load_client_tls_config_accepts_ca_and_client_identity_for_https() {
+        let cli = Cli::try_parse_from([
+            "goatkv_client",
+            "--address",
+            "https://127.0.0.1:50051",
+            "--ca-cert-path",
+            fixture_path("ca-cert.pem").as_str(),
+            "--client-cert-path",
+            fixture_path("client-cert.pem").as_str(),
+            "--client-key-path",
+            fixture_path("client-key.pem").as_str(),
+            "--tls-domain-name",
+            "localhost",
+            "flush",
+        ])
+        .expect("parse https cli");
+
+        let tls = load_client_tls_config(&cli).expect("build tls config");
+        assert!(tls.is_some(), "https cli should produce tls config");
+    }
+
+    #[test]
+    fn request_with_auth_sets_expected_metadata_headers() {
+        let bearer = request_with_auth((), &ClientAuth::Bearer("secret".to_string()))
+            .expect("build bearer request");
+        assert_eq!(
+            bearer.metadata().get("authorization").unwrap(),
+            "Bearer secret"
+        );
+
+        let api_key = request_with_auth((), &ClientAuth::ApiKey("key-123".to_string()))
+            .expect("build api key request");
+        assert_eq!(api_key.metadata().get("x-api-key").unwrap(), "key-123");
     }
 }

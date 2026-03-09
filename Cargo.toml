@@ -117,6 +117,11 @@ path = "tests/e2e/tls_test.rs"
 harness = true
 
 [[test]]
+name = "e2e_client_cli"
+path = "tests/e2e/client_cli_test.rs"
+harness = true
+
+[[test]]
 name = "integration_recovery"
 path = "tests/integration/recovery_test.rs"
 harness = true
